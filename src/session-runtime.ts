@@ -1,8 +1,8 @@
-import type { SDKAgent, SDKCustomTool } from "@cursor/sdk";
+import type { SDKAgent, SDKCustomTool, SDKUserMessage } from "@cursor/sdk";
 import type { Context } from "@oh-my-pi/pi-ai";
 import { DEFAULT_AGENT_INSTANCE_ID } from "./constants.js";
 import type { BindingState, GrantedTool, OmpHostBridgeV1 } from "./contracts.js";
-import { activeUserText, computeContextFingerprint, emptySendState, planSend, type SendState } from "./context.js";
+import { activeUserInput, computeContextFingerprint, emptySendState, planSend, type SendState } from "./context.js";
 import { createSharedToolExec, type SharedToolExec } from "./host-exec.js";
 import {
 	createLiveRun,
@@ -51,13 +51,14 @@ function getOrCreateSlot(scopeKey: string, agentInstanceId: string, cwd: string)
 		return existing;
 	}
 	const handle = getMatchingResumeHandle(agentInstanceId);
+	const committed = handle?.state === "committed";
 	const slot: RuntimeSlot = {
 		key,
 		scopeKey,
 		agentInstanceId,
 		cwd,
-		sendState: handle ? { ...handle.sendState } : emptySendState(),
-		bindingState: handle?.state ?? (handle ? "committed" : "dirty"),
+		sendState: committed && handle ? { ...handle.sendState } : emptySendState(),
+		bindingState: committed ? "committed" : "dirty",
 		storeIdentity: handle?.storeIdentity ?? { version: 1, stateRoot: storeRootForScope(cwd, scopeKey) },
 	};
 	slots.set(key, slot);
@@ -79,7 +80,7 @@ export interface PreparedTurn {
 	live: LiveRun;
 	continuing: boolean;
 	customTools: Record<string, SDKCustomTool>;
-	prompt?: string;
+	prompt?: SDKUserMessage;
 	incremental: boolean;
 }
 
@@ -97,7 +98,12 @@ export async function prepareTurn(input: OpenRuntimeTurnInput): Promise<Prepared
 	const cwd = input.cwd || getCursorSessionCwd();
 	const slot = getOrCreateSlot(scopeKey, input.agentInstanceId, cwd);
 	const existingLive = getLiveRun(slot.key);
-	const continuing = Boolean(existingLive && trailingToolResults(input.context).length > 0);
+	const trailing = trailingToolResults(input.context);
+	const continuing = Boolean(existingLive && trailing.length > 0);
+
+	if (trailing.length > 0 && !existingLive) {
+		throw new Error("Cannot continue parked Cursor SDK tool calls after the adapter restarted; send a new user turn");
+	}
 
 	if (existingLive && continuing) {
 		return { slot, live: existingLive, continuing: true, customTools: {}, incremental: true };
@@ -108,14 +114,15 @@ export async function prepareTurn(input: OpenRuntimeTurnInput): Promise<Prepared
 	}
 
 	const plan = planSend(slot.sendState, input.context);
-	if (plan.resetAgent && slot.agent) {
+	const unsafeBinding = slot.bindingState !== "committed";
+	if ((plan.resetAgent || unsafeBinding) && slot.agent) {
 		await disposeAgent(slot.agent);
 		slot.agent = undefined;
 		slot.bindingState = "dirty";
 	}
 
 	const resumeHandle = getMatchingResumeHandle(input.agentInstanceId);
-	const savedAgentId = plan.resetAgent ? undefined : (slot.agent?.agentId ?? resumeHandle?.agentId);
+	const savedAgentId = plan.resetAgent || unsafeBinding ? undefined : (slot.agent?.agentId ?? resumeHandle?.agentId);
 	const store = openScopedJsonlStore(cwd, scopeKey);
 	slot.storeIdentity = { version: 1, stateRoot: storeRootForScope(cwd, scopeKey) };
 
@@ -146,7 +153,7 @@ export async function prepareTurn(input: OpenRuntimeTurnInput): Promise<Prepared
 		live,
 		continuing: false,
 		customTools,
-		prompt: activeUserText(input.context),
+		prompt: activeUserInput(input.context),
 		incremental: plan.mode === "incremental",
 	};
 }
@@ -171,18 +178,33 @@ export function commitTurn(slot: RuntimeSlot, context: Context, incremental: boo
 
 export function markTurnDirty(slot: RuntimeSlot): void {
 	slot.bindingState = "dirty";
+	if (slot.agent) {
+		persistResumeHandle({
+			agentId: slot.agent.agentId,
+			poolKey: slot.agentInstanceId,
+			sendState: { ...slot.sendState },
+			storeIdentity: slot.storeIdentity,
+			state: "dirty",
+			agentInstanceId: slot.agentInstanceId,
+		});
+	}
+	slot.agent = undefined;
 }
 
 export async function finishLiveKeepAgent(key: string, reason: string): Promise<void> {
 	await disposeLiveRun(key, reason, false);
 }
 
+export async function finishTurnFailed(slot: RuntimeSlot, reason: string): Promise<void> {
+	markTurnDirty(slot);
+	await disposeLiveRun(slot.key, reason, true);
+}
+
 export function invalidateRuntime(_reason: string): void {
 	for (const slot of slots.values()) {
-		slot.bindingState = "dirty";
-		slot.sendState = emptySendState();
 		const agent = slot.agent;
-		slot.agent = undefined;
+		markTurnDirty(slot);
+		slot.sendState = emptySendState();
 		if (agent) void disposeAgent(agent);
 	}
 	for (const key of slots.keys()) {

@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import type { SDKImage, SDKUserMessage } from "@cursor/sdk";
 import type { Context } from "@oh-my-pi/pi-ai";
 import { MAX_COMPLETED_INCREMENTAL_SENDS_BEFORE_REBOOTSTRAP } from "./constants.js";
 
@@ -82,22 +83,57 @@ function parseFingerprint(value: string): { systemHash: string; messageHashes: s
 	}
 }
 
-/** Latest user text only. Never prepend OMP system prompt (unsupported by this SDK backend). */
-export function activeUserText(context: Context): string {
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return Boolean(value && typeof value === "object" && !Array.isArray(value));
+}
+
+function lastUserMessage(context: Context): Record<string, unknown> {
 	for (let index = context.messages.length - 1; index >= 0; index -= 1) {
-		const message = context.messages[index] as { role?: string; content?: unknown };
-		if (message.role !== "user") continue;
-		if (typeof message.content === "string" && message.content.trim()) return message.content;
-		if (Array.isArray(message.content)) {
-			const text = message.content
-				.filter((block): block is { type: "text"; text: string } =>
-					Boolean(block && typeof block === "object" && (block as { type?: string }).type === "text"),
-				)
-				.map((block) => block.text)
-				.join("\n")
-				.trim();
-			if (text) return text;
-		}
+		const message = context.messages[index] as { role?: string };
+		if (message.role === "user") return message as Record<string, unknown>;
 	}
 	throw new Error("OMP context has no active user message to send");
+}
+
+function textFromContent(content: unknown): string {
+	if (typeof content === "string") return content.trim();
+	if (!Array.isArray(content)) return "";
+	return content
+		.filter(
+			(block): block is { type: "text"; text: string } =>
+				Boolean(block && typeof block === "object" && (block as { type?: string }).type === "text" && typeof (block as { text?: unknown }).text === "string"),
+		)
+		.map((block) => block.text)
+		.join("\n")
+		.trim();
+}
+
+function imagesFromContent(content: unknown): SDKImage[] {
+	if (!Array.isArray(content)) return [];
+	const images: SDKImage[] = [];
+	for (const block of content) {
+		if (!isRecord(block) || block.type !== "image") continue;
+		if (typeof block.data === "string" && typeof block.mimeType === "string") {
+			images.push({ data: block.data, mimeType: block.mimeType });
+		}
+	}
+	return images;
+}
+
+/**
+ * Current user turn only. Never walk back to an older user request, and never
+ * prepend the OMP system prompt.
+ */
+export function activeUserInput(context: Context): SDKUserMessage {
+	const message = lastUserMessage(context);
+	const text = textFromContent(message.content);
+	const images = imagesFromContent(message.content);
+	if (!text && images.length === 0) {
+		throw new Error("OMP current user message has no text or image content");
+	}
+	return images.length > 0 ? { text, images } : { text };
+}
+
+export function activeUserText(context: Context): string {
+	return activeUserInput(context).text;
 }

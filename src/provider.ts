@@ -8,14 +8,13 @@ import { grantedToolsFromContext } from "./omp-tools.js";
 import { mergeGrantedTools } from "./tool-catalog.js";
 import {
 	collectParkedBatch,
-	disposeLiveRun,
 	resumeParked,
 	startSend,
 	stopWaitingForPark,
 	waitForParked,
 	waitForResult,
 } from "./live-run.js";
-import { commitTurn, finishLiveKeepAgent, markTurnDirty, prepareTurn } from "./session-runtime.js";
+import { commitTurn, finishLiveKeepAgent, finishTurnFailed, prepareTurn, type RuntimeSlot } from "./session-runtime.js";
 import { getCursorSessionCwd } from "./session-scope.js";
 import { withSdkExitSuppressed } from "./sdk-exit-guard.js";
 import { defaultModelSelection } from "./sdk-session.js";
@@ -39,15 +38,14 @@ export function streamCursorRuntime(
 	const stream = createProviderStream();
 	const partial = createEmptyAssistantMessage(model);
 	queueMicrotask(async () => {
+		let slot: RuntimeSlot | undefined;
 		try {
 			const host = readHostBridge((options as Record<string, unknown> | undefined)?.[HOST_BRIDGE_OPTION_KEY]);
 			const snapshot = host?.snapshot();
 			const cwd = snapshot?.cwd ?? (typeof options?.cwd === "string" && options.cwd ? options.cwd : getCursorSessionCwd());
 			const agentInstanceId = snapshot?.agentInstanceId ?? DEFAULT_AGENT_INSTANCE_ID;
 			const apiKey = requireCursorApiKey(typeof options?.apiKey === "string" ? options.apiKey : undefined);
-			const grantedTools = mergeGrantedTools(
-				snapshot?.grantedTools?.length ? snapshot.grantedTools : grantedToolsFromContext(context),
-			);
+			const grantedTools = mergeGrantedTools(snapshot ? snapshot.grantedTools : grantedToolsFromContext(context));
 			stream.push({ type: "start", partial });
 
 			const prepared = await prepareTurn({
@@ -59,7 +57,8 @@ export function streamCursorRuntime(
 				grantedTools,
 				host,
 			});
-			const { slot, live, continuing, customTools, prompt, incremental } = prepared;
+			const { slot: preparedSlot, live, continuing, customTools, prompt, incremental } = prepared;
+			slot = preparedSlot;
 			live.sink = { stream, partial };
 
 			if (continuing) {
@@ -88,9 +87,8 @@ export function streamCursorRuntime(
 
 			const abortSignal = host?.signal ?? options?.signal;
 			const onAbort = () => {
-				markTurnDirty(slot);
-				slot.agent = undefined;
-				void disposeLiveRun(slot.key, "aborted", true);
+				if (!slot) return;
+				void finishTurnFailed(slot, "aborted");
 			};
 			abortSignal?.addEventListener("abort", onAbort, { once: true });
 			try {
@@ -115,26 +113,24 @@ export function streamCursorRuntime(
 				closeOpenBlocks(stream, partial);
 				partial.stopReason = runResultToStopReason(first.result);
 				if (first.result.status === "error") {
-					markTurnDirty(slot);
 					partial.errorMessage = first.result.error?.message ?? "Cursor SDK run failed";
 					stream.push({ type: "error", reason: "error", error: partial });
 					stream.end(partial);
-					await finishLiveKeepAgent(slot.key, "run error");
+					await finishTurnFailed(preparedSlot, "run error");
 					return;
 				}
 				if (first.result.status === "cancelled") {
-					markTurnDirty(slot);
 					partial.errorMessage = "Cancelled";
 					stream.push({ type: "error", reason: "aborted", error: partial });
 					stream.end(partial);
-					await finishLiveKeepAgent(slot.key, "cancelled");
+					await finishTurnFailed(preparedSlot, "cancelled");
 					return;
 				}
-				commitTurn(slot, context, incremental);
+				commitTurn(preparedSlot, context, incremental);
 				if (host) {
 					await host.commitBinding({
 						version: 1,
-						ompSessionId: snapshot?.sessionId ?? slot.scopeKey,
+						ompSessionId: snapshot?.sessionId ?? preparedSlot.scopeKey,
 						agentInstanceId,
 						branchEpoch: snapshot?.branchEpoch ?? 0,
 						sdkAgentId: live.agent?.agentId ?? "",
@@ -142,17 +138,18 @@ export function streamCursorRuntime(
 						credentialScopeId: "cursor-sdk",
 						configFingerprint: snapshot?.configFingerprint ?? "",
 						committedLeafId: snapshot?.committedLeafId ?? "",
-						effectiveHistoryDigest: slot.sendState.contextFingerprint,
+						effectiveHistoryDigest: preparedSlot.sendState.contextFingerprint,
 						state: "committed",
 					});
 				}
 				stream.push({ type: "done", reason: "stop", message: partial });
 				stream.end(partial);
-				await finishLiveKeepAgent(slot.key, "run finished");
+				await finishLiveKeepAgent(preparedSlot.key, "run finished");
 			} finally {
 				abortSignal?.removeEventListener("abort", onAbort);
 			}
 		} catch (error) {
+			if (slot) await finishTurnFailed(slot, "send failed");
 			partial.stopReason = "error";
 			partial.errorMessage = error instanceof Error ? error.message : String(error);
 			stream.push({ type: "error", reason: "error", error: partial });

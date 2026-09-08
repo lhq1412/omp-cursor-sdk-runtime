@@ -277,6 +277,7 @@ export function getResumeBranchPathHash(): string {
 export function getMatchingResumeHandle(poolKey: string): ResumeEntryData | undefined {
 	const handle = state.activeHandle;
 	if (!handle || !isLocalAgentId(handle.agentId)) return undefined;
+	if (handle.state !== "committed") return undefined;
 	if (handle.poolKey !== poolKey) return undefined;
 	if (handle.scopeKey !== state.scopeKey) return undefined;
 	if (handle.sessionFile !== state.sessionFile) return undefined;

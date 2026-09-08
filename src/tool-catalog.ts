@@ -45,9 +45,8 @@ export interface CatalogToolInfo {
 }
 
 /**
- * Index every registered OMP tool. Do **not** skip `getActiveTools()`:
- * OMP's ExtensionAPI maps that to `getEnabledToolNames()`, which includes
- * xd://-mounted MCP tools that are absent from `context.tools`.
+ * Index registered OMP tools for MCP schema lookup. `getAllTools()` is not a
+ * grant list; merge only attaches `mcp__*` names missing from this turn's grant.
  */
 export function snapshotHostToolCatalog(allTools: readonly (string | CatalogToolInfo)[]): void {
 	extras.clear();
@@ -68,6 +67,11 @@ export function extraGrantedTools(): GrantedTool[] {
 	return [...extras.values()];
 }
 
+/**
+ * This turn's grant set is authoritative. An empty grant stays empty.
+ * Catalog extras may only attach enabled `mcp__*` tools that xdev unmounted
+ * from `context.tools`; they must never re-introduce bash/edit/etc.
+ */
 export function mergeGrantedTools(fromContext: readonly GrantedTool[]): GrantedTool[] {
 	if (liveCatalog) {
 		try {
@@ -76,12 +80,14 @@ export function mergeGrantedTools(fromContext: readonly GrantedTool[]): GrantedT
 			// Catalog is best-effort; keep the last successful snapshot.
 		}
 	}
+	if (fromContext.length === 0) return [];
 	const byName = new Map<string, GrantedTool>();
-	for (const extra of extras.values()) {
-		byName.set(extra.name, extra);
-	}
 	for (const tool of fromContext) {
 		byName.set(tool.name, tool);
+	}
+	for (const extra of extras.values()) {
+		if (byName.has(extra.name) || !isMcpToolName(extra.name)) continue;
+		byName.set(extra.name, extra);
 	}
 	return [...byName.values()];
 }

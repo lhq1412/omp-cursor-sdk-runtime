@@ -3,6 +3,7 @@ import { CURSOR_SESSION_AGENT_RESUME_ENTRY_TYPE } from "../../src/constants.ts";
 import {
 	EMPTY_BRANCH_HASH,
 	foldResumeHandle,
+	getMatchingResumeHandle,
 	hashBranchStep,
 	parseResumeEntryData,
 	persistResumeHandle,
@@ -123,5 +124,21 @@ describe("session resume fold", () => {
 		expect(appended[0]?.type).toBe(CURSOR_SESSION_AGENT_RESUME_ENTRY_TYPE);
 		expect(parseResumeEntryData(appended[0]?.data)?.agentId).toBe("agent-local-1");
 		expect(parseResumeEntryData(appended[0]?.data)?.state).toBe("committed");
+	});
+
+	test("rejects dirty and in-flight handles at the resume gate", () => {
+		scopeTestUtils.reset();
+		scopeTestUtils.set("/tmp/project", "/tmp/session.jsonl", "sess-1");
+		resumeTestUtils.reset();
+		resumeTestUtils.state.scopeKey = "/tmp/session.jsonl";
+		resumeTestUtils.state.sessionFile = "/tmp/session.jsonl";
+		resumeTestUtils.state.sessionId = "sess-1";
+		resumeTestUtils.state.cwd = "/tmp/project";
+		resumeTestUtils.state.activeHandle = validData({ state: "dirty" });
+		expect(getMatchingResumeHandle("main")).toBeUndefined();
+		resumeTestUtils.state.activeHandle = validData({ state: "in-flight" });
+		expect(getMatchingResumeHandle("main")).toBeUndefined();
+		resumeTestUtils.state.activeHandle = validData({ state: "committed" });
+		expect(getMatchingResumeHandle("main")?.agentId).toBe("agent-local-1");
 	});
 });

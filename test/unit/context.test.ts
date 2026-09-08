@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { activeUserText, computeContextFingerprint, emptySendState, planSend } from "../../src/context.ts";
+import { activeUserInput, activeUserText, computeContextFingerprint, emptySendState, planSend } from "../../src/context.ts";
 import type { Context } from "@oh-my-pi/pi-ai";
 
 function context(messages: Context["messages"], systemPrompt = ["sys"]): Context {
@@ -44,5 +44,21 @@ describe("send policy", () => {
 		);
 		expect(activeUserText(ctx)).toBe("do the work");
 		expect(activeUserText(ctx)).not.toContain("OMP agent");
+	});
+
+	test("does not fall back to an older user request when the current turn is image-only", () => {
+		const ctx = context([
+			{ role: "user", content: "Run the old command", timestamp: 1 } as Context["messages"][number],
+			{ role: "assistant", content: [{ type: "text", text: "Done" }], timestamp: 2 } as Context["messages"][number],
+			{
+				role: "user",
+				content: [{ type: "image", data: "abc", mimeType: "image/png" }],
+				timestamp: 3,
+			} as Context["messages"][number],
+		]);
+		expect(activeUserInput(ctx)).toEqual({
+			text: "",
+			images: [{ data: "abc", mimeType: "image/png" }],
+		});
 	});
 });

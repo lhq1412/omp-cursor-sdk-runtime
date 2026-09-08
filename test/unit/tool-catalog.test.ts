@@ -60,6 +60,19 @@ describe("host tool catalog", () => {
 		expect(granted.map((item) => item.name)).toContain("mcp__late_connect");
 	});
 
+	test("keeps an empty grant empty even when the catalog has local tools", () => {
+		catalogTestUtils.clear();
+		snapshotHostToolCatalog(["read", "bash", "edit", "mcp__github_list_issues"]);
+		expect(mergeGrantedTools([])).toEqual([]);
+	});
+
+	test("does not expand a read-only grant with catalog bash or edit", () => {
+		catalogTestUtils.clear();
+		snapshotHostToolCatalog(["read", "bash", "edit", "mcp__github_list_issues"]);
+		const granted = mergeGrantedTools([{ name: "read", description: "read", inputSchema: { type: "object" } }]);
+		expect(granted.map((item) => item.name)).toEqual(["read", "mcp__github_list_issues"]);
+	});
+
 	test("maps long MCP names to unique SDK identifiers", () => {
 		const used = new Set<string>();
 		const first = uniqueSdkToolName("mcp__a_very_long_server_name_and_an_even_longer_tool_name_exceeding_limit", used);
