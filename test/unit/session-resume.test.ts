@@ -7,6 +7,7 @@ import {
 	hashBranchStep,
 	parseResumeEntryData,
 	persistResumeHandle,
+	flushResumeHandleNow,
 	registerCursorSessionResume,
 	__testUtils as resumeTestUtils,
 	type ResumeEntryData,
@@ -45,6 +46,7 @@ function validData(overrides: Partial<ResumeEntryData> = {}): ResumeEntryData {
 		storeIdentity: { version: 1, stateRoot: "/tmp/store" },
 		state: "committed",
 		agentInstanceId: "main",
+		credentialScopeId: "cred-1",
 		...overrides,
 	};
 }
@@ -118,12 +120,96 @@ describe("session resume fold", () => {
 			storeIdentity: { version: 1, stateRoot: "/tmp/store" },
 			state: "committed",
 			agentInstanceId: "main",
+			credentialScopeId: "cred-1",
 		});
 		await handlers.get("turn_end")?.[0]?.({ type: "turn_end" }, ctx);
 		expect(appended).toHaveLength(1);
 		expect(appended[0]?.type).toBe(CURSOR_SESSION_AGENT_RESUME_ENTRY_TYPE);
 		expect(parseResumeEntryData(appended[0]?.data)?.agentId).toBe("agent-local-1");
 		expect(parseResumeEntryData(appended[0]?.data)?.state).toBe("committed");
+	});
+
+	test("flushResumeHandleNow appends in-flight before send and fails closed without appendEntry", () => {
+		scopeTestUtils.reset();
+		scopeTestUtils.set("/tmp/project", "/tmp/session.jsonl", "sess-1");
+		resumeTestUtils.reset();
+		expect(() =>
+			flushResumeHandleNow({
+				agentId: "agent-local-1",
+				poolKey: "main",
+				sendState: { bootstrapped: true, contextFingerprint: "fp", incrementalSendCount: 0 },
+				storeIdentity: { version: 1, stateRoot: "/tmp/store" },
+				state: "in-flight",
+				agentInstanceId: "main",
+				credentialScopeId: "cred-1",
+			}),
+		).toThrow(/appendEntry/);
+		const appended: Array<{ type: string; data: unknown }> = [];
+		const handlers = new Map<string, Array<(event: unknown, ctx: unknown) => unknown>>();
+		const branch = [message("u1", null, "user")];
+		const ctx = {
+			cwd: "/tmp/project",
+			sessionManager: {
+				getSessionFile: () => "/tmp/session.jsonl",
+				getSessionId: () => "sess-1",
+				getBranch: () => branch,
+				getEntries: () => branch,
+			},
+		};
+		const pi = {
+			appendEntry(customType: string, data?: unknown) {
+				appended.push({ type: customType, data });
+			},
+			on(event: string, handler: (event: unknown, ctx: unknown) => unknown) {
+				const list = handlers.get(event) ?? [];
+				list.push(handler);
+				handlers.set(event, list);
+			},
+		};
+		registerCursorSessionResume(pi as never);
+		void handlers.get("session_start")?.[0]?.({ type: "session_start" }, ctx);
+		flushResumeHandleNow({
+			agentId: "agent-local-1",
+			poolKey: "main",
+			sendState: { bootstrapped: true, contextFingerprint: "fp", incrementalSendCount: 0 },
+			storeIdentity: { version: 1, stateRoot: "/tmp/store" },
+			state: "in-flight",
+			agentInstanceId: "main",
+			credentialScopeId: "cred-1",
+		});
+		expect(appended).toHaveLength(1);
+		expect(parseResumeEntryData(appended[0]?.data)?.state).toBe("in-flight");
+		expect(getMatchingResumeHandle("main", "cred-1")).toBeUndefined();
+	});
+
+	test("keeps ExtensionAPI this when flushing so OMP runtime.appendEntry is reachable", () => {
+		scopeTestUtils.reset();
+		scopeTestUtils.set("/tmp/project", "/tmp/session.jsonl", "sess-1");
+		resumeTestUtils.reset();
+		const appended: Array<{ type: string; data: unknown }> = [];
+		class FakeExtensionApi {
+			runtime = {
+				appendEntry(customType: string, data?: unknown) {
+					appended.push({ type: customType, data });
+				},
+			};
+			appendEntry(customType: string, data?: unknown) {
+				this.runtime.appendEntry(customType, data);
+			}
+			on() {}
+		}
+		registerCursorSessionResume(new FakeExtensionApi() as never);
+		flushResumeHandleNow({
+			agentId: "agent-local-1",
+			poolKey: "main",
+			sendState: { bootstrapped: true, contextFingerprint: "fp", incrementalSendCount: 0 },
+			storeIdentity: { version: 1, stateRoot: "/tmp/store" },
+			state: "in-flight",
+			agentInstanceId: "main",
+			credentialScopeId: "cred-1",
+		});
+		expect(appended).toHaveLength(1);
+		expect(parseResumeEntryData(appended[0]?.data)?.state).toBe("in-flight");
 	});
 
 	test("rejects dirty and in-flight handles at the resume gate", () => {
@@ -135,10 +221,24 @@ describe("session resume fold", () => {
 		resumeTestUtils.state.sessionId = "sess-1";
 		resumeTestUtils.state.cwd = "/tmp/project";
 		resumeTestUtils.state.activeHandle = validData({ state: "dirty" });
-		expect(getMatchingResumeHandle("main")).toBeUndefined();
+		expect(getMatchingResumeHandle("main", "cred-1")).toBeUndefined();
 		resumeTestUtils.state.activeHandle = validData({ state: "in-flight" });
-		expect(getMatchingResumeHandle("main")).toBeUndefined();
+		expect(getMatchingResumeHandle("main", "cred-1")).toBeUndefined();
 		resumeTestUtils.state.activeHandle = validData({ state: "committed" });
-		expect(getMatchingResumeHandle("main")?.agentId).toBe("agent-local-1");
+		expect(getMatchingResumeHandle("main", "cred-1")?.agentId).toBe("agent-local-1");
+		expect(getMatchingResumeHandle("main", "other-cred")).toBeUndefined();
+		resumeTestUtils.state.activeHandle = validData({ state: "committed", credentialScopeId: undefined });
+		expect(getMatchingResumeHandle("main", "cred-1")).toBeUndefined();
+	});
+
+	test("a later in-flight record supersedes an older committed handle on the same lineage", () => {
+		const user = message("u1", null, "user");
+		const afterUser = hashBranchStep(EMPTY_BRANCH_HASH, user);
+		const committed = validData({ branchPathHash: afterUser, state: "committed" });
+		const inflight = validData({ branchPathHash: afterUser, state: "in-flight" });
+		const r1 = resume("r1", "u1", committed);
+		const r2 = resume("r2", "u1", inflight);
+		const fold = foldResumeHandle([user, r1], scope, new Set(), [user, r1, r2]);
+		expect(fold.activeHandle).toBeUndefined();
 	});
 });

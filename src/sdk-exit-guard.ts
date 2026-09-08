@@ -10,6 +10,10 @@ type ProcessWithReallyExit = NodeJS.Process & { reallyExit?: (code?: number) => 
  * Import this module before `@cursor/sdk` so signal-exit captures a swallow
  * instead of OMP's throwing guard. Scoped `withSdkExitSuppressed` still covers
  * direct `process.exit` during create/send/dispose.
+ *
+ * Nested/overlapping calls share one installed swallow and restore the host
+ * functions only when the last call exits. Async save/restore of the global
+ * slots is not safe.
  */
 export function isSdkHostExitCode(code?: number | string): boolean {
 	if (code === undefined || code === 0 || code === 1) return true;
@@ -29,6 +33,9 @@ function isNativeFunction(fn: Function): boolean {
 }
 
 let installed = false;
+let suppressDepth = 0;
+let hostExit: typeof process.exit | undefined;
+let hostReallyExit: ((code?: number) => void) | undefined;
 
 export function installSdkExitGuard(): void {
 	if (installed) return;
@@ -39,23 +46,37 @@ export function installSdkExitGuard(): void {
 	proc.reallyExit = wrapReallyExitForSdk(proc.reallyExit.bind(process)) as typeof proc.reallyExit;
 }
 
-export async function withSdkExitSuppressed<T>(fn: () => Promise<T>): Promise<T> {
+function installScopedSwallow(): void {
 	const proc = process as ProcessWithReallyExit;
-	const exit = process.exit.bind(process);
-	const reallyExit = proc.reallyExit?.bind(process);
+	hostExit = process.exit.bind(process);
+	hostReallyExit = proc.reallyExit?.bind(process);
 	const swallow = ((code?: number) => {
 		if (isSdkHostExitCode(code)) return undefined as never;
-		throw new Error(`Cursor SDK attempted process.exit(${code})`);
+		if (!hostExit) throw new Error(`Cursor SDK attempted process.exit(${code})`);
+		return hostExit(code);
 	}) as typeof process.exit;
 	process.exit = swallow;
-	if (typeof reallyExit === "function") {
-		proc.reallyExit = wrapReallyExitForSdk(reallyExit) as typeof proc.reallyExit;
+	if (typeof hostReallyExit === "function") {
+		proc.reallyExit = wrapReallyExitForSdk(hostReallyExit) as typeof proc.reallyExit;
 	}
+}
+
+function restoreHostExit(): void {
+	const proc = process as ProcessWithReallyExit;
+	if (hostExit) process.exit = hostExit;
+	if (hostReallyExit) proc.reallyExit = hostReallyExit;
+	hostExit = undefined;
+	hostReallyExit = undefined;
+}
+
+export async function withSdkExitSuppressed<T>(fn: () => Promise<T>): Promise<T> {
+	if (suppressDepth === 0) installScopedSwallow();
+	suppressDepth += 1;
 	try {
 		return await fn();
 	} finally {
-		process.exit = exit;
-		if (reallyExit) proc.reallyExit = reallyExit;
+		suppressDepth -= 1;
+		if (suppressDepth === 0) restoreHostExit();
 	}
 }
 

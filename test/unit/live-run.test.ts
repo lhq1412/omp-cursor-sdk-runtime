@@ -13,6 +13,9 @@ import {
 	startSend,
 	waitForParked,
 	waitForResult,
+	bindLiveAbort,
+	cancelLiveRun,
+	waitForCancelled,
 } from "../../src/live-run.ts";
 
 function dummyExec() {
@@ -72,5 +75,38 @@ describe("live-run park-and-yield", () => {
 		resumeParked(live, { messages: [toolResult("call-3", "ok")] } as Context);
 		await expect(waitForResult(live)).resolves.toMatchObject({ status: "finished" });
 		await expect(send).resolves.toMatchObject({ status: "finished" });
+	});
+
+	test("pre-cancelled send cancels the run once the handle is attached", async () => {
+		liveRunTestUtils.clear();
+		const live = createLiveRun(dummyExec());
+		let cancelled = 0;
+		const controller = new AbortController();
+		controller.abort();
+		bindLiveAbort(live, controller.signal);
+		const send = startSend(live, async () => {
+			return {
+				supports: (op: string) => op === "cancel",
+				cancel: async () => {
+					cancelled += 1;
+				},
+				wait: async (): Promise<RunResult> => ({ status: "cancelled" }) as RunResult,
+			} as unknown as Run;
+		});
+		await expect(waitForCancelled(live)).resolves.toBeUndefined();
+		await expect(send).resolves.toMatchObject({ status: "cancelled" });
+		expect(cancelled).toBe(1);
+	});
+
+	test("cancel during park rejects callbacks and stays bound after streamSimple would return", async () => {
+		liveRunTestUtils.clear();
+		const live = createLiveRun(dummyExec());
+		const execution = parkToolCall(live, "read", { path: "a.ts" }, "call-4");
+		const controller = new AbortController();
+		bindLiveAbort(live, controller.signal);
+		controller.abort();
+		await expect(execution).rejects.toThrow(/cancelled/);
+		await expect(parkToolCall(live, "read", { path: "b.ts" }, "call-5")).rejects.toThrow(/cancelled/);
+		await cancelLiveRun(live);
 	});
 });

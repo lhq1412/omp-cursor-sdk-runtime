@@ -8,6 +8,7 @@ const OPEN_SCHEMA: Record<string, unknown> = { type: "object", additionalPropert
 
 const extras = new Map<string, GrantedTool>();
 let liveCatalog: (() => readonly (string | CatalogToolInfo)[]) | undefined;
+let liveEnabled: (() => readonly string[]) | undefined;
 
 export function isMcpToolName(name: string): boolean {
 	return name.startsWith("mcp__");
@@ -44,9 +45,17 @@ export interface CatalogToolInfo {
 	parameters?: unknown;
 }
 
+export interface MergeGrantedToolsOptions {
+	/**
+	 * Stock OMP may attach enabled-but-unmounted `mcp__*` tools. Explicit host
+	 * snapshots are already the authorization boundary and must not be expanded.
+	 */
+	catalogExtras?: boolean;
+}
+
 /**
  * Index registered OMP tools for MCP schema lookup. `getAllTools()` is not a
- * grant list; merge only attaches `mcp__*` names missing from this turn's grant.
+ * grant list.
  */
 export function snapshotHostToolCatalog(allTools: readonly (string | CatalogToolInfo)[]): void {
 	extras.clear();
@@ -67,33 +76,50 @@ export function extraGrantedTools(): GrantedTool[] {
 	return [...extras.values()];
 }
 
+function refreshCatalog(): void {
+	if (!liveCatalog) return;
+	try {
+		snapshotHostToolCatalog(liveCatalog());
+	} catch {
+		// Catalog is best-effort; keep the last successful snapshot.
+	}
+}
+
+function enabledToolNames(): Set<string> | undefined {
+	if (!liveEnabled) return undefined;
+	try {
+		return new Set(liveEnabled());
+	} catch {
+		return undefined;
+	}
+}
+
 /**
  * This turn's grant set is authoritative. An empty grant stays empty.
- * Catalog extras may only attach enabled `mcp__*` tools that xdev unmounted
- * from `context.tools`; they must never re-introduce bash/edit/etc.
+ * Catalog extras attach only `mcp__*` names that are in the current enabled
+ * set (`getActiveTools()` / `getEnabledToolNames()`), looked up from the full
+ * catalog for schema. Disabled or unknown-authorization MCP is not added.
  */
-export function mergeGrantedTools(fromContext: readonly GrantedTool[]): GrantedTool[] {
-	if (liveCatalog) {
-		try {
-			snapshotHostToolCatalog(liveCatalog());
-		} catch {
-			// Catalog is best-effort; keep the last successful snapshot.
-		}
-	}
+export function mergeGrantedTools(fromContext: readonly GrantedTool[], options?: MergeGrantedToolsOptions): GrantedTool[] {
+	refreshCatalog();
 	if (fromContext.length === 0) return [];
+	if (options?.catalogExtras === false) return [...fromContext];
+	const enabled = enabledToolNames();
+	if (!enabled) return [...fromContext];
 	const byName = new Map<string, GrantedTool>();
 	for (const tool of fromContext) {
 		byName.set(tool.name, tool);
 	}
 	for (const extra of extras.values()) {
-		if (byName.has(extra.name) || !isMcpToolName(extra.name)) continue;
+		if (byName.has(extra.name) || !isMcpToolName(extra.name) || !enabled.has(extra.name)) continue;
 		byName.set(extra.name, extra);
 	}
 	return [...byName.values()];
 }
 
-export function registerHostToolCatalog(pi: Pick<ExtensionAPI, "on" | "getAllTools">): void {
+export function registerHostToolCatalog(pi: Pick<ExtensionAPI, "on" | "getAllTools" | "getActiveTools">): void {
 	liveCatalog = () => pi.getAllTools();
+	liveEnabled = () => pi.getActiveTools();
 	const snapshot = () => {
 		snapshotHostToolCatalog(pi.getAllTools());
 	};
@@ -111,9 +137,13 @@ export const __testUtils = {
 	clear() {
 		extras.clear();
 		liveCatalog = undefined;
+		liveEnabled = undefined;
 	},
 	setLiveCatalog(loader: (() => readonly (string | CatalogToolInfo)[]) | undefined) {
 		liveCatalog = loader;
+	},
+	setLiveEnabled(loader: (() => readonly string[]) | undefined) {
+		liveEnabled = loader;
 	},
 	extras,
 };

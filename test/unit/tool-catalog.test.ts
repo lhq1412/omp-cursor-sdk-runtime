@@ -17,7 +17,7 @@ function tool(name: string): Tool {
 }
 
 describe("host tool catalog", () => {
-	test("adds xd://-mounted MCP tools even when they appear in getEnabledToolNames", () => {
+	test("adds enabled xd://-mounted MCP tools even when they appear in getActiveTools", () => {
 		catalogTestUtils.clear();
 		snapshotHostToolCatalog([
 			"read",
@@ -29,6 +29,7 @@ describe("host tool catalog", () => {
 			},
 			"mcp__exa_search",
 		]);
+		catalogTestUtils.setLiveEnabled(() => ["read", "bash", "mcp__github_list_issues", "mcp__exa_search"]);
 		const granted = mergeGrantedTools(
 			grantedToolsFromContext({ messages: [], tools: [tool("read"), tool("bash")] }),
 		);
@@ -41,6 +42,7 @@ describe("host tool catalog", () => {
 	test("does not override schemas already present in context.tools", () => {
 		catalogTestUtils.clear();
 		snapshotHostToolCatalog(["read", "mcp__dup"]);
+		catalogTestUtils.setLiveEnabled(() => ["mcp__dup"]);
 		const granted = mergeGrantedTools([
 			{ name: "mcp__dup", description: "from context", inputSchema: { type: "object", properties: { q: { type: "string" } } } },
 		]);
@@ -56,6 +58,7 @@ describe("host tool catalog", () => {
 		catalogTestUtils.setLiveCatalog(() => [
 			{ name: "mcp__late_connect", description: "connected after session_start", parameters: { type: "object" } },
 		]);
+		catalogTestUtils.setLiveEnabled(() => ["read", "mcp__late_connect"]);
 		const granted = mergeGrantedTools(grantedToolsFromContext({ messages: [], tools: [tool("read")] }));
 		expect(granted.map((item) => item.name)).toContain("mcp__late_connect");
 	});
@@ -63,14 +66,41 @@ describe("host tool catalog", () => {
 	test("keeps an empty grant empty even when the catalog has local tools", () => {
 		catalogTestUtils.clear();
 		snapshotHostToolCatalog(["read", "bash", "edit", "mcp__github_list_issues"]);
+		catalogTestUtils.setLiveEnabled(() => ["read", "bash", "edit", "mcp__github_list_issues"]);
 		expect(mergeGrantedTools([])).toEqual([]);
 	});
 
-	test("does not expand a read-only grant with catalog bash or edit", () => {
+	test("does not expand a read-only grant with catalog bash, edit, or disabled MCP", () => {
 		catalogTestUtils.clear();
-		snapshotHostToolCatalog(["read", "bash", "edit", "mcp__github_list_issues"]);
+		snapshotHostToolCatalog(["read", "bash", "edit", "mcp__github_list_issues", "mcp__disabled_delete"]);
+		catalogTestUtils.setLiveEnabled(() => ["read"]);
+		const granted = mergeGrantedTools([{ name: "read", description: "read", inputSchema: { type: "object" } }]);
+		expect(granted.map((item) => item.name)).toEqual(["read"]);
+	});
+
+	test("adds only enabled MCP extras from the catalog", () => {
+		catalogTestUtils.clear();
+		snapshotHostToolCatalog(["read", "bash", "edit", "mcp__github_list_issues", "mcp__disabled_delete"]);
+		catalogTestUtils.setLiveEnabled(() => ["read", "mcp__github_list_issues"]);
 		const granted = mergeGrantedTools([{ name: "read", description: "read", inputSchema: { type: "object" } }]);
 		expect(granted.map((item) => item.name)).toEqual(["read", "mcp__github_list_issues"]);
+	});
+
+	test("does not add extras when the enabled set cannot be determined", () => {
+		catalogTestUtils.clear();
+		snapshotHostToolCatalog(["read", "mcp__github_list_issues"]);
+		const granted = mergeGrantedTools([{ name: "read", description: "read", inputSchema: { type: "object" } }]);
+		expect(granted.map((item) => item.name)).toEqual(["read"]);
+	});
+
+	test("does not expand an explicit host grant", () => {
+		catalogTestUtils.clear();
+		snapshotHostToolCatalog(["read", "mcp__github_list_issues"]);
+		catalogTestUtils.setLiveEnabled(() => ["read", "mcp__github_list_issues"]);
+		const granted = mergeGrantedTools([{ name: "read", description: "read", inputSchema: { type: "object" } }], {
+			catalogExtras: false,
+		});
+		expect(granted.map((item) => item.name)).toEqual(["read"]);
 	});
 
 	test("maps long MCP names to unique SDK identifiers", () => {

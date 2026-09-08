@@ -43,4 +43,34 @@ describe("sdk exit guard", () => {
 			process.exit = original;
 		}
 	});
+
+	test("overlapping withSdkExitSuppressed restores host exit only after the last call", async () => {
+		const original = process.exit;
+		const seen: number[] = [];
+		process.exit = ((code?: number) => {
+			seen.push(code ?? -1);
+			return undefined as never;
+		}) as typeof process.exit;
+		try {
+			let releaseA!: () => void;
+			const holdA = new Promise<void>((resolve) => {
+				releaseA = resolve;
+			});
+			const a = withSdkExitSuppressed(async () => {
+				await holdA;
+			});
+			const b = withSdkExitSuppressed(async () => {
+				process.exit(1);
+			});
+			await b;
+			process.exit(1);
+			expect(seen).toEqual([]);
+			releaseA();
+			await a;
+			process.exit(1);
+			expect(seen).toEqual([1]);
+		} finally {
+			process.exit = original;
+		}
+	});
 });

@@ -5,7 +5,7 @@ import type { BindingState } from "./contracts.js";
 import type { SendState } from "./context.js";
 import { getCursorSessionScopeKey } from "./session-scope.js";
 
-export const RESUME_ENTRY_VERSION = 2;
+export const RESUME_ENTRY_VERSION = 3;
 
 export interface ResumeStoreIdentity {
 	version: 1;
@@ -37,6 +37,7 @@ export interface ResumeEntryData {
 	storeIdentity?: ResumeStoreIdentity;
 	state?: BindingState;
 	agentInstanceId?: string;
+	credentialScopeId?: string;
 }
 
 export interface ResumeScope {
@@ -53,6 +54,7 @@ interface PendingResumeHandle {
 	storeIdentity: ResumeStoreIdentity;
 	state: BindingState;
 	agentInstanceId: string;
+	credentialScopeId?: string;
 }
 
 interface ResumeState {
@@ -160,6 +162,9 @@ export function parseResumeEntryData(value: unknown): ResumeEntryData | undefine
 		...(storeIdentity ? { storeIdentity } : {}),
 		state: parseBindingState(record.state),
 		...(typeof record.agentInstanceId === "string" ? { agentInstanceId: record.agentInstanceId } : {}),
+		...(typeof record.credentialScopeId === "string" && record.credentialScopeId
+			? { credentialScopeId: record.credentialScopeId }
+			: {}),
 	};
 }
 
@@ -274,7 +279,7 @@ export function getResumeBranchPathHash(): string {
 	return state.branchPathHash;
 }
 
-export function getMatchingResumeHandle(poolKey: string): ResumeEntryData | undefined {
+export function getMatchingResumeHandle(poolKey: string, credentialScopeId?: string): ResumeEntryData | undefined {
 	const handle = state.activeHandle;
 	if (!handle || !isLocalAgentId(handle.agentId)) return undefined;
 	if (handle.state !== "committed") return undefined;
@@ -284,6 +289,7 @@ export function getMatchingResumeHandle(poolKey: string): ResumeEntryData | unde
 	if (handle.sessionId !== state.sessionId) return undefined;
 	if (handle.cwd !== state.cwd) return undefined;
 	if (handle.compactionGeneration !== state.compactionGeneration) return undefined;
+	if (!handle.credentialScopeId || !credentialScopeId || handle.credentialScopeId !== credentialScopeId) return undefined;
 	return {
 		...handle,
 		sendState: { ...handle.sendState },
@@ -299,15 +305,12 @@ export function persistResumeHandle(input: PendingResumeHandle): void {
 		storeIdentity: { ...input.storeIdentity },
 		state: input.state,
 		agentInstanceId: input.agentInstanceId,
+		...(input.credentialScopeId ? { credentialScopeId: input.credentialScopeId } : {}),
 	};
 }
 
-function flushPendingHandle(branch: readonly ResumeSessionEntry[]): void {
-	restoreFromBranch(branch);
-	const pending = state.pendingHandle;
-	state.pendingHandle = undefined;
-	if (!pending || !state.appendEntry) return;
-	const data: ResumeEntryData = {
+function resumeEntryFromPending(pending: PendingResumeHandle): ResumeEntryData {
+	return {
 		version: RESUME_ENTRY_VERSION,
 		runtime: "local",
 		agentId: pending.agentId,
@@ -323,12 +326,43 @@ function flushPendingHandle(branch: readonly ResumeSessionEntry[]): void {
 		storeIdentity: { ...pending.storeIdentity },
 		state: pending.state,
 		agentInstanceId: pending.agentInstanceId,
+		...(pending.credentialScopeId ? { credentialScopeId: pending.credentialScopeId } : {}),
 	};
+}
+
+/**
+ * Persist a resume record immediately. Used to invalidate a previous committed
+ * binding before the SDK agent is advanced. Failure must not start send.
+ */
+export function flushResumeHandleNow(input: PendingResumeHandle): void {
+	if (!isLocalAgentId(input.agentId)) {
+		throw new Error("Cannot persist a Cursor SDK resume handle without a local agent id");
+	}
+	persistResumeHandle(input);
+	if (!state.appendEntry) {
+		throw new Error("Cannot persist Cursor SDK resume invalidation without a session appendEntry hook");
+	}
+	const pending = state.pendingHandle;
+	if (!pending) {
+		throw new Error("Cannot persist Cursor SDK resume invalidation without a pending handle");
+	}
+	state.pendingHandle = undefined;
+	const data = resumeEntryFromPending(pending);
+	state.appendEntry<ResumeEntryData>(CURSOR_SESSION_AGENT_RESUME_ENTRY_TYPE, data);
+	state.activeHandle = data;
+}
+
+function flushPendingHandle(branch: readonly ResumeSessionEntry[]): void {
+	restoreFromBranch(branch);
+	const pending = state.pendingHandle;
+	state.pendingHandle = undefined;
+	if (!pending || !state.appendEntry) return;
+	const data = resumeEntryFromPending(pending);
 	try {
 		state.appendEntry<ResumeEntryData>(CURSOR_SESSION_AGENT_RESUME_ENTRY_TYPE, data);
 		state.activeHandle = data;
 	} catch {
-		// Resume persistence is an optimization; a failed append must not fail the turn.
+		// Committed flush is after the turn; in-flight invalidation already landed.
 	}
 }
 
@@ -342,7 +376,11 @@ function restoreFromSessionManager(sessionManager: {
 }
 
 export function registerCursorSessionResume(pi: Pick<ExtensionAPI, "on" | "appendEntry">): void {
-	state.appendEntry = pi.appendEntry;
+	// Keep `this` on the ExtensionAPI. Detaching `pi.appendEntry` makes OMP
+	// evaluate `this.runtime.appendEntry` against the wrong object.
+	state.appendEntry = (customType, data) => {
+		pi.appendEntry(customType, data);
+	};
 	pi.on("session_start", (_event, ctx) => {
 		state.scopeKey = getCursorSessionScopeKey();
 		state.sessionFile = ctx.sessionManager.getSessionFile?.() ?? undefined;

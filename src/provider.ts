@@ -11,8 +11,10 @@ import {
 	resumeParked,
 	startSend,
 	stopWaitingForPark,
+	waitForCancelled,
 	waitForParked,
 	waitForResult,
+	bindLiveAbort,
 } from "./live-run.js";
 import { commitTurn, finishLiveKeepAgent, finishTurnFailed, prepareTurn, type RuntimeSlot } from "./session-runtime.js";
 import { getCursorSessionCwd } from "./session-scope.js";
@@ -45,7 +47,9 @@ export function streamCursorRuntime(
 			const cwd = snapshot?.cwd ?? (typeof options?.cwd === "string" && options.cwd ? options.cwd : getCursorSessionCwd());
 			const agentInstanceId = snapshot?.agentInstanceId ?? DEFAULT_AGENT_INSTANCE_ID;
 			const apiKey = requireCursorApiKey(typeof options?.apiKey === "string" ? options.apiKey : undefined);
-			const grantedTools = mergeGrantedTools(snapshot ? snapshot.grantedTools : grantedToolsFromContext(context));
+			const grantedTools = snapshot
+				? [...snapshot.grantedTools]
+				: mergeGrantedTools(grantedToolsFromContext(context));
 			stream.push({ type: "start", partial });
 
 			const prepared = await prepareTurn({
@@ -60,6 +64,20 @@ export function streamCursorRuntime(
 			const { slot: preparedSlot, live, continuing, customTools, prompt, incremental } = prepared;
 			slot = preparedSlot;
 			live.sink = { stream, partial };
+
+			const abortSignal = host?.signal ?? options?.signal;
+			bindLiveAbort(live, abortSignal, () => {
+				if (!slot) return;
+				void finishTurnFailed(slot, "aborted");
+			});
+			if (live.cancelled) {
+				partial.stopReason = "aborted";
+				partial.errorMessage = "Cancelled";
+				stream.push({ type: "error", reason: "aborted", error: partial });
+				stream.end(partial);
+				await finishTurnFailed(preparedSlot, "aborted");
+				return;
+			}
 
 			if (continuing) {
 				resumeParked(live, context);
@@ -85,19 +103,18 @@ export function streamCursorRuntime(
 				void starting.catch(() => undefined);
 			}
 
-			const abortSignal = host?.signal ?? options?.signal;
-			const onAbort = () => {
-				if (!slot) return;
-				void finishTurnFailed(slot, "aborted");
-			};
-			abortSignal?.addEventListener("abort", onAbort, { once: true });
-			try {
-				if (abortSignal?.aborted && live.run?.supports("cancel")) {
-					await live.run.cancel();
-				}
-				const parked = waitForParked(live);
+			const parked = waitForParked(live);
 				const finished = waitForResult(live).then((result) => ({ kind: "finished" as const, result }));
-				const first = await Promise.race([parked.then(() => ({ kind: "parked" as const })), finished]);
+				const cancelled = waitForCancelled(live).then(() => ({ kind: "cancelled" as const }));
+				const first = await Promise.race([parked.then(() => ({ kind: "parked" as const })), finished, cancelled]);
+				if (first.kind === "cancelled" || live.cancelled) {
+					partial.stopReason = "aborted";
+					partial.errorMessage = "Cancelled";
+					stream.push({ type: "error", reason: "aborted", error: partial });
+					stream.end(partial);
+					await finishTurnFailed(preparedSlot, "cancelled");
+					return;
+				}
 				if (first.kind === "parked") {
 					const batch = await collectParkedBatch(live);
 					for (const call of batch) {
@@ -135,7 +152,7 @@ export function streamCursorRuntime(
 						branchEpoch: snapshot?.branchEpoch ?? 0,
 						sdkAgentId: live.agent?.agentId ?? "",
 						workspaceIdentity: cwd,
-						credentialScopeId: "cursor-sdk",
+						credentialScopeId: preparedSlot.credentialScopeId ?? "cursor-sdk",
 						configFingerprint: snapshot?.configFingerprint ?? "",
 						committedLeafId: snapshot?.committedLeafId ?? "",
 						effectiveHistoryDigest: preparedSlot.sendState.contextFingerprint,
@@ -145,9 +162,6 @@ export function streamCursorRuntime(
 				stream.push({ type: "done", reason: "stop", message: partial });
 				stream.end(partial);
 				await finishLiveKeepAgent(preparedSlot.key, "run finished");
-			} finally {
-				abortSignal?.removeEventListener("abort", onAbort);
-			}
 		} catch (error) {
 			if (slot) await finishTurnFailed(slot, "send failed");
 			partial.stopReason = "error";

@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { activeUserInput, activeUserText, computeContextFingerprint, emptySendState, planSend } from "../../src/context.ts";
+import { activeUserInput, activeUserText, bootstrapUserInput, computeContextFingerprint, emptySendState, planSend, turnPrompt } from "../../src/context.ts";
 import type { Context } from "@oh-my-pi/pi-ai";
 
 function context(messages: Context["messages"], systemPrompt = ["sys"]): Context {
@@ -59,6 +59,24 @@ describe("send policy", () => {
 		expect(activeUserInput(ctx)).toEqual({
 			text: "",
 			images: [{ data: "abc", mimeType: "image/png" }],
+		});
+	});
+
+	test("bootstraps prior history with the current user request and never copies the system prompt", () => {
+		const ctx = context(
+			[
+				{ role: "user", content: "target is /workspace/important.ts", timestamp: 1 } as Context["messages"][number],
+				{ role: "assistant", content: [{ type: "text", text: "ok" }], timestamp: 2 } as Context["messages"][number],
+				{ role: "user", content: "continue that edit", timestamp: 3 } as Context["messages"][number],
+			],
+			["You are an OMP agent with extra instructions."],
+		);
+		const prompt = bootstrapUserInput(ctx);
+		expect(prompt.text).toContain("target is /workspace/important.ts");
+		expect(prompt.text).toContain("continue that edit");
+		expect(prompt.text).not.toContain("OMP agent");
+		expect(turnPrompt({ mode: "incremental", resetAgent: false, reason: "incremental" }, ctx)).toEqual({
+			text: "continue that edit",
 		});
 	});
 });
