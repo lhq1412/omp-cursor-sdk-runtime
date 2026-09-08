@@ -62,6 +62,35 @@ describe("send policy", () => {
 		});
 	});
 
+	test("bootstraps assistant.content toolCall blocks with name, id, arguments, and later toolResult", () => {
+		const ctx = context([
+			{ role: "user", content: "run the listing", timestamp: 1 } as Context["messages"][number],
+			{
+				role: "assistant",
+				content: [
+					{ type: "text", text: "listing files" },
+					{ type: "toolCall", id: "call-1", name: "bash", arguments: { command: "ls -la" } },
+				],
+				timestamp: 2,
+			} as Context["messages"][number],
+			{
+				role: "toolResult",
+				toolCallId: "call-1",
+				toolName: "bash",
+				content: [{ type: "text", text: "a.ts" }],
+				isError: false,
+				timestamp: 3,
+			} as Context["messages"][number],
+			{ role: "user", content: "continue", timestamp: 4 } as Context["messages"][number],
+		]);
+		const prompt = bootstrapUserInput(ctx);
+		expect(prompt.text).toContain("toolCall bash (call-1)");
+		expect(prompt.text).toContain("ls -la");
+		expect(prompt.text).toContain("toolResult bash (call-1): a.ts");
+		expect(prompt.text).toContain("continue");
+		expect(prompt.text).not.toMatch(/role":"toolCall"/);
+	});
+
 	test("bootstraps prior history with the current user request and never copies the system prompt", () => {
 		const ctx = context(
 			[

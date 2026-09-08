@@ -54,6 +54,10 @@ export function normalizeRuntimeCwd(cwd: string): string {
 
 export function agentConfigMismatch(slot: RuntimeSlot, cwd: string, nextCredentialScopeId: string): boolean {
 	if (!slot.agent) return false;
+	return slotIdentityMismatch(slot, cwd, nextCredentialScopeId);
+}
+
+export function slotIdentityMismatch(slot: RuntimeSlot, cwd: string, nextCredentialScopeId: string): boolean {
 	if (!slot.createCwd || !slot.credentialScopeId) return true;
 	return normalizeRuntimeCwd(slot.createCwd) !== normalizeRuntimeCwd(cwd) || slot.credentialScopeId !== nextCredentialScopeId;
 }
@@ -120,6 +124,41 @@ function resumePending(slot: RuntimeSlot, state: BindingState) {
 	};
 }
 
+function persistDirtyHandle(slot: RuntimeSlot, handle: {
+	agentId: string;
+	sendState: SendState;
+	storeIdentity?: ResumeStoreIdentity;
+	credentialScopeId?: string;
+}): void {
+	const dirty = {
+		agentId: handle.agentId,
+		poolKey: slot.agentInstanceId,
+		sendState: { ...handle.sendState },
+		storeIdentity: handle.storeIdentity ?? slot.storeIdentity,
+		state: "dirty" as const,
+		agentInstanceId: slot.agentInstanceId,
+		...(handle.credentialScopeId ? { credentialScopeId: handle.credentialScopeId } : {}),
+	};
+	try {
+		flushResumeHandleNow(dirty);
+	} catch {
+		persistResumeHandle(dirty);
+	}
+}
+
+async function persistDirtyAndDisposeAgent(slot: RuntimeSlot): Promise<void> {
+	const dirty = resumePending(slot, "dirty");
+	if (dirty) persistDirtyHandle(slot, dirty);
+	if (slot.agent) {
+		await disposeAgent(slot.agent);
+		slot.agent = undefined;
+	}
+	slot.bindingState = "dirty";
+	slot.createCwd = undefined;
+	slot.credentialScopeId = undefined;
+	slot.sendState = emptySendState();
+}
+
 function invalidateBindingBeforeSend(slot: RuntimeSlot, agentId: string): void {
 	flushResumeHandleNow({
 		agentId,
@@ -147,6 +186,10 @@ export async function prepareTurn(input: OpenRuntimeTurnInput): Promise<Prepared
 	}
 
 	if (existingLive && continuing) {
+		if (slotIdentityMismatch(slot, cwd, nextCredential)) {
+			await finishTurnFailed(slot, "identity changed during parked tool calls");
+			throw new Error("Cannot continue parked Cursor SDK tool calls after cwd or credentials changed");
+		}
 		return { slot, live: existingLive, continuing: true, customTools: {}, incremental: true };
 	}
 
@@ -154,56 +197,36 @@ export async function prepareTurn(input: OpenRuntimeTurnInput): Promise<Prepared
 		await disposeLiveRun(slot.key, "OMP started a new user turn", false);
 	}
 
-	const plan = planSend(slot.sendState, input.context);
 	const configMismatch = agentConfigMismatch(slot, cwd, nextCredential);
-	const unsafeBinding = slot.bindingState !== "committed" || configMismatch;
-	if ((plan.resetAgent || unsafeBinding) && slot.agent) {
-		const dirty = resumePending(slot, "dirty");
-		if (dirty) {
-			try {
-				flushResumeHandleNow(dirty);
-			} catch {
-				persistResumeHandle(dirty);
-			}
-		}
-		await disposeAgent(slot.agent);
-		slot.agent = undefined;
-		slot.bindingState = "dirty";
-		slot.createCwd = undefined;
-		slot.credentialScopeId = undefined;
+	const unsafeBinding = Boolean(slot.agent) && (slot.bindingState !== "committed" || configMismatch);
+	if (unsafeBinding) {
+		await persistDirtyAndDisposeAgent(slot);
 	}
 
-	const resumeHandle = getMatchingResumeHandle(input.agentInstanceId, nextCredential);
-	if (plan.resetAgent && resumeHandle) {
-		try {
-			flushResumeHandleNow({
-				agentId: resumeHandle.agentId,
-				poolKey: slot.agentInstanceId,
-				sendState: { ...resumeHandle.sendState },
-				storeIdentity: resumeHandle.storeIdentity ?? slot.storeIdentity,
-				state: "dirty",
-				agentInstanceId: slot.agentInstanceId,
-				...(resumeHandle.credentialScopeId ? { credentialScopeId: resumeHandle.credentialScopeId } : {}),
-			});
-		} catch {
-			persistResumeHandle({
-				agentId: resumeHandle.agentId,
-				poolKey: slot.agentInstanceId,
-				sendState: { ...resumeHandle.sendState },
-				storeIdentity: resumeHandle.storeIdentity ?? slot.storeIdentity,
-				state: "dirty",
-				agentInstanceId: slot.agentInstanceId,
-				...(resumeHandle.credentialScopeId ? { credentialScopeId: resumeHandle.credentialScopeId } : {}),
-			});
-		}
-	} else if (resumeHandle && !slot.agent) {
+	const resumeHandle = getMatchingResumeHandle(input.agentInstanceId, nextCredential, cwd);
+	if (resumeHandle && !slot.agent) {
 		slot.sendState = { ...resumeHandle.sendState };
 		slot.bindingState = "committed";
 		slot.createCwd = resumeHandle.cwd;
 		slot.credentialScopeId = resumeHandle.credentialScopeId;
 		slot.storeIdentity = resumeHandle.storeIdentity ?? slot.storeIdentity;
 	}
-	const savedAgentId = plan.resetAgent || slot.bindingState !== "committed" ? undefined : (slot.agent?.agentId ?? resumeHandle?.agentId);
+
+	let plan = planSend(slot.sendState, input.context);
+	if (plan.resetAgent) {
+		if (slot.agent) {
+			await persistDirtyAndDisposeAgent(slot);
+		} else if (resumeHandle) {
+			persistDirtyHandle(slot, resumeHandle);
+			slot.bindingState = "dirty";
+			slot.createCwd = undefined;
+			slot.credentialScopeId = undefined;
+			slot.sendState = emptySendState();
+		}
+		plan = planSend(slot.sendState, input.context);
+	}
+
+	const savedAgentId = slot.agent?.agentId ?? (slot.bindingState === "committed" ? resumeHandle?.agentId : undefined);
 	const store = openScopedJsonlStore(cwd, scopeKey);
 	slot.storeIdentity = { version: 1, stateRoot: storeRootForScope(cwd, scopeKey) };
 

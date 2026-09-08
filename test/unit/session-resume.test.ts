@@ -1,3 +1,6 @@
+import { appendFileSync, mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, test } from "bun:test";
 import { CURSOR_SESSION_AGENT_RESUME_ENTRY_TYPE } from "../../src/constants.ts";
 import {
@@ -85,17 +88,22 @@ describe("session resume fold", () => {
 		expect(fold.compactionGeneration).toBe(1);
 	});
 
-	test("flushes a pending resume handle on turn_end", async () => {
-		scopeTestUtils.reset();
-		scopeTestUtils.set("/tmp/project", "/tmp/session.jsonl", "sess-1");
-		resumeTestUtils.reset();
+	function registerResume(mode: "write" | "swallow" | "missing-file" = "write"): {
+		appended: Array<{ type: string; data: unknown }>;
+		sessionFile: string;
+		handlers: Map<string, Array<(event: unknown, ctx: unknown) => unknown>>;
+		ctx: { cwd: string; sessionManager: Record<string, unknown> };
+	} {
 		const appended: Array<{ type: string; data: unknown }> = [];
 		const handlers = new Map<string, Array<(event: unknown, ctx: unknown) => unknown>>();
+		const sessionFile = join(mkdtempSync(join(tmpdir(), "omp-csr-resume-")), "session.jsonl");
+		writeFileSync(sessionFile, "");
+		scopeTestUtils.set("/tmp/project", mode === "missing-file" ? undefined : sessionFile, "sess-1");
 		const branch = [message("u1", null, "user")];
 		const ctx = {
 			cwd: "/tmp/project",
 			sessionManager: {
-				getSessionFile: () => "/tmp/session.jsonl",
+				getSessionFile: () => (mode === "missing-file" ? undefined : sessionFile),
 				getSessionId: () => "sess-1",
 				getBranch: () => branch,
 				getEntries: () => branch,
@@ -104,6 +112,9 @@ describe("session resume fold", () => {
 		const pi = {
 			appendEntry(customType: string, data?: unknown) {
 				appended.push({ type: customType, data });
+				if (mode === "write") {
+					appendFileSync(sessionFile, `${JSON.stringify({ type: "custom", customType, data })}\n`);
+				}
 			},
 			on(event: string, handler: (event: unknown, ctx: unknown) => unknown) {
 				const list = handlers.get(event) ?? [];
@@ -112,7 +123,14 @@ describe("session resume fold", () => {
 			},
 		};
 		registerCursorSessionResume(pi as never);
-		await handlers.get("session_start")?.[0]?.({ type: "session_start" }, ctx);
+		void handlers.get("session_start")?.[0]?.({ type: "session_start" }, ctx);
+		return { appended, sessionFile, handlers, ctx };
+	}
+
+	test("flushes a pending resume handle on turn_end", async () => {
+		scopeTestUtils.reset();
+		resumeTestUtils.reset();
+		const { appended, handlers, ctx } = registerResume();
 		persistResumeHandle({
 			agentId: "agent-local-1",
 			poolKey: "main",
@@ -131,7 +149,6 @@ describe("session resume fold", () => {
 
 	test("flushResumeHandleNow appends in-flight before send and fails closed without appendEntry", () => {
 		scopeTestUtils.reset();
-		scopeTestUtils.set("/tmp/project", "/tmp/session.jsonl", "sess-1");
 		resumeTestUtils.reset();
 		expect(() =>
 			flushResumeHandleNow({
@@ -144,30 +161,7 @@ describe("session resume fold", () => {
 				credentialScopeId: "cred-1",
 			}),
 		).toThrow(/appendEntry/);
-		const appended: Array<{ type: string; data: unknown }> = [];
-		const handlers = new Map<string, Array<(event: unknown, ctx: unknown) => unknown>>();
-		const branch = [message("u1", null, "user")];
-		const ctx = {
-			cwd: "/tmp/project",
-			sessionManager: {
-				getSessionFile: () => "/tmp/session.jsonl",
-				getSessionId: () => "sess-1",
-				getBranch: () => branch,
-				getEntries: () => branch,
-			},
-		};
-		const pi = {
-			appendEntry(customType: string, data?: unknown) {
-				appended.push({ type: customType, data });
-			},
-			on(event: string, handler: (event: unknown, ctx: unknown) => unknown) {
-				const list = handlers.get(event) ?? [];
-				list.push(handler);
-				handlers.set(event, list);
-			},
-		};
-		registerCursorSessionResume(pi as never);
-		void handlers.get("session_start")?.[0]?.({ type: "session_start" }, ctx);
+		const { appended } = registerResume();
 		flushResumeHandleNow({
 			agentId: "agent-local-1",
 			poolKey: "main",
@@ -182,21 +176,74 @@ describe("session resume fold", () => {
 		expect(getMatchingResumeHandle("main", "cred-1")).toBeUndefined();
 	});
 
+	test("flushResumeHandleNow fails closed when appendEntry swallows a disk write", () => {
+		scopeTestUtils.reset();
+		resumeTestUtils.reset();
+		registerResume("swallow");
+		expect(() =>
+			flushResumeHandleNow({
+				agentId: "agent-local-1",
+				poolKey: "main",
+				sendState: { bootstrapped: true, contextFingerprint: "fp", incrementalSendCount: 0 },
+				storeIdentity: { version: 1, stateRoot: "/tmp/store" },
+				state: "in-flight",
+				agentInstanceId: "main",
+				credentialScopeId: "cred-1",
+			}),
+		).toThrow(/not persisted/);
+		expect(resumeTestUtils.state.activeHandle).toBeUndefined();
+	});
+
+	test("flushResumeHandleNow fails closed when the session has no session file", () => {
+		scopeTestUtils.reset();
+		resumeTestUtils.reset();
+		registerResume("missing-file");
+		expect(() =>
+			flushResumeHandleNow({
+				agentId: "agent-local-1",
+				poolKey: "main",
+				sendState: { bootstrapped: true, contextFingerprint: "fp", incrementalSendCount: 0 },
+				storeIdentity: { version: 1, stateRoot: "/tmp/store" },
+				state: "in-flight",
+				agentInstanceId: "main",
+				credentialScopeId: "cred-1",
+			}),
+		).toThrow(/session file/);
+	});
+
 	test("keeps ExtensionAPI this when flushing so OMP runtime.appendEntry is reachable", () => {
 		scopeTestUtils.reset();
-		scopeTestUtils.set("/tmp/project", "/tmp/session.jsonl", "sess-1");
 		resumeTestUtils.reset();
 		const appended: Array<{ type: string; data: unknown }> = [];
+		const sessionFile = join(mkdtempSync(join(tmpdir(), "omp-csr-this-")), "session.jsonl");
+		writeFileSync(sessionFile, "");
+		scopeTestUtils.set("/tmp/project", sessionFile, "sess-1");
 		class FakeExtensionApi {
 			runtime = {
 				appendEntry(customType: string, data?: unknown) {
 					appended.push({ type: customType, data });
+					appendFileSync(sessionFile, `${JSON.stringify({ type: "custom", customType, data })}\n`);
 				},
 			};
 			appendEntry(customType: string, data?: unknown) {
 				this.runtime.appendEntry(customType, data);
 			}
-			on() {}
+			on(event: string, handler: (event: unknown, ctx: unknown) => unknown) {
+				if (event === "session_start") {
+					handler(
+						{ type: "session_start" },
+						{
+							cwd: "/tmp/project",
+							sessionManager: {
+								getSessionFile: () => sessionFile,
+								getSessionId: () => "sess-1",
+								getBranch: () => [],
+								getEntries: () => [],
+							},
+						},
+					);
+				}
+			}
 		}
 		registerCursorSessionResume(new FakeExtensionApi() as never);
 		flushResumeHandleNow({
@@ -226,6 +273,8 @@ describe("session resume fold", () => {
 		expect(getMatchingResumeHandle("main", "cred-1")).toBeUndefined();
 		resumeTestUtils.state.activeHandle = validData({ state: "committed" });
 		expect(getMatchingResumeHandle("main", "cred-1")?.agentId).toBe("agent-local-1");
+		expect(getMatchingResumeHandle("main", "cred-1", "/tmp/other")).toBeUndefined();
+		expect(getMatchingResumeHandle("main", "cred-1", "/tmp/project")?.agentId).toBe("agent-local-1");
 		expect(getMatchingResumeHandle("main", "other-cred")).toBeUndefined();
 		resumeTestUtils.state.activeHandle = validData({ state: "committed", credentialScopeId: undefined });
 		expect(getMatchingResumeHandle("main", "cred-1")).toBeUndefined();

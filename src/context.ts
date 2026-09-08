@@ -128,20 +128,18 @@ function lastUserIndex(context: Context): number {
 	throw new Error("OMP context has no active user message to send");
 }
 
+function serializeToolCall(block: Record<string, unknown>): string {
+	const name = typeof block.name === "string" ? block.name : "tool";
+	const id = typeof block.id === "string" ? block.id : typeof block.toolCallId === "string" ? block.toolCallId : "";
+	const args = "arguments" in block ? block.arguments : block.args;
+	return `toolCall ${name}${id ? ` (${id})` : ""}: ${typeof args === "string" ? args : JSON.stringify(args ?? {})}`;
+}
+
 function serializeMessage(message: unknown): string {
 	if (!isRecord(message)) return "";
 	const role = typeof message.role === "string" ? message.role : "unknown";
-	if (role === "user" || role === "assistant") {
-		const text = textFromContent(message.content);
-		const images = imagesFromContent(message.content);
-		const imageNote = images.length > 0 ? " [image omitted]" : "";
-		return `${role}: ${text}${imageNote}`.trimEnd();
-	}
 	if (role === "toolCall" || role === "toolUse") {
-		const name = typeof message.name === "string" ? message.name : "tool";
-		const id = typeof message.id === "string" ? message.id : "";
-		const args = "arguments" in message ? message.arguments : message.args;
-		return `toolCall ${name}${id ? ` (${id})` : ""}: ${typeof args === "string" ? args : JSON.stringify(args ?? {})}`;
+		return serializeToolCall(message);
 	}
 	if (role === "toolResult") {
 		const name = typeof message.toolName === "string" ? message.toolName : "tool";
@@ -149,6 +147,24 @@ function serializeMessage(message: unknown): string {
 		const text = textFromContent(message.content);
 		const error = message.isError ? " error" : "";
 		return `toolResult ${name}${id ? ` (${id})` : ""}${error}: ${text}`;
+	}
+	if (role === "user" || role === "assistant") {
+		const lines: string[] = [];
+		const text = textFromContent(message.content);
+		const images = imagesFromContent(message.content);
+		const imageNote = images.length > 0 ? " [image omitted]" : "";
+		if (text || images.length > 0) {
+			lines.push(`${role}: ${text}${imageNote}`.trimEnd());
+		}
+		if (Array.isArray(message.content)) {
+			for (const block of message.content) {
+				if (!isRecord(block)) continue;
+				if (block.type === "toolCall" || block.type === "toolUse") {
+					lines.push(serializeToolCall(block));
+				}
+			}
+		}
+		return lines.join("\n");
 	}
 	return `${role}: ${JSON.stringify(message)}`;
 }

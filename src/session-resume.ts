@@ -1,4 +1,6 @@
 import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { resolve as resolvePath } from "node:path";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import { CURSOR_SESSION_AGENT_RESUME_ENTRY_TYPE } from "./constants.js";
 import type { BindingState } from "./contracts.js";
@@ -186,6 +188,47 @@ function resumeLineageKey(data: ResumeEntryData): string {
 	return JSON.stringify([data.agentId, data.scopeKey, data.sessionFile, data.sessionId, data.cwd, data.poolKey]);
 }
 
+function sameResumeCwd(left: string, right: string): boolean {
+	return resolvePath(left) === resolvePath(right);
+}
+
+function parseResumeLine(value: unknown): ResumeEntryData | undefined {
+	const record = asRecord(value);
+	if (!record) return undefined;
+	if (record.customType !== CURSOR_SESSION_AGENT_RESUME_ENTRY_TYPE && record.type !== CURSOR_SESSION_AGENT_RESUME_ENTRY_TYPE) {
+		return undefined;
+	}
+	return parseResumeEntryData(record.data ?? record);
+}
+
+/** Latest on-disk resume record for this lineage must match the in-flight payload. */
+export function sessionFileContainsResume(sessionFile: string, data: ResumeEntryData): boolean {
+	let text: string;
+	try {
+		text = readFileSync(sessionFile, "utf8");
+	} catch {
+		return false;
+	}
+	let latest: ResumeEntryData | undefined;
+	const lineage = resumeLineageKey(data);
+	for (const line of text.split("\n")) {
+		const trimmed = line.trim();
+		if (!trimmed) continue;
+		let parsed: unknown;
+		try {
+			parsed = JSON.parse(trimmed);
+		} catch {
+			continue;
+		}
+		const entry = parseResumeLine(parsed);
+		if (!entry || resumeLineageKey(entry) !== lineage) continue;
+		latest = entry;
+	}
+	return Boolean(
+		latest && latest.state === data.state && latest.agentId === data.agentId && latest.createdAt === data.createdAt,
+	);
+}
+
 function indexLatestResumeEntries(entries: readonly ResumeSessionEntry[]): {
 	entryIds: Set<string>;
 	latestEntryIdByLineage: Map<string, string>;
@@ -279,7 +322,11 @@ export function getResumeBranchPathHash(): string {
 	return state.branchPathHash;
 }
 
-export function getMatchingResumeHandle(poolKey: string, credentialScopeId?: string): ResumeEntryData | undefined {
+export function getMatchingResumeHandle(
+	poolKey: string,
+	credentialScopeId?: string,
+	cwd = state.cwd,
+): ResumeEntryData | undefined {
 	const handle = state.activeHandle;
 	if (!handle || !isLocalAgentId(handle.agentId)) return undefined;
 	if (handle.state !== "committed") return undefined;
@@ -287,7 +334,7 @@ export function getMatchingResumeHandle(poolKey: string, credentialScopeId?: str
 	if (handle.scopeKey !== state.scopeKey) return undefined;
 	if (handle.sessionFile !== state.sessionFile) return undefined;
 	if (handle.sessionId !== state.sessionId) return undefined;
-	if (handle.cwd !== state.cwd) return undefined;
+	if (!sameResumeCwd(handle.cwd, cwd)) return undefined;
 	if (handle.compactionGeneration !== state.compactionGeneration) return undefined;
 	if (!handle.credentialScopeId || !credentialScopeId || handle.credentialScopeId !== credentialScopeId) return undefined;
 	return {
@@ -348,7 +395,13 @@ export function flushResumeHandleNow(input: PendingResumeHandle): void {
 	}
 	state.pendingHandle = undefined;
 	const data = resumeEntryFromPending(pending);
+	if (!state.sessionFile) {
+		throw new Error("Cannot persist Cursor SDK resume invalidation without a session file");
+	}
 	state.appendEntry<ResumeEntryData>(CURSOR_SESSION_AGENT_RESUME_ENTRY_TYPE, data);
+	if (!sessionFileContainsResume(state.sessionFile, data)) {
+		throw new Error("Cursor SDK resume invalidation was not persisted to the session file");
+	}
 	state.activeHandle = data;
 }
 
