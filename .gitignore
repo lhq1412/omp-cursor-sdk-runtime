@@ -1,0 +1,46 @@
+# Dependencies
+node_modules/
+
+# Build & typecheck output
+dist/
+dist.staging*/
+*.tsbuildinfo
+
+# Test coverage
+coverage/
+
+# Environment & secrets
+.env
+.env.*
+!.env.example
+
+# Pack / publish artifacts
+*.tgz
+
+# OMP / Pi local runtime state (do not commit)
+.pi/
+
+# Project probe & debug output (do not commit)
+.debug/
+.artifacts/
+.probe-runs/
+
+# Cursor local/runtime logs and prompt exports (do not commit)
+.cursor/debug-*.log
+prompt-exports/
+
+# Logs
+*.log
+npm-debug.log*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors
+.idea/
+*.swp
+*.swo
+
+# Bun (npm lockfile is canonical for this repo)
+bun.lockb

@@ -1,0 +1,42 @@
+{
+  "name": "omp-cursor-sdk-runtime",
+  "version": "0.1.0",
+  "description": "OMP provider adapter for the official @cursor/sdk local agent runtime",
+  "author": "lhq1412 (https://github.com/lhq1412)",
+  "license": "MIT",
+  "keywords": [
+    "omp-plugin",
+    "omp",
+    "oh-my-pi",
+    "cursor",
+    "cursor-sdk"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lhq1412/omp-cursor-sdk-runtime.git"
+  },
+  "type": "module",
+  "engines": {
+    "node": ">=22.19.0",
+    "bun": ">=1.3.14"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "bun test --isolate test",
+    "probe:sdk": "bun scripts/sdk-contract-probe.ts",
+    "check:boundaries": "bun scripts/check-boundaries.ts"
+  },
+  "dependencies": {
+    "@cursor/sdk": "1.0.31",
+    "@oh-my-pi/pi-ai": "18.1.14",
+    "@oh-my-pi/pi-coding-agent": "18.1.14"
+  },
+  "devDependencies": {
+    "typescript": "^6.0.3"
+  },
+  "omp": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  }
+}
