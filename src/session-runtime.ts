@@ -112,7 +112,7 @@ function attachParkExecutor(live: LiveRun, grantedTools: readonly GrantedTool[],
 }
 
 function resumePending(slot: RuntimeSlot, state: BindingState) {
-	if (!slot.agent) return undefined;
+	if (!slot.agent || !slot.createCwd) return undefined;
 	return {
 		agentId: slot.agent.agentId,
 		poolKey: slot.agentInstanceId,
@@ -120,6 +120,7 @@ function resumePending(slot: RuntimeSlot, state: BindingState) {
 		storeIdentity: slot.storeIdentity,
 		state,
 		agentInstanceId: slot.agentInstanceId,
+		cwd: slot.createCwd,
 		...(slot.credentialScopeId ? { credentialScopeId: slot.credentialScopeId } : {}),
 	};
 }
@@ -129,6 +130,7 @@ function persistDirtyHandle(slot: RuntimeSlot, handle: {
 	sendState: SendState;
 	storeIdentity?: ResumeStoreIdentity;
 	credentialScopeId?: string;
+	cwd: string;
 }): void {
 	const dirty = {
 		agentId: handle.agentId,
@@ -137,6 +139,7 @@ function persistDirtyHandle(slot: RuntimeSlot, handle: {
 		storeIdentity: handle.storeIdentity ?? slot.storeIdentity,
 		state: "dirty" as const,
 		agentInstanceId: slot.agentInstanceId,
+		cwd: handle.cwd,
 		...(handle.credentialScopeId ? { credentialScopeId: handle.credentialScopeId } : {}),
 	};
 	try {
@@ -160,6 +163,9 @@ async function persistDirtyAndDisposeAgent(slot: RuntimeSlot): Promise<void> {
 }
 
 function invalidateBindingBeforeSend(slot: RuntimeSlot, agentId: string): void {
+	if (!slot.createCwd) {
+		throw new Error("Cannot invalidate a Cursor SDK binding without the agent's execution cwd");
+	}
 	flushResumeHandleNow({
 		agentId,
 		poolKey: slot.agentInstanceId,
@@ -167,6 +173,7 @@ function invalidateBindingBeforeSend(slot: RuntimeSlot, agentId: string): void {
 		storeIdentity: slot.storeIdentity,
 		state: "in-flight",
 		agentInstanceId: slot.agentInstanceId,
+		cwd: slot.createCwd,
 		...(slot.credentialScopeId ? { credentialScopeId: slot.credentialScopeId } : {}),
 	});
 	slot.bindingState = "in-flight";
@@ -210,6 +217,8 @@ export async function prepareTurn(input: OpenRuntimeTurnInput): Promise<Prepared
 		slot.createCwd = resumeHandle.cwd;
 		slot.credentialScopeId = resumeHandle.credentialScopeId;
 		slot.storeIdentity = resumeHandle.storeIdentity ?? slot.storeIdentity;
+	} else if (!slot.agent) {
+		slot.sendState = emptySendState();
 	}
 
 	let plan = planSend(slot.sendState, input.context);
@@ -278,7 +287,7 @@ export function commitTurn(slot: RuntimeSlot, context: Context, incremental: boo
 		incrementalSendCount: incremental ? slot.sendState.incrementalSendCount + 1 : 0,
 	};
 	slot.bindingState = "committed";
-	if (!slot.agent) return;
+	if (!slot.agent || !slot.createCwd) return;
 	persistResumeHandle({
 		agentId: slot.agent.agentId,
 		poolKey: slot.agentInstanceId,
@@ -286,6 +295,7 @@ export function commitTurn(slot: RuntimeSlot, context: Context, incremental: boo
 		storeIdentity: slot.storeIdentity,
 		state: "committed",
 		agentInstanceId: slot.agentInstanceId,
+		cwd: slot.createCwd,
 		...(slot.credentialScopeId ? { credentialScopeId: slot.credentialScopeId } : {}),
 	});
 }
@@ -301,6 +311,7 @@ export function markTurnDirty(slot: RuntimeSlot): void {
 		}
 	}
 	slot.agent = undefined;
+	slot.sendState = emptySendState();
 }
 
 export async function finishLiveKeepAgent(key: string, reason: string): Promise<void> {

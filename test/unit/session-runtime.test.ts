@@ -1,15 +1,22 @@
 import { appendFileSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { describe, expect, test } from "bun:test";
 import type { Context } from "@oh-my-pi/pi-ai";
 import type { SDKAgent } from "@cursor/sdk";
 import { credentialScopeId } from "../../src/auth.ts";
 import { computeContextFingerprint } from "../../src/context.ts";
-import { prepareTurn, agentConfigMismatch, __testUtils as runtimeTestUtils } from "../../src/session-runtime.ts";
+import { CURSOR_SESSION_AGENT_RESUME_ENTRY_TYPE } from "../../src/constants.ts";
+import {
+	prepareTurn,
+	commitTurn,
+	finishTurnFailed,
+	agentConfigMismatch,
+	__testUtils as runtimeTestUtils,
+} from "../../src/session-runtime.ts";
 import { __testUtils as liveRunTestUtils } from "../../src/live-run.ts";
 import { __testUtils as scopeTestUtils } from "../../src/session-scope.ts";
-import { registerCursorSessionResume, __testUtils as resumeTestUtils } from "../../src/session-resume.ts";
+import { parseResumeEntryData, registerCursorSessionResume, __testUtils as resumeTestUtils } from "../../src/session-resume.ts";
 
 function fakeAgent(id: string, sends: string[] = []): SDKAgent {
 	return {
@@ -55,13 +62,16 @@ function toolResultContext(): Context {
 function registerResume(mode: "write" | "swallow" = "write"): {
 	appended: Array<{ type: string; data: unknown }>;
 	sessionFile: string;
+	handlers: Map<string, Array<(event: unknown, ctx: unknown) => unknown>>;
+	ctx: { cwd: string; sessionManager: Record<string, unknown> };
+	branch: Array<{ type: string; id: string; parentId: string | null; customType?: string; data?: unknown; message?: { role: string } }>;
 } {
 	const appended: Array<{ type: string; data: unknown }> = [];
 	const handlers = new Map<string, Array<(event: unknown, ctx: unknown) => unknown>>();
 	const sessionFile = join(mkdtempSync(join(tmpdir(), "omp-csr-")), "session.jsonl");
 	writeFileSync(sessionFile, "");
 	scopeTestUtils.set("/tmp/project", sessionFile, "sess-1");
-	const branch: Array<{ type: string; id: string; parentId: string | null; message?: { role: string } }> = [];
+	const branch: Array<{ type: string; id: string; parentId: string | null; customType?: string; data?: unknown; message?: { role: string } }> = [];
 	const ctx = {
 		cwd: "/tmp/project",
 		sessionManager: {
@@ -85,7 +95,7 @@ function registerResume(mode: "write" | "swallow" = "write"): {
 	};
 	registerCursorSessionResume(pi as never);
 	void handlers.get("session_start")?.[0]?.({ type: "session_start" }, ctx);
-	return { appended, sessionFile };
+	return { appended, sessionFile, handlers, ctx, branch };
 }
 
 function seedCommittedHandle(sessionFile: string, context: Context, agentId = "agent-old"): void {
@@ -203,7 +213,7 @@ describe("session runtime", () => {
 		liveRunTestUtils.clear();
 		scopeTestUtils.reset();
 		resumeTestUtils.reset();
-		registerResume();
+		const { appended } = registerResume();
 		const opens: Array<{ savedAgentId?: string; cwd: string }> = [];
 		runtimeTestUtils.setOpenAgent(async (input) => {
 			opens.push({ savedAgentId: input.savedAgentId, cwd: input.cwd });
@@ -241,6 +251,9 @@ describe("session runtime", () => {
 		expect(second.incremental).toBe(false);
 		expect(second.prompt?.text).toContain("target is important.ts");
 		expect(second.prompt?.text).toContain("continue that edit");
+		const dirty = appended.find((entry) => (entry.data as { state?: string }).state === "dirty");
+		expect(parseResumeEntryData(dirty?.data)?.cwd).toBe(resolve("/tmp/project"));
+		expect(parseResumeEntryData(dirty?.data)?.agentId).toBe("agent-1");
 	});
 
 	test("resumes a matching committed handle incrementally instead of re-sending history", async () => {
@@ -388,5 +401,134 @@ describe("session runtime", () => {
 		).rejects.toThrow(/not persisted/);
 		expect(opens).toBe(1);
 		expect(sends).toEqual([]);
+	});
+
+	test("bootstraps after a failed turn instead of incrementing leftover sendState", async () => {
+		runtimeTestUtils.clear();
+		liveRunTestUtils.clear();
+		scopeTestUtils.reset();
+		resumeTestUtils.reset();
+		registerResume();
+		const opens: Array<{ savedAgentId?: string }> = [];
+		runtimeTestUtils.setOpenAgent(async (input) => {
+			opens.push({ savedAgentId: input.savedAgentId });
+			return fakeAgent(input.savedAgentId ?? `agent-${opens.length}`);
+		});
+		const firstContext = historyThenContinue();
+		const first = await prepareTurn({
+			cwd: "/tmp/project",
+			agentInstanceId: "main",
+			apiKey: "test-key",
+			modelId: "composer-2.5",
+			context: firstContext,
+			grantedTools: [],
+		});
+		commitTurn(first.slot, firstContext, first.incremental);
+		liveRunTestUtils.clear();
+		const failedContext = {
+			messages: [
+				...firstContext.messages,
+				{ role: "user", content: "Continue without repeating completed work", timestamp: 4 },
+			],
+		} as Context;
+		const failed = await prepareTurn({
+			cwd: "/tmp/project",
+			agentInstanceId: "main",
+			apiKey: "test-key",
+			modelId: "composer-2.5",
+			context: failedContext,
+			grantedTools: [],
+		});
+		expect(failed.incremental).toBe(true);
+		await finishTurnFailed(failed.slot, "run error");
+		const recovered = await prepareTurn({
+			cwd: "/tmp/project",
+			agentInstanceId: "main",
+			apiKey: "test-key",
+			modelId: "composer-2.5",
+			context: failedContext,
+			grantedTools: [],
+		});
+		expect(opens.at(-1)?.savedAgentId).toBeUndefined();
+		expect(recovered.incremental).toBe(false);
+		expect(recovered.prompt?.text).toContain("target is important.ts");
+		expect(recovered.prompt?.text).toContain("Continue without repeating completed work");
+	});
+
+	test("commits the agent's execution cwd and does not resume it from the session cwd", async () => {
+		runtimeTestUtils.clear();
+		liveRunTestUtils.clear();
+		scopeTestUtils.reset();
+		resumeTestUtils.reset();
+		const { appended, handlers, ctx, branch } = registerResume();
+		const opens: Array<{ savedAgentId?: string; cwd: string }> = [];
+		runtimeTestUtils.setOpenAgent(async (input) => {
+			opens.push({ savedAgentId: input.savedAgentId, cwd: input.cwd });
+			return fakeAgent(input.savedAgentId ?? `agent-${opens.length}`);
+		});
+		const firstContext = userContext("first");
+		const first = await prepareTurn({
+			cwd: "/tmp/other",
+			agentInstanceId: "main",
+			apiKey: "test-key",
+			modelId: "composer-2.5",
+			context: firstContext,
+			grantedTools: [],
+		});
+		commitTurn(first.slot, firstContext, first.incremental);
+		await handlers.get("turn_end")?.[0]?.({ type: "turn_end" }, ctx);
+		const committed = appended.map((entry) => parseResumeEntryData(entry.data)).findLast((entry) => entry?.state === "committed");
+		expect(committed?.cwd).toBe(resolve("/tmp/other"));
+		expect(committed?.agentId).toBe("agent-1");
+		branch.push({
+			type: "custom",
+			id: "r1",
+			parentId: null,
+			customType: CURSOR_SESSION_AGENT_RESUME_ENTRY_TYPE,
+			data: committed,
+		});
+
+		runtimeTestUtils.clear();
+		liveRunTestUtils.clear();
+		runtimeTestUtils.setOpenAgent(async (input) => {
+			opens.push({ savedAgentId: input.savedAgentId, cwd: input.cwd });
+			return fakeAgent(input.savedAgentId ?? `agent-${opens.length}`);
+		});
+		void handlers.get("session_start")?.[0]?.({ type: "session_start" }, ctx);
+		const secondContext = {
+			messages: [
+				{ role: "user", content: "first", timestamp: 1 } as Context["messages"][number],
+				{ role: "user", content: "second", timestamp: 2 } as Context["messages"][number],
+			],
+		} as Context;
+		const resumed = await prepareTurn({
+			cwd: "/tmp/other",
+			agentInstanceId: "main",
+			apiKey: "test-key",
+			modelId: "composer-2.5",
+			context: secondContext,
+			grantedTools: [],
+		});
+		expect(resumed.incremental).toBe(true);
+		expect(opens.at(-1)).toEqual({ savedAgentId: "agent-1", cwd: expect.stringContaining("/tmp/other") });
+
+		runtimeTestUtils.clear();
+		liveRunTestUtils.clear();
+		runtimeTestUtils.setOpenAgent(async (input) => {
+			opens.push({ savedAgentId: input.savedAgentId, cwd: input.cwd });
+			return fakeAgent(input.savedAgentId ?? `agent-${opens.length}`);
+		});
+		void handlers.get("session_start")?.[0]?.({ type: "session_start" }, ctx);
+		const fromSessionCwd = await prepareTurn({
+			cwd: "/tmp/project",
+			agentInstanceId: "main",
+			apiKey: "test-key",
+			modelId: "composer-2.5",
+			context: secondContext,
+			grantedTools: [],
+		});
+		expect(opens.at(-1)?.savedAgentId).toBeUndefined();
+		expect(opens.at(-1)?.cwd).toContain("/tmp/project");
+		expect(fromSessionCwd.incremental).toBe(false);
 	});
 });

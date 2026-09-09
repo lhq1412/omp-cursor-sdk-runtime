@@ -56,6 +56,7 @@ interface PendingResumeHandle {
 	storeIdentity: ResumeStoreIdentity;
 	state: BindingState;
 	agentInstanceId: string;
+	cwd: string;
 	credentialScopeId?: string;
 }
 
@@ -248,12 +249,7 @@ function indexLatestResumeEntries(entries: readonly ResumeSessionEntry[]): {
 }
 
 function matchesScope(data: ResumeEntryData, scope: ResumeScope): boolean {
-	return (
-		data.scopeKey === scope.scopeKey &&
-		data.sessionFile === scope.sessionFile &&
-		data.sessionId === scope.sessionId &&
-		data.cwd === scope.cwd
-	);
+	return data.scopeKey === scope.scopeKey && data.sessionFile === scope.sessionFile && data.sessionId === scope.sessionId;
 }
 
 function advanceFold(
@@ -352,6 +348,7 @@ export function persistResumeHandle(input: PendingResumeHandle): void {
 		storeIdentity: { ...input.storeIdentity },
 		state: input.state,
 		agentInstanceId: input.agentInstanceId,
+		cwd: resolvePath(input.cwd),
 		...(input.credentialScopeId ? { credentialScopeId: input.credentialScopeId } : {}),
 	};
 }
@@ -364,7 +361,7 @@ function resumeEntryFromPending(pending: PendingResumeHandle): ResumeEntryData {
 		scopeKey: state.scopeKey,
 		...(state.sessionFile ? { sessionFile: state.sessionFile } : {}),
 		...(state.sessionId ? { sessionId: state.sessionId } : {}),
-		cwd: state.cwd,
+		cwd: pending.cwd,
 		poolKey: pending.poolKey,
 		branchPathHash: state.branchPathHash,
 		compactionGeneration: state.compactionGeneration,

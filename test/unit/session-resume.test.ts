@@ -1,6 +1,6 @@
 import { appendFileSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { describe, expect, test } from "bun:test";
 import { CURSOR_SESSION_AGENT_RESUME_ENTRY_TYPE } from "../../src/constants.ts";
 import {
@@ -138,6 +138,7 @@ describe("session resume fold", () => {
 			storeIdentity: { version: 1, stateRoot: "/tmp/store" },
 			state: "committed",
 			agentInstanceId: "main",
+			cwd: "/tmp/project",
 			credentialScopeId: "cred-1",
 		});
 		await handlers.get("turn_end")?.[0]?.({ type: "turn_end" }, ctx);
@@ -145,6 +146,36 @@ describe("session resume fold", () => {
 		expect(appended[0]?.type).toBe(CURSOR_SESSION_AGENT_RESUME_ENTRY_TYPE);
 		expect(parseResumeEntryData(appended[0]?.data)?.agentId).toBe("agent-local-1");
 		expect(parseResumeEntryData(appended[0]?.data)?.state).toBe("committed");
+		expect(parseResumeEntryData(appended[0]?.data)?.cwd).toBe(resolve("/tmp/project"));
+	});
+
+	test("writes the agent's execution cwd instead of the session cwd", () => {
+		scopeTestUtils.reset();
+		resumeTestUtils.reset();
+		const { appended } = registerResume();
+		flushResumeHandleNow({
+			agentId: "agent-local-1",
+			poolKey: "main",
+			sendState: { bootstrapped: true, contextFingerprint: "fp", incrementalSendCount: 0 },
+			storeIdentity: { version: 1, stateRoot: "/tmp/store" },
+			state: "in-flight",
+			agentInstanceId: "main",
+			cwd: "/tmp/other",
+			credentialScopeId: "cred-1",
+		});
+		expect(parseResumeEntryData(appended[0]?.data)?.cwd).toBe(resolve("/tmp/other"));
+		expect(parseResumeEntryData(appended[0]?.data)?.cwd).not.toBe(resolve("/tmp/project"));
+	});
+
+	test("folds a handle whose execution cwd differs from the session cwd", () => {
+		const user = message("u1", null, "user");
+		const data = validData({
+			branchPathHash: hashBranchStep(EMPTY_BRANCH_HASH, user),
+			cwd: "/tmp/other",
+		});
+		const fold = foldResumeHandle([user, resume("r1", "u1", data)], scope);
+		expect(fold.activeHandle?.agentId).toBe("agent-local-1");
+		expect(fold.activeHandle?.cwd).toBe("/tmp/other");
 	});
 
 	test("flushResumeHandleNow appends in-flight before send and fails closed without appendEntry", () => {
@@ -158,6 +189,7 @@ describe("session resume fold", () => {
 				storeIdentity: { version: 1, stateRoot: "/tmp/store" },
 				state: "in-flight",
 				agentInstanceId: "main",
+				cwd: "/tmp/project",
 				credentialScopeId: "cred-1",
 			}),
 		).toThrow(/appendEntry/);
@@ -169,6 +201,7 @@ describe("session resume fold", () => {
 			storeIdentity: { version: 1, stateRoot: "/tmp/store" },
 			state: "in-flight",
 			agentInstanceId: "main",
+			cwd: "/tmp/project",
 			credentialScopeId: "cred-1",
 		});
 		expect(appended).toHaveLength(1);
@@ -188,6 +221,7 @@ describe("session resume fold", () => {
 				storeIdentity: { version: 1, stateRoot: "/tmp/store" },
 				state: "in-flight",
 				agentInstanceId: "main",
+				cwd: "/tmp/project",
 				credentialScopeId: "cred-1",
 			}),
 		).toThrow(/not persisted/);
@@ -206,6 +240,7 @@ describe("session resume fold", () => {
 				storeIdentity: { version: 1, stateRoot: "/tmp/store" },
 				state: "in-flight",
 				agentInstanceId: "main",
+				cwd: "/tmp/project",
 				credentialScopeId: "cred-1",
 			}),
 		).toThrow(/session file/);
@@ -253,6 +288,7 @@ describe("session resume fold", () => {
 			storeIdentity: { version: 1, stateRoot: "/tmp/store" },
 			state: "in-flight",
 			agentInstanceId: "main",
+			cwd: "/tmp/project",
 			credentialScopeId: "cred-1",
 		});
 		expect(appended).toHaveLength(1);
