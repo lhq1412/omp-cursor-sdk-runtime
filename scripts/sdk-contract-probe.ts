@@ -61,7 +61,7 @@ async function main(): Promise<void> {
 		results.push({
 			name: "systemPrompt",
 			ok: SYSTEM_PROMPT_REPLACEMENT === "unsupported",
-			detail: "GAP AgentOptions.systemPrompt is omitted; live CLI rejected --system-prompt; OMP system prompt is not forwarded into user send",
+			detail: "GAP AgentOptions.systemPrompt is omitted; live CLI rejected --system-prompt; the adapter includes sanitized OMP instructions only in bootstrap text, not as native system-role input",
 		});
 
 		const agent = await Agent.create(options);

@@ -1,6 +1,6 @@
 import "./sdk-exit-guard.js";
 import { Agent, JsonlLocalAgentStore, type AgentOptions, type LocalAgentStore, type ModelSelection, type SDKAgent, type SDKCustomTool } from "@cursor/sdk";
-import { DEFAULT_MODEL_ID, SDK_NATIVE_DISALLOWED_TOOLS } from "./constants.js";
+import { SDK_NATIVE_DISALLOWED_TOOLS } from "./constants.js";
 
 export const SYSTEM_PROMPT_UNSUPPORTED_ERROR = /unknown option '--system-prompt'/i;
 
@@ -53,8 +53,4 @@ export function openJsonlStore(rootDir: string): LocalAgentStore {
 export async function openAgent(input: OpenAgentInput): Promise<SDKAgent> {
 	const options = buildAgentOptions(input);
 	return input.savedAgentId ? Agent.resume(input.savedAgentId, options) : Agent.create(options);
-}
-
-export function defaultModelSelection(id = DEFAULT_MODEL_ID): ModelSelection {
-	return { id };
 }

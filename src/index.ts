@@ -8,12 +8,14 @@ import { registerCursorSessionScope } from "./session-scope.js";
 import { registerCursorSessionResume } from "./session-resume.js";
 import { registerCursorSessionLifecycle } from "./session-lifecycle.js";
 import { registerHostToolCatalog } from "./tool-catalog.js";
+import { recordDynamicModelFetch, registerModelControls } from "./model-controls.js";
 
 export default async function (pi: ExtensionAPI): Promise<void> {
 	registerCursorSessionScope(pi);
 	registerCursorSessionResume(pi);
 	registerCursorSessionLifecycle(pi);
 	registerHostToolCatalog(pi);
+	registerModelControls(pi);
 	pi.registerProvider(CURSOR_SDK_PROVIDER_ID, {
 		baseUrl: "https://cursor.com",
 		api: CURSOR_SDK_API,
@@ -33,9 +35,19 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		},
 		streamSimple: streamCursorRuntime,
 		fetchDynamicModels: async (apiKey) => {
-			const resolved = resolveCursorApiKey(apiKey);
-			if (!resolved) return fallbackModels();
-			return fetchCursorModels(resolved);
+			try {
+				const resolved = resolveCursorApiKey(apiKey);
+				if (!resolved) {
+					recordDynamicModelFetch(false, "No Cursor SDK API key configured; using fallback models.");
+					return fallbackModels();
+				}
+				const models = await fetchCursorModels(resolved);
+				recordDynamicModelFetch(true);
+				return models;
+			} catch (error) {
+				recordDynamicModelFetch(false, error instanceof Error ? error.message : String(error));
+				throw error;
+			}
 		},
 	});
 }

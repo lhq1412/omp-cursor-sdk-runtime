@@ -85,13 +85,21 @@ omp models cursor-sdk
 omp models refresh
 ```
 
-The extension exposes models only through OMP's `fetchDynamicModels` path: live SDK rows when a key is available, otherwise the fallback `composer-2.5` row.
+Models are **canonical IDs only** (`cursor-sdk/composer-2.5`). Fast is a per-send flag, not a catalog alias: there are no `@fast` / slow suffix rows.
 
 ```bash
 omp --model cursor-sdk/composer-2.5
+omp --model cursor-sdk/gpt-5.5:xhigh  # when this model/effort is in your live catalog
 ```
 
-Cloud `bc-*` agent ids are rejected. Local runtime is the only supported runtime.
+Thinking uses native OMP `:level` suffixes and the thinking selector (`off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`), limited to each model's advertised capabilities. Composer's fallback has fast but no thinking selector. Extended context uses native `/extended-context [on|off|status]` or Settings → Extended Context. Exactly two numeric context tiers share one model row; three or more tiers retain explicit non-default `@context` rows. Runtime maps the host-clamped `model.contextWindow` to the SDK context parameter.
+
+In-session:
+
+- `/cursor-fast [on|off|status]` — per canonical model; `--cursor-no-fast` wins `--cursor-fast`; otherwise session custom entries. Takes effect on the next new send, not an in-flight parked run. Captures the selected model and actual session identity when invoked; pending commands are discarded without saving or notifying if navigation starts or the identity changes while capabilities load, including before navigation-completed events. If navigation is cancelled, rerun the command.
+- `/cursor-refresh-models` — requires a Cursor SDK key and calls native `modelRegistry.refreshProvider("cursor-sdk", "online")`. Success requires a successful live discovery callback, not a silently reused cache; failures retain the previous catalog. `omp models refresh` also goes through `fetchDynamicModels`.
+
+Raw SDK parameter metadata is hydrated once per credential when OMP serves cached model rows. `/cursor-fast` works offline for the known `composer-2.5` fallback; other models require known capabilities and fail clearly if discovery is unavailable. Authentication uses the `cursor-sdk` provider key with `CURSOR_API_KEY` fallback; credential-scoped metadata cannot leak between accounts. Empty live catalogs are errors, not successful refreshes. Cloud `bc-*` agent IDs remain rejected.
 
 ## Tools
 
@@ -101,7 +109,7 @@ When the model calls a tool, the adapter emits OMP `toolUse`, parks the SDK call
 
 An explicit host grant is used as-is. Stock extras only add currently enabled `mcp__*` names; an empty or read-only grant stays empty.
 
-## Capability gap: no custom system prompt
+## Capability gap: native `systemPrompt` unsupported
 
 Live probe against this account (2026-09-08) rejected `AgentOptions.systemPrompt` with:
 
@@ -109,15 +117,28 @@ Live probe against this account (2026-09-08) rejected `AgentOptions.systemPrompt
 [invalid_argument] unknown option '--system-prompt'
 ```
 
-v1 therefore **does not set `systemPrompt`**. OMP system instructions stay in the OMP session; they are not applied to the Cursor agent, and they are **not** copied into the user message. Cursor's built-in harness prompt remains in effect. This is a documented semantic gap, not an equivalent replacement of OMP's system prompt.
+v1 therefore **does not set `systemPrompt`**. Cursor's built-in harness prompt remains in effect. That native system-role option is unused; sanitized bootstrap text is not a replacement for it.
 
-When the backend starts accepting `--system-prompt`, pass `systemPrompt` again on create and resume; do not invent a user-message fallback.
+A **fresh bootstrap** prepends sanitized OMP system instructions when nonempty to send text as:
+
+```text
+System instructions from OMP:
+${sanitized}
+```
+
+then prior visible history and the current user turn (including a first user turn). Incremental rounds omit that prefix; the existing agent already has it from bootstrap. Empty or missing system text leaves history/images-only behavior unchanged. `activeUserInput` stays the current user turn only. The reuse fingerprint still uses the raw system text, so a system change forces a fresh bootstrap.
+
+Sanitizer (`serializeSystemPrompt` joins `string | string[]` with newlines):
+
+- If the prompt does not start with `<system-conventions>`, use it trimmed.
+- Else find `\n# Internal URLs\n`, then `\n§ Workflow\n` after it. If either marker is missing, use the trimmed prompt.
+- Else join with `\n\n`: the prefix before Internal URLs (`trimEnd`), the literal `OMP host tool catalog and tool policy omitted: Cursor can call only Cursor SDK tools exposed in this run.`, and the Workflow suffix (`trimStart`).
 
 ## Session behavior
 
-Local agents are bound to the current OMP JSONL session leaf, cwd, and credential identity. Same-session incremental turns reuse the agent. New agents reconstruct prior visible OMP history into the current user input (no system prompt). Resume records persist the agent's execution cwd; a matching committed handle can be resumed after process restart. Branch navigation, compaction, failed turns, and cwd/key changes start a new agent.
+Local agents are bound to the current OMP JSONL session leaf, cwd, and credential identity. Same-session incremental turns reuse the agent and send only the current user input. A new agent bootstraps with sanitized OMP system instructions when nonempty, plus reconstructed visible history and the current turn. Resume records persist the agent's execution cwd; a matching committed handle can be resumed after process restart. Branch navigation, compaction, failed turns, and cwd/key changes start a new agent.
 
-Cancel belongs to the in-flight live run (including park-and-yield). SDK `process.reallyExit(0|1)` during teardown is swallowed so `/quit` does not throw `ExtensionExitError`.
+Cancellation while model discovery is pending ends that request before any runtime binding is prepared; shared discovery may finish for other requests, but its late result cannot resume the cancelled request or touch a newly selected session. Once prepared, cancellation belongs to the in-flight live run (including park-and-yield). SDK `process.reallyExit(0|1)` during teardown is swallowed so `/quit` does not throw `ExtensionExitError`.
 
 ## Development and verification
 
@@ -137,7 +158,7 @@ export CURSOR_API_KEY=...
 npm run probe:sdk
 ```
 
-The probe records the system-prompt gap, then checks custom-tool callbacks, `toolCallId`, and `Agent.resume` without that option.
+The probe records that native `AgentOptions.systemPrompt` is omitted, then checks custom-tool callbacks, `toolCallId`, and `Agent.resume` without that option.
 
 ## Provenance and license
 
