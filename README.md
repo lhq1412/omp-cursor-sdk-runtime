@@ -96,7 +96,7 @@ Thinking uses native OMP `:level` suffixes and the thinking selector (`off`, `mi
 
 In-session:
 
-- `/cursor-fast [on|off|status]` — per canonical model; `--cursor-no-fast` wins `--cursor-fast`; otherwise session custom entries. Takes effect on the next new send, not an in-flight parked run.
+- `/cursor-fast [on|off|status]` — per canonical model; `--cursor-no-fast` wins `--cursor-fast`; otherwise session custom entries. Takes effect on the next new send, not an in-flight parked run. Captures the selected model when invoked; if the session or branch changes while capabilities load, the pending command is discarded without saving a preference.
 - `/cursor-refresh-models` — requires a Cursor SDK key and calls native `modelRegistry.refreshProvider("cursor-sdk", "online")`. Success requires a successful live discovery callback, not a silently reused cache; failures retain the previous catalog. `omp models refresh` also goes through `fetchDynamicModels`.
 
 Raw SDK parameter metadata is hydrated once per credential when OMP serves cached model rows. `/cursor-fast` works offline for the known `composer-2.5` fallback; other models require known capabilities and fail clearly if discovery is unavailable. Authentication uses the `cursor-sdk` provider key with `CURSOR_API_KEY` fallback; credential-scoped metadata cannot leak between accounts. Empty live catalogs are errors, not successful refreshes. Cloud `bc-*` agent IDs remain rejected.

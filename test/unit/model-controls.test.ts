@@ -131,6 +131,38 @@ function metadata(id: string, overrides: { baseModelId?: string; supportsFast?: 
 	};
 }
 
+function deferred() {
+	let resolve!: () => void;
+	const promise = new Promise<void>((done) => { resolve = done; });
+	return { promise, resolve };
+}
+
+function deferCatalog(...modelIds: string[]) {
+	controlsTestUtils.reset();
+	const started = deferred();
+	const gate = deferred();
+	const calls: string[] = [];
+	catalogTestUtils.setListModels(async (apiKey) => {
+		calls.push(apiKey);
+		started.resolve();
+		await gate.promise;
+		return modelIds.map((id) => ({
+			id,
+			displayName: id,
+			parameters: [{ id: "fast", values: [{ value: "false" }, { value: "true" }] }],
+		}));
+	});
+	return { started: started.promise, release: gate.resolve, calls };
+}
+
+function fastBranch(modelId: string, fast: boolean): SessionEntry[] {
+	return [{
+		type: "custom",
+		customType: controlsTestUtils.FAST_ENTRY_TYPE,
+		data: { modelId, fast },
+	}];
+}
+
 describe("model controls", () => {
 	let originalApiKey: string | undefined;
 
@@ -393,6 +425,142 @@ describe("model controls", () => {
 		await host.run("cursor-fast", "on");
 		expect(getFastMode("acct-model")).toBe(true);
 		expect(host.notifications.at(-1)?.type).toBe("info");
+	});
+
+	test.each(["on", "off"] as const)("pending %s cannot change the destination session", async (action) => {
+		const catalog = deferCatalog("cached-model");
+		const host = createHost({
+			model: { id: "cached-model", provider: CURSOR_SDK_PROVIDER_ID },
+			getApiKeyForProvider: async () => "crsr_test",
+		});
+		registerModelControls(host.pi);
+		await host.emit("session_start");
+		const pending = host.run("cursor-fast", action);
+		await catalog.started;
+
+		const baseline = action === "off";
+		const branchB = fastBranch("cached-model", baseline);
+		host.setBranch(branchB);
+		await host.emit("session_switch");
+		expect(getFastMode("cached-model")).toBe(baseline);
+		catalog.release();
+		await pending;
+
+		expect(host.ctx.sessionManager.getBranch()).toEqual(branchB);
+		expect(host.appended).toEqual([]);
+		expect(getFastMode("cached-model")).toBe(baseline);
+		expect(host.notifications).toEqual([]);
+	});
+
+	test("returning to A does not revive its pending command", async () => {
+		const catalog = deferCatalog("cached-model");
+		const branchA = fastBranch("cached-model", false);
+		const host = createHost({
+			model: { id: "cached-model", provider: CURSOR_SDK_PROVIDER_ID },
+			branch: branchA,
+			getApiKeyForProvider: async () => "crsr_test",
+		});
+		registerModelControls(host.pi);
+		await host.emit("session_start");
+		const pending = host.run("cursor-fast", "on");
+		await catalog.started;
+		host.setBranch(fastBranch("cached-model", true));
+		await host.emit("session_switch");
+		host.setBranch(branchA);
+		await host.emit("session_switch");
+		catalog.release();
+		await pending;
+
+		expect(host.ctx.sessionManager.getBranch()).toEqual(branchA);
+		expect(host.appended).toEqual([]);
+		expect(getFastMode("cached-model")).toBe(false);
+		expect(host.notifications).toEqual([]);
+	});
+
+	test.each(["session_start", "session_tree"])("%s invalidates a command already waiting for its key", async (event) => {
+		const catalog = deferCatalog("cached-model");
+		const key = deferred();
+		const keyRequested = deferred();
+		const host = createHost({
+			model: { id: "cached-model", provider: CURSOR_SDK_PROVIDER_ID },
+			getApiKeyForProvider: async () => {
+				keyRequested.resolve();
+				await key.promise;
+				return "crsr_test";
+			},
+		});
+		registerModelControls(host.pi);
+		const pending = host.run("cursor-fast", "on");
+		await keyRequested.promise;
+		const branch = fastBranch("cached-model", false);
+		host.setBranch(branch);
+		await host.emit(event);
+		key.resolve();
+		await catalog.started;
+		catalog.release();
+		await pending;
+
+		expect(host.ctx.sessionManager.getBranch()).toEqual(branch);
+		expect(host.appended).toEqual([]);
+		expect(getFastMode("cached-model")).toBe(false);
+		expect(host.notifications).toEqual([]);
+	});
+
+	test("same-session cold discovery commits the model selected before key resolution", async () => {
+		const catalog = deferCatalog("cached-model", "replacement-model");
+		const key = deferred();
+		const keyRequested = deferred();
+		const selected = { id: "cached-model", provider: CURSOR_SDK_PROVIDER_ID };
+		const host = createHost({
+			model: selected,
+			getApiKeyForProvider: async () => {
+				keyRequested.resolve();
+				await key.promise;
+				return "crsr_test";
+			},
+		});
+		registerModelControls(host.pi);
+		const pending = host.run("cursor-fast", "on");
+		await keyRequested.promise;
+		selected.id = "composer-2.5";
+		key.resolve();
+		await catalog.started;
+		host.setModel({ id: "replacement-model", provider: CURSOR_SDK_PROVIDER_ID });
+		catalog.release();
+		await pending;
+
+		expect(host.appended).toEqual([
+			{ type: controlsTestUtils.FAST_ENTRY_TYPE, data: { modelId: "cached-model", fast: true } },
+		]);
+		expect(getFastMode("cached-model")).toBe(true);
+		expect(getFastMode("composer-2.5")).toBe(false);
+		expect(getFastMode("replacement-model")).toBe(false);
+		expect(host.notifications.map((item) => item.type)).toEqual(["info"]);
+	});
+
+	test("a destination command survives the stale waiter sharing its catalog query", async () => {
+		const catalog = deferCatalog("cached-model");
+		const host = createHost({
+			model: { id: "cached-model", provider: CURSOR_SDK_PROVIDER_ID },
+			getApiKeyForProvider: async () => "crsr_test",
+		});
+		registerModelControls(host.pi);
+		const stale = host.run("cursor-fast", "on");
+		await catalog.started;
+		host.setBranch(fastBranch("cached-model", true));
+		await host.emit("session_switch");
+		const survivor = host.run("cursor-fast", "off");
+		// Drain B's key-resolution microtasks while the shared catalog is still blocked.
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		catalog.release();
+		await Promise.all([stale, survivor]);
+
+		expect(catalog.calls).toEqual(["crsr_test"]);
+		expect(host.appended).toEqual([
+			{ type: controlsTestUtils.FAST_ENTRY_TYPE, data: { modelId: "cached-model", fast: false } },
+		]);
+		expect(getFastMode("cached-model")).toBe(false);
+		expect(host.notifications.map((item) => item.type)).toEqual(["info"]);
 	});
 
 });

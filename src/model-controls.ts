@@ -161,6 +161,7 @@ function errorMessage(error: unknown): string {
 export function registerModelControls(
 	pi: Pick<ExtensionAPI, "registerFlag" | "registerCommand" | "getFlag" | "appendEntry" | "on">,
 ): void {
+	let preferenceGeneration = 0;
 	controlsApi = {
 		getFlag: (name) => pi.getFlag(name),
 		appendEntry: (customType, data) => pi.appendEntry(customType, data),
@@ -187,8 +188,11 @@ export function registerModelControls(
 				ctx.ui.notify(`Invalid Cursor fast argument "${args.trim()}". ${FAST_USAGE}`, "error");
 				return;
 			}
-			const apiKey = await hydrateCatalogMetadata(ctx);
-			const target = currentFastTarget(ctx, apiKey);
+			const generation = preferenceGeneration;
+			const model = ctx.model ? { ...ctx.model } : undefined;
+			const apiKey = await hydrateCatalogMetadata({ model, modelRegistry: ctx.modelRegistry });
+			if (generation !== preferenceGeneration) return;
+			const target = currentFastTarget({ model }, apiKey);
 			if (!target.ok) {
 				ctx.ui.notify(target.message, "error");
 				return;
@@ -236,6 +240,7 @@ export function registerModelControls(
 	});
 
 	const fold = (_event: unknown, ctx: ExtensionContext) => {
+		preferenceGeneration++;
 		foldSessionPreferences(ctx);
 	};
 	pi.on("session_start", fold);
