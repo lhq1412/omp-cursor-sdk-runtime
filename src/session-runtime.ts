@@ -1,5 +1,5 @@
 import { resolve as resolvePath } from "node:path";
-import type { SDKAgent, SDKCustomTool, SDKUserMessage } from "@cursor/sdk";
+import type { ModelSelection, SDKAgent, SDKCustomTool, SDKUserMessage } from "@cursor/sdk";
 import type { Context } from "@oh-my-pi/pi-ai";
 import { credentialScopeId } from "./auth.js";
 import { DEFAULT_AGENT_INSTANCE_ID } from "./constants.js";
@@ -18,7 +18,7 @@ import {
 } from "./live-run.js";
 import { trailingToolResults } from "./omp-tools.js";
 import { withSdkExitSuppressed } from "./sdk-exit-guard.js";
-import { defaultModelSelection, openAgent, type OpenAgentInput } from "./sdk-session.js";
+import { openAgent, type OpenAgentInput } from "./sdk-session.js";
 import { flushResumeHandleNow, getMatchingResumeHandle, persistResumeHandle, type ResumeStoreIdentity } from "./session-resume.js";
 import { getCursorSessionCwd, getCursorSessionScopeKey } from "./session-scope.js";
 import { openScopedJsonlStore, storeRootForScope } from "./store.js";
@@ -86,7 +86,7 @@ export interface OpenRuntimeTurnInput {
 	cwd: string;
 	agentInstanceId: string;
 	apiKey: string;
-	modelId: string;
+	modelSelection?: ModelSelection;
 	context: Context;
 	grantedTools: readonly GrantedTool[];
 	host?: OmpHostBridgeV1;
@@ -200,6 +200,11 @@ export async function prepareTurn(input: OpenRuntimeTurnInput): Promise<Prepared
 		return { slot, live: existingLive, continuing: true, customTools: {}, incremental: true };
 	}
 
+	const modelSelection = input.modelSelection;
+	if (!modelSelection) {
+		throw new Error("Cannot open a Cursor SDK agent without a model selection");
+	}
+
 	if (existingLive) {
 		await disposeLiveRun(slot.key, "OMP started a new user turn", false);
 	}
@@ -255,7 +260,7 @@ export async function prepareTurn(input: OpenRuntimeTurnInput): Promise<Prepared
 			openAgentImpl({
 				apiKey: input.apiKey,
 				cwd,
-				model: defaultModelSelection(input.modelId),
+				model: modelSelection,
 				store,
 				customTools,
 				savedAgentId,

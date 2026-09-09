@@ -4,7 +4,7 @@ import { CURSOR_SDK_API, CURSOR_SDK_PROVIDER_ID, DEFAULT_AGENT_INSTANCE_ID } fro
 import { requireCursorApiKey } from "./auth.js";
 import { readHostBridge } from "./contracts.js";
 import { HOST_BRIDGE_OPTION_KEY } from "./host-option.js";
-import { grantedToolsFromContext } from "./omp-tools.js";
+import { grantedToolsFromContext, trailingToolResults } from "./omp-tools.js";
 import { mergeGrantedTools } from "./tool-catalog.js";
 import {
 	collectParkedBatch,
@@ -19,7 +19,9 @@ import {
 import { commitTurn, finishLiveKeepAgent, finishTurnFailed, prepareTurn, type RuntimeSlot } from "./session-runtime.js";
 import { getCursorSessionCwd } from "./session-scope.js";
 import { withSdkExitSuppressed } from "./sdk-exit-guard.js";
-import { defaultModelSelection } from "./sdk-session.js";
+import { ensureCursorModels, getModelMetadata, buildModelSelection } from "./catalog.js";
+import { getFastMode } from "./model-controls.js";
+import type { ModelSelection } from "@cursor/sdk";
 import {
 	applyInteractionUpdate,
 	applyToolCall,
@@ -28,6 +30,17 @@ import {
 	createProviderStream,
 	runResultToStopReason,
 } from "./projector.js";
+
+function selectionForTurn(model: Model<Api>, apiKey: string, options?: SimpleStreamOptions): ModelSelection {
+	const thinkingLevel = options?.disableReasoning ? "off" : (options?.reasoning ?? "off");
+	const metadata = getModelMetadata(model.id, apiKey);
+	const standard = metadata?.extendedContext?.standardContextWindow;
+	return buildModelSelection(model.id, thinkingLevel, {
+		apiKey,
+		fastEnabled: getFastMode(metadata?.baseModelId ?? model.id),
+		extendedContextEnabled: standard === undefined ? undefined : (model.contextWindow ?? 0) > standard,
+	});
+}
 
 export function streamCursorRuntime(
 	model: Model<Api>,
@@ -52,11 +65,16 @@ export function streamCursorRuntime(
 				: mergeGrantedTools(grantedToolsFromContext(context));
 			stream.push({ type: "start", partial });
 
+			let modelSelection: ModelSelection | undefined;
+			if (trailingToolResults(context).length === 0) {
+				await ensureCursorModels(apiKey);
+				modelSelection = selectionForTurn(model, apiKey, options);
+			}
 			const prepared = await prepareTurn({
 				cwd,
 				agentInstanceId,
 				apiKey,
-				modelId: model.id,
+				modelSelection,
 				context,
 				grantedTools,
 				host,
@@ -87,10 +105,13 @@ export function streamCursorRuntime(
 				}
 				const agent = live.agent;
 				const userPrompt = prompt;
+				if (!modelSelection) {
+					throw new Error("Cannot send a Cursor SDK turn without a model selection");
+				}
 				const starting = startSend(live, () =>
 					withSdkExitSuppressed(() =>
 						agent.send(userPrompt, {
-							model: defaultModelSelection(model.id),
+							model: modelSelection,
 							local: { customTools },
 							onDelta: ({ update }) => {
 								const sink = live.sink;

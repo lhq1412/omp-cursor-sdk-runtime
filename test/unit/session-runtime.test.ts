@@ -134,7 +134,7 @@ describe("session runtime", () => {
 				cwd: "/tmp/project",
 				agentInstanceId: "main",
 				apiKey: "test-key",
-				modelId: "composer-2.5",
+				modelSelection: { id: "composer-2.5" },
 				context: toolResultContext(),
 				grantedTools: [],
 			}),
@@ -152,7 +152,7 @@ describe("session runtime", () => {
 			cwd: "/tmp/project",
 			agentInstanceId: "main",
 			apiKey: "test-key",
-			modelId: "composer-2.5",
+			modelSelection: { id: "composer-2.5" },
 			context: historyThenContinue(),
 			grantedTools: [],
 		});
@@ -177,7 +177,7 @@ describe("session runtime", () => {
 			cwd: "/tmp/project",
 			agentInstanceId: "main",
 			apiKey: "test-key",
-			modelId: "composer-2.5",
+			modelSelection: { id: "composer-2.5" },
 			context: firstContext,
 			grantedTools: [],
 		});
@@ -198,7 +198,7 @@ describe("session runtime", () => {
 			cwd: "/tmp/project",
 			agentInstanceId: "main",
 			apiKey: "test-key",
-			modelId: "composer-2.5",
+			modelSelection: { id: "composer-2.5" },
 			context: secondContext,
 			grantedTools: [],
 		});
@@ -224,7 +224,7 @@ describe("session runtime", () => {
 			cwd: "/tmp/project",
 			agentInstanceId: "main",
 			apiKey: "key-a",
-			modelId: "composer-2.5",
+			modelSelection: { id: "composer-2.5" },
 			context,
 			grantedTools: [],
 		});
@@ -241,7 +241,7 @@ describe("session runtime", () => {
 			cwd: "/tmp/other",
 			agentInstanceId: "main",
 			apiKey: "key-b",
-			modelId: "composer-2.5",
+			modelSelection: { id: "composer-2.5" },
 			context,
 			grantedTools: [],
 		});
@@ -279,7 +279,7 @@ describe("session runtime", () => {
 			cwd: "/tmp/project",
 			agentInstanceId: "main",
 			apiKey: "test-key",
-			modelId: "composer-2.5",
+			modelSelection: { id: "composer-2.5" },
 			context: secondContext,
 			grantedTools: [],
 		});
@@ -312,7 +312,7 @@ describe("session runtime", () => {
 			cwd: "/tmp/other",
 			agentInstanceId: "main",
 			apiKey: "test-key",
-			modelId: "composer-2.5",
+			modelSelection: { id: "composer-2.5" },
 			context: secondContext,
 			grantedTools: [],
 		});
@@ -338,7 +338,7 @@ describe("session runtime", () => {
 			cwd: "/tmp/project",
 			agentInstanceId: "main",
 			apiKey: "key-a",
-			modelId: "composer-2.5",
+			modelSelection: { id: "composer-2.5" },
 			context: userContext("first"),
 			grantedTools: [],
 		});
@@ -347,7 +347,7 @@ describe("session runtime", () => {
 				cwd: "/tmp/other",
 				agentInstanceId: "main",
 				apiKey: "key-b",
-				modelId: "composer-2.5",
+				modelSelection: { id: "composer-2.5" },
 				context: toolResultContext(),
 				grantedTools: [],
 			}),
@@ -372,7 +372,7 @@ describe("session runtime", () => {
 			cwd: "/tmp/project",
 			agentInstanceId: "main",
 			apiKey: "test-key",
-			modelId: "composer-2.5",
+			modelSelection: { id: "composer-2.5" },
 			context: firstContext,
 			grantedTools: [],
 		});
@@ -394,7 +394,7 @@ describe("session runtime", () => {
 				cwd: "/tmp/project",
 				agentInstanceId: "main",
 				apiKey: "test-key",
-				modelId: "composer-2.5",
+				modelSelection: { id: "composer-2.5" },
 				context: secondContext,
 				grantedTools: [],
 			}),
@@ -419,7 +419,7 @@ describe("session runtime", () => {
 			cwd: "/tmp/project",
 			agentInstanceId: "main",
 			apiKey: "test-key",
-			modelId: "composer-2.5",
+			modelSelection: { id: "composer-2.5" },
 			context: firstContext,
 			grantedTools: [],
 		});
@@ -435,7 +435,7 @@ describe("session runtime", () => {
 			cwd: "/tmp/project",
 			agentInstanceId: "main",
 			apiKey: "test-key",
-			modelId: "composer-2.5",
+			modelSelection: { id: "composer-2.5" },
 			context: failedContext,
 			grantedTools: [],
 		});
@@ -445,7 +445,7 @@ describe("session runtime", () => {
 			cwd: "/tmp/project",
 			agentInstanceId: "main",
 			apiKey: "test-key",
-			modelId: "composer-2.5",
+			modelSelection: { id: "composer-2.5" },
 			context: failedContext,
 			grantedTools: [],
 		});
@@ -471,7 +471,7 @@ describe("session runtime", () => {
 			cwd: "/tmp/other",
 			agentInstanceId: "main",
 			apiKey: "test-key",
-			modelId: "composer-2.5",
+			modelSelection: { id: "composer-2.5" },
 			context: firstContext,
 			grantedTools: [],
 		});
@@ -505,7 +505,7 @@ describe("session runtime", () => {
 			cwd: "/tmp/other",
 			agentInstanceId: "main",
 			apiKey: "test-key",
-			modelId: "composer-2.5",
+			modelSelection: { id: "composer-2.5" },
 			context: secondContext,
 			grantedTools: [],
 		});
@@ -523,12 +523,74 @@ describe("session runtime", () => {
 			cwd: "/tmp/project",
 			agentInstanceId: "main",
 			apiKey: "test-key",
-			modelId: "composer-2.5",
+			modelSelection: { id: "composer-2.5" },
 			context: secondContext,
 			grantedTools: [],
 		});
 		expect(opens.at(-1)?.savedAgentId).toBeUndefined();
 		expect(opens.at(-1)?.cwd).toContain("/tmp/project");
 		expect(fromSessionCwd.incremental).toBe(false);
+	});
+
+	test("opens create/resume with this turn's ModelSelection", async () => {
+		runtimeTestUtils.clear();
+		liveRunTestUtils.clear();
+		scopeTestUtils.reset();
+		resumeTestUtils.reset();
+		scopeTestUtils.set("/tmp/project", "/tmp/session.jsonl", "sess-1");
+		const modelSelection = {
+			id: "composer-2.5",
+			params: [
+				{ id: "fast", value: "true" },
+				{ id: "context", value: "1m" },
+				{ id: "effort", value: "high" },
+			],
+		};
+		const opened: unknown[] = [];
+		runtimeTestUtils.setOpenAgent(async (input) => {
+			opened.push(input.model);
+			return fakeAgent("agent-1");
+		});
+		await prepareTurn({
+			cwd: "/tmp/project",
+			agentInstanceId: "main",
+			apiKey: "test-key",
+			modelSelection,
+			context: userContext("first"),
+			grantedTools: [],
+		});
+		expect(opened).toEqual([modelSelection]);
+		expect(opened[0]).toBe(modelSelection);
+	});
+
+	test("parked continuation keeps the original agent and ignores a new ModelSelection", async () => {
+		runtimeTestUtils.clear();
+		liveRunTestUtils.clear();
+		scopeTestUtils.reset();
+		resumeTestUtils.reset();
+		scopeTestUtils.set("/tmp/project", "/tmp/session.jsonl", "sess-1");
+		const opened: unknown[] = [];
+		runtimeTestUtils.setOpenAgent(async (input) => {
+			opened.push(input.model);
+			return fakeAgent(`agent-${opened.length + 1}`);
+		});
+		await prepareTurn({
+			cwd: "/tmp/project",
+			agentInstanceId: "main",
+			apiKey: "test-key",
+			modelSelection: { id: "composer-2.5", params: [{ id: "fast", value: "false" }] },
+			context: userContext("first"),
+			grantedTools: [],
+		});
+		const next = await prepareTurn({
+			cwd: "/tmp/project",
+			agentInstanceId: "main",
+			apiKey: "test-key",
+			modelSelection: { id: "composer-2.5", params: [{ id: "fast", value: "true" }] },
+			context: toolResultContext(),
+			grantedTools: [],
+		});
+		expect(opened).toHaveLength(1);
+		expect(next.continuing).toBe(true);
 	});
 });

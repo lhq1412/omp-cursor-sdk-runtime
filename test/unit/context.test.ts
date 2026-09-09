@@ -2,14 +2,19 @@ import { describe, expect, test } from "bun:test";
 import { activeUserInput, activeUserText, bootstrapUserInput, computeContextFingerprint, emptySendState, planSend, turnPrompt } from "../../src/context.ts";
 import type { Context } from "@oh-my-pi/pi-ai";
 
-function context(messages: Context["messages"], systemPrompt = ["sys"]): Context {
+function context(messages: Context["messages"], systemPrompt: Context["systemPrompt"] = ["sys"]): Context {
 	return { systemPrompt, messages };
 }
 
+const firstUser = [{ role: "user", content: "hi", timestamp: 1 } as Context["messages"][number]];
+
 describe("send policy", () => {
-	test("bootstraps the first send", () => {
-		const ctx = context([{ role: "user", content: "hi", timestamp: 1 } as Context["messages"][number]]);
-		expect(planSend(emptySendState(), ctx).mode).toBe("bootstrap");
+	test("bootstraps the first send with system instructions", () => {
+		const ctx = context(firstUser, ["Keep going.", "Be brief."]);
+		const plan = planSend(emptySendState(), ctx);
+		expect(plan.mode).toBe("bootstrap");
+		expect(turnPrompt(plan, ctx).text).toBe("System instructions from OMP:\nKeep going.\nBe brief.\n\nhi");
+		expect(bootstrapUserInput(context(firstUser, "")).text).toBe("hi");
 	});
 
 	test("incrementals when only a user message is appended", () => {
@@ -21,6 +26,7 @@ describe("send policy", () => {
 		]);
 		const plan = planSend({ bootstrapped: true, contextFingerprint: fingerprint, incrementalSendCount: 0 }, second);
 		expect(plan).toEqual({ mode: "incremental", resetAgent: false, reason: "incremental" });
+		expect(turnPrompt(plan, second).text).toBe("again");
 	});
 
 	test("rebuilds after a shortened history", () => {
@@ -35,6 +41,18 @@ describe("send policy", () => {
 		);
 		expect(plan.mode).toBe("bootstrap");
 		expect(plan.resetAgent).toBe(true);
+	});
+
+	test("rebuilds after the system prompt changes", () => {
+		const first = context(firstUser, "old policy");
+		const second = context(firstUser, "new policy");
+		const plan = planSend(
+			{ bootstrapped: true, contextFingerprint: computeContextFingerprint(first), incrementalSendCount: 1 },
+			second,
+		);
+		expect(plan.mode).toBe("bootstrap");
+		expect(plan.resetAgent).toBe(true);
+		expect(turnPrompt(plan, second).text).toBe("System instructions from OMP:\nnew policy\n\nhi");
 	});
 
 	test("sends only the active user text, never the system prompt", () => {
@@ -60,6 +78,7 @@ describe("send policy", () => {
 			text: "",
 			images: [{ data: "abc", mimeType: "image/png" }],
 		});
+		expect(bootstrapUserInput(ctx).images).toEqual([{ data: "abc", mimeType: "image/png" }]);
 	});
 
 	test("bootstraps assistant.content toolCall blocks with name, id, arguments, and later toolResult", () => {
@@ -91,7 +110,7 @@ describe("send policy", () => {
 		expect(prompt.text).not.toMatch(/role":"toolCall"/);
 	});
 
-	test("bootstraps prior history with the current user request and never copies the system prompt", () => {
+	test("bootstraps history and system instructions; incrementals send the current user only", () => {
 		const ctx = context(
 			[
 				{ role: "user", content: "target is /workspace/important.ts", timestamp: 1 } as Context["messages"][number],
@@ -100,12 +119,55 @@ describe("send policy", () => {
 			],
 			["You are an OMP agent with extra instructions."],
 		);
-		const prompt = bootstrapUserInput(ctx);
-		expect(prompt.text).toContain("target is /workspace/important.ts");
-		expect(prompt.text).toContain("continue that edit");
-		expect(prompt.text).not.toContain("OMP agent");
+		expect(bootstrapUserInput(ctx).text).toBe(
+			[
+				"System instructions from OMP:",
+				"You are an OMP agent with extra instructions.",
+				"",
+				"Previous OMP conversation (reconstructed context, not live Cursor history):",
+				"user: target is /workspace/important.ts",
+				"assistant: ok",
+				"",
+				"---",
+				"Current user request:",
+				"continue that edit",
+			].join("\n"),
+		);
 		expect(turnPrompt({ mode: "incremental", resetAgent: false, reason: "incremental" }, ctx)).toEqual({
 			text: "continue that edit",
 		});
+	});
+
+	test("sanitizes structured OMP prompts and falls back when markers are absent", () => {
+		const structured = [
+			"<system-conventions>",
+			"Stay in this prefix.",
+			"# Internal URLs",
+			"HOST_CATALOG must vanish",
+			"§ Workflow",
+			"Keep this workflow.",
+		].join("\n");
+		expect(bootstrapUserInput(context(firstUser, structured)).text).toBe(
+			[
+				"System instructions from OMP:",
+				"<system-conventions>",
+				"Stay in this prefix.",
+				"",
+				"OMP host tool catalog and tool policy omitted: Cursor can call only Cursor SDK tools exposed in this run.",
+				"",
+				"§ Workflow",
+				"Keep this workflow.",
+				"",
+				"hi",
+			].join("\n"),
+		);
+
+		const unmarked = "  Be terse. Extra.  ";
+		expect(bootstrapUserInput(context(firstUser, unmarked)).text).toBe("System instructions from OMP:\nBe terse. Extra.\n\nhi");
+
+		const incomplete = "<system-conventions>\n# Internal URLs\nHOST_CATALOG stays\nno workflow marker";
+		expect(bootstrapUserInput(context(firstUser, incomplete)).text).toBe(
+			`System instructions from OMP:\n${incomplete}\n\nhi`,
+		);
 	});
 });

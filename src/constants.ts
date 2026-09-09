@@ -8,7 +8,9 @@ export const MAX_COMPLETED_INCREMENTAL_SENDS_BEFORE_REBOOTSTRAP = 20;
 /**
  * Live probe (2026-09-08): this backend rejects `AgentOptions.systemPrompt`
  * with `[invalid_argument] unknown option '--system-prompt'`.
- * v1 never sets that field and never copies OMP system text into user messages.
+ * Native replacement stays unsupported; never set AgentOptions.systemPrompt.
+ * Bootstrap send text may include sanitized OMP instructions; incremental turns
+ * omit them because the existing agent retains bootstrap.
  */
 export const SYSTEM_PROMPT_REPLACEMENT = "unsupported" as const;
 

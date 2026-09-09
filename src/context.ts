@@ -25,6 +25,19 @@ function serializeSystemPrompt(systemPrompt: string | readonly string[] | undefi
 	return typeof systemPrompt === "string" ? systemPrompt : systemPrompt?.join("\n") ?? "";
 }
 
+function sanitizeSystemPromptForCursor(systemPrompt: string): string {
+	if (!systemPrompt.startsWith("<system-conventions>")) return systemPrompt.trim();
+	const toolPolicyStart = systemPrompt.indexOf("\n# Internal URLs\n");
+	if (toolPolicyStart < 0) return systemPrompt.trim();
+	const workflowStart = systemPrompt.indexOf("\n§ Workflow\n", toolPolicyStart);
+	if (workflowStart < 0) return systemPrompt.trim();
+	return [
+		systemPrompt.slice(0, toolPolicyStart).trimEnd(),
+		"OMP host tool catalog and tool policy omitted: Cursor can call only Cursor SDK tools exposed in this run.",
+		systemPrompt.slice(workflowStart).trimStart(),
+	].join("\n\n");
+}
+
 export function computeContextFingerprint(context: Context): string {
 	const systemHash = hashValue(serializeSystemPrompt(context.systemPrompt));
 	const messageHashes = context.messages.map((message, index) => {
@@ -193,16 +206,24 @@ export function activeUserInput(context: Context): SDKUserMessage {
 }
 
 /**
- * New SDK agent input: prior visible history plus the current user turn.
- * System prompt is never copied. Historical images are noted, not re-attached.
+ * New SDK agent input: sanitized OMP system instructions (when nonempty), prior
+ * visible history, then the current user turn. Native SDK systemPrompt is never
+ * set. Historical images are noted, not re-attached.
  */
 export function bootstrapUserInput(context: Context): SDKUserMessage {
 	const index = lastUserIndex(context);
 	const prior = context.messages.slice(0, index);
 	const current = activeUserInput(context);
-	if (prior.length === 0) return current;
-	const history = serializeHistory(prior);
-	const text = `${history}\n\n---\nCurrent user request:\n${current.text}`;
+	const conversation =
+		prior.length === 0
+			? current.text
+			: `${serializeHistory(prior)}\n\n---\nCurrent user request:\n${current.text}`;
+	const sanitized = sanitizeSystemPromptForCursor(serializeSystemPrompt(context.systemPrompt));
+	const text = sanitized
+		? conversation
+			? `System instructions from OMP:\n${sanitized}\n\n${conversation}`
+			: `System instructions from OMP:\n${sanitized}`
+		: conversation;
 	return current.images && current.images.length > 0 ? { text, images: current.images } : { text };
 }
 
