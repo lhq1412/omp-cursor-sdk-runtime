@@ -34,6 +34,8 @@ function createHost(options: HostOptions = {}) {
 	const appended: Array<{ type: string; data: unknown }> = [];
 	const refreshCalls: Array<{ providerId: string; strategy?: string; thisValue: unknown }> = [];
 	let branch = options.branch ?? [];
+	let sessionId = "session-a";
+	let sessionFile: string | undefined = "/sessions/a.jsonl";
 	let model = options.model ?? { id: "composer-2.5", provider: CURSOR_SDK_PROVIDER_ID };
 
 	const modelRegistry = {
@@ -50,7 +52,11 @@ function createHost(options: HostOptions = {}) {
 		model: typeof model;
 		hasUI: boolean;
 		ui: { notify: (message: string, type?: "info" | "warning" | "error") => void };
-		sessionManager: { getBranch: () => SessionEntry[] };
+		sessionManager: {
+			getBranch: () => SessionEntry[];
+			getSessionId: () => string;
+			getSessionFile: () => string | undefined;
+		};
 		modelRegistry: typeof modelRegistry;
 	};
 
@@ -64,6 +70,8 @@ function createHost(options: HostOptions = {}) {
 		},
 		sessionManager: {
 			getBranch: () => branch,
+			getSessionId: () => sessionId,
+			getSessionFile: () => sessionFile,
 		},
 		modelRegistry,
 	};
@@ -112,6 +120,10 @@ function createHost(options: HostOptions = {}) {
 		},
 		setBranch(next: SessionEntry[]) {
 			branch = next;
+		},
+		setSessionIdentity(id: string, file: string | undefined) {
+			sessionId = id;
+			sessionFile = file;
 		},
 		async emit(event: string) {
 			for (const handler of handlers.get(event) ?? []) await handler({ type: event }, ctx);
@@ -459,6 +471,121 @@ describe("model controls", () => {
 		expect(host.notifications).toEqual([]);
 	});
 
+	test.each(["on", "off"] as const)("pending %s cannot write B before session_branch completes", async (action) => {
+		const catalog = deferCatalog("cached-model");
+		const baselineB = action === "off";
+		const host = createHost({
+			model: { id: "cached-model", provider: CURSOR_SDK_PROVIDER_ID },
+			branch: fastBranch("cached-model", !baselineB),
+			getApiKeyForProvider: async () => "crsr_test",
+		});
+		registerModelControls(host.pi);
+		await host.emit("session_start");
+		const pending = host.run("cursor-fast", action);
+		await catalog.started;
+
+		await host.emit("session_before_branch");
+		const branchB = fastBranch("cached-model", baselineB);
+		host.setSessionIdentity("session-b", "/sessions/b.jsonl");
+		host.setBranch(branchB);
+		// OMP has switched the actual session, but memory reset still delays session_branch.
+		catalog.release();
+		await pending;
+		expect(host.appended).toEqual([]);
+		expect(host.notifications).toEqual([]);
+		expect(host.ctx.sessionManager.getBranch()).toEqual(branchB);
+
+		await host.emit("session_branch");
+		expect(getFastMode("cached-model")).toBe(baselineB);
+	});
+
+	test.each([
+		["session ID", "session-b", "/sessions/a.jsonl"],
+		["session file", "session-a", "/sessions/b.jsonl"],
+	] as const)("%s changes during key lookup invalidate without a navigation event", async (_field, id, file) => {
+		const catalog = deferCatalog("cached-model");
+		const key = deferred();
+		const keyRequested = deferred();
+		const host = createHost({
+			model: { id: "cached-model", provider: CURSOR_SDK_PROVIDER_ID },
+			branch: fastBranch("cached-model", true),
+			getApiKeyForProvider: async () => {
+				keyRequested.resolve();
+				await key.promise;
+				return "crsr_test";
+			},
+		});
+		registerModelControls(host.pi);
+		await host.emit("session_start");
+		const pending = host.run("cursor-fast", "on");
+		await keyRequested.promise;
+		host.setSessionIdentity(id, file);
+		const branchB = fastBranch("cached-model", false);
+		host.setBranch(branchB);
+		key.resolve();
+		await catalog.started;
+		catalog.release();
+		await pending;
+
+		expect(host.appended).toEqual([]);
+		expect(host.notifications).toEqual([]);
+		expect(host.ctx.sessionManager.getBranch()).toEqual(branchB);
+		await host.emit("session_branch");
+		expect(getFastMode("cached-model")).toBe(false);
+	});
+
+	test("same-file tree navigation invalidates before completion with unchanged session identity", async () => {
+		const catalog = deferCatalog("cached-model");
+		const host = createHost({
+			model: { id: "cached-model", provider: CURSOR_SDK_PROVIDER_ID },
+			branch: fastBranch("cached-model", true),
+			getApiKeyForProvider: async () => "crsr_test",
+		});
+		registerModelControls(host.pi);
+		await host.emit("session_start");
+		const pending = host.run("cursor-fast", "on");
+		await catalog.started;
+		await host.emit("session_before_tree");
+		const destination = fastBranch("cached-model", false);
+		host.setBranch(destination);
+		catalog.release();
+		await pending;
+
+		expect(host.appended).toEqual([]);
+		expect(host.notifications).toEqual([]);
+		expect(host.ctx.sessionManager.getBranch()).toEqual(destination);
+		await host.emit("session_tree");
+		expect(getFastMode("cached-model")).toBe(false);
+	});
+
+	test("cancelled tree navigation invalidates its waiter but permits a fresh command", async () => {
+		const catalog = deferCatalog("cached-model");
+		const host = createHost({
+			model: { id: "cached-model", provider: CURSOR_SDK_PROVIDER_ID },
+			branch: fastBranch("cached-model", false),
+			getApiKeyForProvider: async () => "crsr_test",
+		});
+		registerModelControls(host.pi);
+		await host.emit("session_start");
+		const pending = host.run("cursor-fast", "on");
+		await catalog.started;
+		await host.emit("session_before_tree");
+		// Cancellation leaves the same identity and branch, with no completion event.
+		catalog.release();
+		await pending;
+		expect(host.appended).toEqual([]);
+		expect(host.notifications).toEqual([]);
+		expect(getFastMode("cached-model")).toBe(false);
+
+		await host.run("cursor-fast", "on");
+		expect(host.appended).toEqual([
+			{ type: controlsTestUtils.FAST_ENTRY_TYPE, data: { modelId: "cached-model", fast: true } },
+		]);
+		expect(getFastMode("cached-model")).toBe(true);
+		expect(host.notifications.map((item) => item.type)).toEqual(["info"]);
+		expect(catalog.calls).toEqual(["crsr_test"]);
+	});
+
 	test("returning to A does not revive its pending command", async () => {
 		const catalog = deferCatalog("cached-model");
 		const branchA = fastBranch("cached-model", false);
@@ -471,8 +598,10 @@ describe("model controls", () => {
 		await host.emit("session_start");
 		const pending = host.run("cursor-fast", "on");
 		await catalog.started;
+		host.setSessionIdentity("session-b", "/sessions/b.jsonl");
 		host.setBranch(fastBranch("cached-model", true));
 		await host.emit("session_switch");
+		host.setSessionIdentity("session-a", "/sessions/a.jsonl");
 		host.setBranch(branchA);
 		await host.emit("session_switch");
 		catalog.release();
@@ -558,6 +687,7 @@ describe("model controls", () => {
 		await catalog.started;
 		if (event === "session_branch") await host.emit("session_before_branch");
 		const branchB = fastBranch("cached-model", true);
+		host.setSessionIdentity("session-b", "/sessions/b.jsonl");
 		host.setBranch(branchB);
 		await host.emit(event);
 		expect(getFastMode("cached-model")).toBe(true);

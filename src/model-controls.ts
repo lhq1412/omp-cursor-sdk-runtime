@@ -189,9 +189,15 @@ export function registerModelControls(
 				return;
 			}
 			const generation = preferenceGeneration;
+			const sessionId = ctx.sessionManager.getSessionId();
+			const sessionFile = ctx.sessionManager.getSessionFile();
 			const model = ctx.model ? { ...ctx.model } : undefined;
 			const apiKey = await hydrateCatalogMetadata({ model, modelRegistry: ctx.modelRegistry });
-			if (generation !== preferenceGeneration) return;
+			if (
+				generation !== preferenceGeneration ||
+				sessionId !== ctx.sessionManager.getSessionId() ||
+				sessionFile !== ctx.sessionManager.getSessionFile()
+			) return;
 			const target = currentFastTarget({ model }, apiKey);
 			if (!target.ok) {
 				ctx.ui.notify(target.message, "error");
@@ -239,6 +245,12 @@ export function registerModelControls(
 		},
 	});
 
+	const invalidate = () => {
+		preferenceGeneration++;
+	};
+	pi.on("session_before_switch", invalidate);
+	pi.on("session_before_branch", invalidate);
+	pi.on("session_before_tree", invalidate);
 	const fold = (_event: unknown, ctx: ExtensionContext) => {
 		preferenceGeneration++;
 		foldSessionPreferences(ctx);
