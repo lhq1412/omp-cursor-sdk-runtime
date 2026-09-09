@@ -245,6 +245,7 @@ export function registerModelControls(
 	};
 	pi.on("session_start", fold);
 	pi.on("session_switch", fold);
+	pi.on("session_branch", fold);
 	pi.on("session_tree", fold);
 }
 

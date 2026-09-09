@@ -427,10 +427,17 @@ describe("model controls", () => {
 		expect(host.notifications.at(-1)?.type).toBe("info");
 	});
 
-	test.each(["on", "off"] as const)("pending %s cannot change the destination session", async (action) => {
+	test.each([
+		["session_switch", "on"],
+		["session_switch", "off"],
+		["session_branch", "on"],
+		["session_branch", "off"],
+	] as const)("pending %s %s cannot change the destination session", async (event, action) => {
 		const catalog = deferCatalog("cached-model");
+		const baseline = action === "off";
 		const host = createHost({
 			model: { id: "cached-model", provider: CURSOR_SDK_PROVIDER_ID },
+			branch: fastBranch("cached-model", !baseline),
 			getApiKeyForProvider: async () => "crsr_test",
 		});
 		registerModelControls(host.pi);
@@ -438,10 +445,10 @@ describe("model controls", () => {
 		const pending = host.run("cursor-fast", action);
 		await catalog.started;
 
-		const baseline = action === "off";
+		if (event === "session_branch") await host.emit("session_before_branch");
 		const branchB = fastBranch("cached-model", baseline);
 		host.setBranch(branchB);
-		await host.emit("session_switch");
+		await host.emit(event);
 		expect(getFastMode("cached-model")).toBe(baseline);
 		catalog.release();
 		await pending;
@@ -538,17 +545,22 @@ describe("model controls", () => {
 		expect(host.notifications.map((item) => item.type)).toEqual(["info"]);
 	});
 
-	test("a destination command survives the stale waiter sharing its catalog query", async () => {
+	test.each(["session_switch", "session_branch"])("a destination command survives the stale %s waiter sharing its catalog query", async (event) => {
 		const catalog = deferCatalog("cached-model");
 		const host = createHost({
 			model: { id: "cached-model", provider: CURSOR_SDK_PROVIDER_ID },
+			branch: fastBranch("cached-model", false),
 			getApiKeyForProvider: async () => "crsr_test",
 		});
 		registerModelControls(host.pi);
+		await host.emit("session_start");
 		const stale = host.run("cursor-fast", "on");
 		await catalog.started;
-		host.setBranch(fastBranch("cached-model", true));
-		await host.emit("session_switch");
+		if (event === "session_branch") await host.emit("session_before_branch");
+		const branchB = fastBranch("cached-model", true);
+		host.setBranch(branchB);
+		await host.emit(event);
+		expect(getFastMode("cached-model")).toBe(true);
 		const survivor = host.run("cursor-fast", "off");
 		// Drain B's key-resolution microtasks while the shared catalog is still blocked.
 		await new Promise<void>((resolve) => setImmediate(resolve));
@@ -558,6 +570,10 @@ describe("model controls", () => {
 		expect(catalog.calls).toEqual(["crsr_test"]);
 		expect(host.appended).toEqual([
 			{ type: controlsTestUtils.FAST_ENTRY_TYPE, data: { modelId: "cached-model", fast: false } },
+		]);
+		expect(host.ctx.sessionManager.getBranch()).toEqual([
+			...branchB,
+			...fastBranch("cached-model", false),
 		]);
 		expect(getFastMode("cached-model")).toBe(false);
 		expect(host.notifications.map((item) => item.type)).toEqual(["info"]);
