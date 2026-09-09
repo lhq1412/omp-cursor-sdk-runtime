@@ -54,8 +54,11 @@ export function streamCursorRuntime(
 	const partial = createEmptyAssistantMessage(model);
 	queueMicrotask(async () => {
 		let slot: RuntimeSlot | undefined;
+		let abortSignal = options?.signal;
 		try {
 			const host = readHostBridge((options as Record<string, unknown> | undefined)?.[HOST_BRIDGE_OPTION_KEY]);
+			abortSignal = host?.signal ?? options?.signal;
+			abortSignal?.throwIfAborted();
 			const snapshot = host?.snapshot();
 			const cwd = snapshot?.cwd ?? (typeof options?.cwd === "string" && options.cwd ? options.cwd : getCursorSessionCwd());
 			const agentInstanceId = snapshot?.agentInstanceId ?? DEFAULT_AGENT_INSTANCE_ID;
@@ -67,9 +70,27 @@ export function streamCursorRuntime(
 
 			let modelSelection: ModelSelection | undefined;
 			if (trailingToolResults(context).length === 0) {
-				await ensureCursorModels(apiKey);
+				const discovery = ensureCursorModels(apiKey);
+				if (abortSignal) {
+					const signal = abortSignal;
+					let onAbort: (() => void) | undefined;
+					const cancelled = new Promise<void>((resolve) => {
+						onAbort = resolve;
+						signal.addEventListener("abort", onAbort, { once: true });
+						if (signal.aborted) resolve();
+					});
+					try {
+						await Promise.race([discovery, cancelled]);
+					} finally {
+						if (onAbort) signal.removeEventListener("abort", onAbort);
+					}
+				} else {
+					await discovery;
+				}
+				abortSignal?.throwIfAborted();
 				modelSelection = selectionForTurn(model, apiKey, options);
 			}
+			abortSignal?.throwIfAborted();
 			const prepared = await prepareTurn({
 				cwd,
 				agentInstanceId,
@@ -83,7 +104,6 @@ export function streamCursorRuntime(
 			slot = preparedSlot;
 			live.sink = { stream, partial };
 
-			const abortSignal = host?.signal ?? options?.signal;
 			bindLiveAbort(live, abortSignal, () => {
 				if (!slot) return;
 				void finishTurnFailed(slot, "aborted");
@@ -185,9 +205,10 @@ export function streamCursorRuntime(
 				await finishLiveKeepAgent(preparedSlot.key, "run finished");
 		} catch (error) {
 			if (slot) await finishTurnFailed(slot, "send failed");
-			partial.stopReason = "error";
-			partial.errorMessage = error instanceof Error ? error.message : String(error);
-			stream.push({ type: "error", reason: "error", error: partial });
+			const aborted = abortSignal?.aborted;
+			partial.stopReason = aborted ? "aborted" : "error";
+			partial.errorMessage = aborted ? "Cancelled" : error instanceof Error ? error.message : String(error);
+			stream.push({ type: "error", reason: aborted ? "aborted" : "error", error: partial });
 			stream.end(partial);
 		}
 	});
