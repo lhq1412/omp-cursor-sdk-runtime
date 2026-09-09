@@ -3,6 +3,7 @@ node_modules/
 
 # Build & typecheck output
 dist/
+dist.staging*/
 *.tsbuildinfo
 
 # Test coverage
@@ -16,10 +17,17 @@ coverage/
 # Pack / publish artifacts
 *.tgz
 
-# Project probe & debug output
+# OMP / Pi local runtime state (do not commit)
+.pi/
+
+# Project probe & debug output (do not commit)
 .debug/
 .artifacts/
 .probe-runs/
+
+# Cursor local/runtime logs and prompt exports (do not commit)
+.cursor/debug-*.log
+prompt-exports/
 
 # Logs
 *.log
