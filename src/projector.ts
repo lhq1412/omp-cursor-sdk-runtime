@@ -1,21 +1,42 @@
 import type { AssistantMessage, AssistantMessageEventStream, Model } from "@oh-my-pi/pi-ai";
 import type { Api } from "@oh-my-pi/pi-ai";
 import { createAssistantMessageEventStream } from "@oh-my-pi/pi-ai";
-import type { InteractionUpdate, RunResult } from "@cursor/sdk";
+import type { InteractionUpdate, RunResult, TokenUsage } from "@cursor/sdk";
 
-export function createEmptyAssistantMessage(model: Model<Api>): AssistantMessage {
+export interface RunProjection {
+	answerText: string;
+	stepId?: number;
+	reportedUsage?: TokenUsage;
+	contextEstimate?: number;
+}
+
+export interface CursorAssistantMessage extends AssistantMessage {
+	cursorSdk: {
+		tokenUsage: "actual" | "unavailable";
+		cost: "unavailable";
+		contextOccupancy: { status: "estimated"; tokens: number } | { status: "unavailable" };
+	};
+}
+
+export function createEmptyAssistantMessage(model: Model<Api>): CursorAssistantMessage {
 	return {
 		role: "assistant",
 		content: [],
 		api: model.api,
 		provider: model.provider,
 		model: model.id,
+		cursorSdk: {
+			tokenUsage: "unavailable",
+			cost: "unavailable",
+			contextOccupancy: { status: "unavailable" },
+		},
 		usage: {
 			input: 0,
 			output: 0,
 			cacheRead: 0,
 			cacheWrite: 0,
 			totalTokens: 0,
+			// Host Usage requires numbers. These placeholders are NOT free pricing; see cursorSdk.cost.
 			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 		},
 		stopReason: "stop",
@@ -57,7 +78,22 @@ export function applyInteractionUpdate(
 	stream: AssistantMessageEventStream,
 	partial: AssistantMessage,
 	update: InteractionUpdate,
+	projection?: RunProjection,
 ): void {
+	if (projection) {
+		if (update.type === "step-started" && update.stepId !== projection.stepId) {
+			projection.stepId = update.stepId;
+			projection.answerText = "";
+		} else if (update.type === "tool-call-started") {
+			projection.answerText = "";
+		} else if (update.type === "text-delta") {
+			projection.answerText += update.text;
+		} else if (update.type === "turn-ended" && update.usage) {
+			// A turn's prompt plus output estimates occupancy; it is not an SDK context snapshot.
+			projection.contextEstimate = update.usage.inputTokens + update.usage.cacheReadTokens
+				+ update.usage.cacheWriteTokens + update.usage.outputTokens;
+		}
+	}
 	if (update.type === "text-delta") {
 		applyTextDelta(stream, partial, update.text);
 		return;
@@ -106,6 +142,56 @@ export function runResultToStopReason(result: RunResult): AssistantMessage["stop
 	if (result.status === "cancelled") return "aborted";
 	if (result.status === "error") return "error";
 	return "stop";
+}
+
+export function reconcileRunResult(
+	stream: AssistantMessageEventStream,
+	partial: AssistantMessage,
+	projection: RunProjection,
+	result: RunResult,
+): void {
+	if (!result.result) return;
+	// RunResult.result is the final answer, not all text from preceding tool steps.
+	const emitted = projection.answerText;
+	const suffix = result.result.startsWith(emitted) ? result.result.slice(emitted.length)
+		: emitted.startsWith(result.result) ? "" : result.result;
+	applyTextDelta(stream, partial, suffix);
+	projection.answerText = result.result;
+}
+
+export function projectRunUsage(
+	partial: CursorAssistantMessage,
+	projection: RunProjection,
+	usage: TokenUsage | undefined,
+): void {
+	if (projection.contextEstimate !== undefined) {
+		partial.cursorSdk.contextOccupancy = { status: "estimated", tokens: projection.contextEstimate };
+	}
+	if (!usage) return;
+	partial.cursorSdk.tokenUsage = "actual";
+	const previous = projection.reportedUsage;
+	const fields = [
+		["input", "inputTokens"], ["output", "outputTokens"],
+		["cacheRead", "cacheReadTokens"], ["cacheWrite", "cacheWriteTokens"],
+	] as const;
+	for (const [host, sdk] of fields) {
+		partial.usage[host] += Math.max(0, usage[sdk] - (previous?.[sdk] ?? 0));
+	}
+	partial.usage.totalTokens = partial.usage.input + partial.usage.output + partial.usage.cacheRead + partial.usage.cacheWrite;
+	if (usage.reasoningTokens !== undefined) {
+		partial.usage.reasoningTokens = (partial.usage.reasoningTokens ?? 0)
+			+ Math.max(0, usage.reasoningTokens - (previous?.reasoningTokens ?? 0));
+	}
+	// Keep the high-water mark on the SDK run, not the short-lived OMP message.
+	projection.reportedUsage = {
+		inputTokens: Math.max(usage.inputTokens, previous?.inputTokens ?? 0),
+		outputTokens: Math.max(usage.outputTokens, previous?.outputTokens ?? 0),
+		cacheReadTokens: Math.max(usage.cacheReadTokens, previous?.cacheReadTokens ?? 0),
+		cacheWriteTokens: Math.max(usage.cacheWriteTokens, previous?.cacheWriteTokens ?? 0),
+		totalTokens: Math.max(usage.totalTokens, previous?.totalTokens ?? 0),
+		reasoningTokens: usage.reasoningTokens === undefined ? previous?.reasoningTokens
+			: Math.max(usage.reasoningTokens, previous?.reasoningTokens ?? 0),
+	};
 }
 
 export function createProviderStream(): AssistantMessageEventStream {
