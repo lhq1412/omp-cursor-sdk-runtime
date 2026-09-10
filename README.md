@@ -97,6 +97,8 @@ omp --model cursor-sdk/gpt-5.5:xhigh  # when this model/effort is in your live c
 
 Thinking uses native OMP `:level` suffixes and the thinking selector (`off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`), limited to each model's advertised capabilities. Composer's fallback has fast but no thinking selector. Extended context uses native `/extended-context [on|off|status]` or Settings → Extended Context. Exactly two numeric context tiers share one model row; three or more tiers retain explicit non-default `@context` rows. Runtime maps the host-clamped `model.contextWindow` to the SDK context parameter.
 
+When switching from `cursor-sdk` to OMP's built-in Codex provider, the extension maps its historical tool-call IDs longer than 64 characters and their paired results to matching 64-character IDs in the outgoing context only. Persisted history and live SDK callback IDs remain unchanged. This also covers existing sessions while the extension is loaded; restart OMP after updating the extension.
+
 In-session:
 
 - `/cursor-fast [on|off|status]` — per canonical model; `--cursor-no-fast` wins `--cursor-fast`; otherwise session custom entries. Takes effect on the next new send, not an in-flight parked run. Captures the selected model and actual session identity when invoked; pending commands are discarded without saving or notifying if navigation starts or the identity changes while capabilities load, including before navigation-completed events. If navigation is cancelled, rerun the command.

@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { SDK_TOOL_CONTEXT } from "../../src/constants.ts";
-import { activeUserInput, activeUserText, computeContextFingerprint, emptySendState, planSend, prepareSendInput, type ModelInputLimits } from "../../src/context.ts";
+import { activeUserInput, activeUserText, computeContextFingerprint, emptySendState, planSend, prepareSendInput, registerCursorToolCallIds, type ModelInputLimits } from "../../src/context.ts";
 import type { Context } from "@oh-my-pi/pi-ai";
 
 const modelLimits = { contextWindow: 200_000, maxTokens: 20_000 };
@@ -253,8 +253,6 @@ describe("send policy", () => {
 			{ data: resultImage.data, mimeType: resultImage.mimeType },
 			{ data: secondImage.data, mimeType: secondImage.mimeType },
 		]);
-		expect(prepared.prompt.text).toMatch(/1[^\n]*capture[^\n]*read/);
-		expect(prepared.prompt.text).toMatch(/2[^\n]*inspect[^\n]*capture_screen/);
 		expect(prepared.prompt.text).not.toContain(requestImage.data);
 		expect(prepared.prompt.text).not.toContain(resultImage.data);
 		expect(() => bootstrap(ctx, { contextWindow: 14_000, maxTokens: 500 })).toThrow(/context window exceeded/i);
@@ -380,5 +378,94 @@ describe("send policy", () => {
 		expect(bootstrap(ctx, { contextWindow: 6000, maxTokens: 500 }).history).toEqual(ctx.messages.slice(0, -1));
 		expect(bootstrap(ctx, { contextWindow: 5000, maxTokens: 500 }).history).toEqual([]);
 		expect(() => bootstrap(context([{ role: "user", content: [image], timestamp: 1 }], ""), { contextWindow: 5000, maxTokens: 500 })).toThrow(/context window exceeded/i);
+	});
+});
+
+describe("Cursor tool call context projection", () => {
+	function registerProjection() {
+		const handlers = new Map<string, (event: unknown, ctx: unknown) => unknown>();
+		registerCursorToolCallIds({
+			on(event: string, handler: (event: unknown, ctx: unknown) => unknown) {
+				handlers.set(event, handler);
+			},
+		} as never);
+		return async (messages: Context["messages"], api?: string) => {
+			const event = { type: "context", messages: structuredClone(messages) };
+			const result = await handlers.get("context")!(event, { model: api ? { api } : undefined }) as { messages?: Context["messages"] } | undefined;
+			return result?.messages ?? event.messages;
+		};
+	}
+
+	function assistant(ids: string[], provider = "cursor-sdk", api = "cursor-sdk-agent") {
+		return {
+			role: "assistant",
+			provider,
+			api,
+			content: ids.map((id) => ({ type: "toolCall", id, name: "read", arguments: { path: id } })),
+			timestamp: 1,
+		} as Context["messages"][number];
+	}
+
+	function result(id: string) {
+		return {
+			role: "toolResult", toolCallId: id, toolName: "read",
+			content: [{ type: "text", text: id }], isError: false, timestamp: 2,
+		} as Context["messages"][number];
+	}
+
+	const ids = ["a", "b"].map((suffix) => "x".repeat(64) + suffix.repeat(22));
+
+	test("projects historical same-name calls to distinct Codex-safe IDs and pairs reversed results", async () => {
+		const project = registerProjection();
+		const messages = [assistant(ids), result(ids[1]!), result(ids[0]!)];
+		const original = structuredClone(messages);
+		const projected = await project(messages, "openai-codex-responses");
+		const calls = projected.flatMap((message) => message.role === "assistant"
+			? message.content.filter((block) => block.type === "toolCall")
+			: []);
+
+		expect(calls).toHaveLength(2);
+		expect(calls[0]!.id).not.toBe(calls[1]!.id);
+		for (const call of calls) {
+			expect(call.id.length).toBeGreaterThan(0);
+			expect(call.id.length).toBeLessThanOrEqual(64);
+		}
+		expect(projected[1]).toMatchObject({ toolCallId: calls[1]!.id, content: [{ type: "text", text: ids[1] }] });
+		expect(projected[2]).toMatchObject({ toolCallId: calls[0]!.id, content: [{ type: "text", text: ids[0] }] });
+		expect(messages).toEqual(original);
+		expect(await project(messages, "cursor-sdk-agent")).toEqual(original);
+	});
+
+	test.each(["openai-responses", undefined])("retains callback IDs outside Codex (%s)", async (api) => {
+		const messages = [assistant(ids), result(ids[0]!), result(ids[1]!)];
+		expect(await registerProjection()(messages, api)).toEqual(messages);
+	});
+
+	test("leaves non-adapter origins, unpaired results, and 64-character IDs unchanged", async () => {
+		const boundaryId = "b".repeat(64);
+		const messages = [
+			assistant([ids[0]!], "other-provider"),
+			result(ids[0]!),
+			assistant([ids[1]!], "cursor-sdk", "other-api"),
+			result(ids[1]!),
+			assistant([boundaryId]),
+			result(boundaryId),
+			result("unpaired".repeat(11)),
+		];
+		expect(await registerProjection()(messages, "openai-codex-responses")).toEqual(messages);
+	});
+
+	test("does not rewrite an unrelated provider's result when it later reuses an adapter ID", async () => {
+		const id = ids[0]!;
+		const messages = [
+			assistant([id]), result(id),
+			assistant([id], "other-provider", "openai-responses"), result(id),
+		];
+		const projected = await registerProjection()(messages, "openai-codex-responses");
+		const first = projected[0]!;
+		if (first.role !== "assistant" || first.content[0]?.type !== "toolCall") throw new Error("Missing projected call");
+		expect(first.content[0].id.length).toBeLessThanOrEqual(64);
+		expect(projected[1]).toMatchObject({ toolCallId: first.content[0].id });
+		expect(projected.slice(2)).toEqual(messages.slice(2));
 	});
 });

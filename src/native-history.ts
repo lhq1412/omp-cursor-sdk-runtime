@@ -5,13 +5,13 @@ import type { Context } from "@oh-my-pi/pi-ai";
 import { buildGrpcRequest } from "@oh-my-pi/pi-ai/providers/cursor";
 import { ConversationStateStructureSchema } from "@oh-my-pi/pi-catalog/discovery/cursor-proto";
 import { toBinary } from "@oh-my-pi/pi-catalog/discovery/protobuf";
+import { nativeToolCallId } from "./context.js";
 
 /** Project history only; the SDK remains responsible for creating and running agents. */
 export async function buildNativeHistory(history: Context["messages"], selection: ModelSelection) {
 	const callIds = new Set<string>();
-	const nativeId = (id: string) => createHash("sha256").update("omp-native-history:tool-call\0").update(id).digest("hex");
 	const messages = history.map((message) => {
-		if (message.role === "toolResult") return { ...message, toolCallId: nativeId(message.toolCallId) };
+		if (message.role === "toolResult") return { ...message, toolCallId: nativeToolCallId(message.toolCallId) };
 		if (message.role !== "assistant") return message;
 		return {
 			...message,
@@ -19,7 +19,7 @@ export async function buildNativeHistory(history: Context["messages"], selection
 				if (block.type !== "toolCall") return block;
 				if (callIds.has(block.id)) throw new Error("Cannot import native history with duplicate tool call IDs");
 				callIds.add(block.id);
-				return { ...block, id: nativeId(block.id) };
+				return { ...block, id: nativeToolCallId(block.id) };
 			}),
 		};
 	});

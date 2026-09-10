@@ -1,7 +1,13 @@
 import { createHash } from "node:crypto";
 import type { SDKImage, SDKUserMessage } from "@cursor/sdk";
 import type { Context } from "@oh-my-pi/pi-ai";
-import { MAX_COMPLETED_INCREMENTAL_SENDS_BEFORE_REBOOTSTRAP, SDK_TOOL_CONTEXT } from "./constants.js";
+import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
+import {
+	CURSOR_SDK_API,
+	CURSOR_SDK_PROVIDER_ID,
+	MAX_COMPLETED_INCREMENTAL_SENDS_BEFORE_REBOOTSTRAP,
+	SDK_TOOL_CONTEXT,
+} from "./constants.js";
 
 export type SendMode = "bootstrap" | "incremental";
 
@@ -29,6 +35,40 @@ export interface PreparedSendInput {
 }
 
 const NATIVE_HISTORY_FORMAT = "native-checkpoint-v1";
+
+export function nativeToolCallId(id: string): string {
+	return createHash("sha256").update("omp-native-history:tool-call\0").update(id).digest("hex");
+}
+
+export function registerCursorToolCallIds(pi: Pick<ExtensionAPI, "on">): void {
+	pi.on("context", (event, ctx) => {
+		if (ctx.model?.api !== "openai-codex-responses") return;
+
+		const callIds = new Map<string, string>();
+		// Context messages are deep copies; leave persisted history and live SDK callback IDs untouched.
+		for (const message of event.messages) {
+			if (message.role === "assistant") {
+				const cursorOrigin = message.provider === CURSOR_SDK_PROVIDER_ID && message.api === CURSOR_SDK_API;
+				for (const block of message.content) {
+					if (block.type !== "toolCall") continue;
+					const id = block.id;
+					if (cursorOrigin && id.length > 64) {
+						const mappedId = nativeToolCallId(id);
+						callIds.set(id, mappedId);
+						block.id = mappedId;
+					} else {
+						// A later call with the same raw ID owns subsequent results.
+						callIds.delete(id);
+					}
+				}
+			} else if (message.role === "toolResult") {
+				const mappedId = callIds.get(message.toolCallId);
+				if (mappedId) message.toolCallId = mappedId;
+			}
+		}
+		return { messages: event.messages };
+	});
+}
 
 function hashValue(value: string): string {
 	return createHash("sha256").update(value).digest("hex").slice(0, 16);
@@ -274,7 +314,7 @@ export function prepareSendInput(plan: SendPlan, context: Context, limits: Model
 			if (result.role !== "toolResult") continue;
 			for (const image of imagesFromContent(result.content)) {
 				images.push(image);
-				current.text += `\nAttached image ${images.length}: toolCallId=${JSON.stringify(result.toolCallId)}, toolName=${JSON.stringify(result.toolName)}.`;
+				current.text += `\nAttached image ${images.length}: toolCallId=${JSON.stringify(nativeToolCallId(result.toolCallId))}, toolName=${JSON.stringify(result.toolName)}.`;
 			}
 		}
 		if (images.length > 0) current.images = images;

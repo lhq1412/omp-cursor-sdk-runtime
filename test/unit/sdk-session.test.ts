@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { SDK_NATIVE_DISALLOWED_TOOLS, SYSTEM_PROMPT_REPLACEMENT } from "../../src/constants.ts";
+import { emptySendState, planSend, prepareSendInput } from "../../src/context.ts";
 import { buildAgentOptions, CloudAgentRejectedError, openAgent } from "../../src/sdk-session.ts";
 import { Agent, JsonlLocalAgentStore, type SDKAgent, type LocalAgentRunDocument } from "@cursor/sdk";
 import type { Context } from "@oh-my-pi/pi-ai";
@@ -158,6 +159,66 @@ describe("native history bootstrap", () => {
 				});
 			}
 			expect(history).toEqual(original);
+		} finally {
+			await agent[Symbol.asyncDispose]();
+		}
+	});
+
+	test("recovered image labels identify native calls and results in attachment order", async () => {
+		const fixture = setup();
+		const beforeImage = { type: "image" as const, data: Buffer.from("before-image").toString("base64"), mimeType: "image/png" };
+		const afterImage = { type: "image" as const, data: Buffer.from("after-image").toString("base64"), mimeType: "image/png" };
+		const context = {
+			messages: [
+				{ role: "user", content: "Compare the screenshots", timestamp: 1 },
+				{
+					role: "assistant", provider: "openai", model: "original-model", api: "openai-responses", timestamp: 2,
+					content: [
+						{ type: "toolCall", id: "call:one", name: "read", arguments: { path: "before.png" } },
+						{ type: "toolCall", id: "call_one", name: "read", arguments: { path: "after.png" } },
+					],
+				},
+				{ role: "toolResult", toolCallId: "call_one", toolName: "read", content: [{ type: "text", text: "after result" }, afterImage], isError: false, timestamp: 3 },
+				{ role: "toolResult", toolCallId: "call:one", toolName: "read", content: [{ type: "text", text: "before result" }, beforeImage], isError: false, timestamp: 4 },
+			],
+		} as Context;
+		const prepared = prepareSendInput(planSend(emptySendState(), context), context, { contextWindow: 200_000, maxTokens: 20_000 });
+		expect(prepared.prompt.images).toEqual([
+			{ data: afterImage.data, mimeType: afterImage.mimeType },
+			{ data: beforeImage.data, mimeType: beforeImage.mimeType },
+		]);
+		const labels = [...prepared.prompt.text.matchAll(/Attached image (\d+): toolCallId=("[^"]+")/g)];
+		expect(labels.map((label) => Number(label[1]))).toEqual([1, 2]);
+		const agent = await openAgent({ ...fixture.input, bootstrapHistory: prepared.history });
+		try {
+			const messages = await Agent.messages.list(agent.agentId, { cwd: fixture.input.cwd, store: fixture.store });
+			const turn = messages[0]?.message as {
+				turn: { value: { steps: Array<{ message: { value: { toolCallId: string } } }> } };
+			};
+			const steps = turn.turn.value.steps;
+			expect(steps).toHaveLength(2);
+			for (const [index, name] of ["after", "before"].entries()) {
+				const id = JSON.parse(labels[index]![2]!);
+				const matches = steps.filter((step) => step.message.value.toolCallId === id);
+				expect(matches).toHaveLength(1);
+				expect(matches[0]).toMatchObject({
+					message: { case: "toolCall", value: {
+						tool: { case: "mcpToolCall", value: {
+							args: {
+								toolCallId: id,
+								args: { path: { kind: { case: "stringValue", value: `${name}.png` } } },
+							},
+							result: { result: { case: "success", value: {
+								content: expect.arrayContaining([expect.objectContaining({
+									content: expect.objectContaining({
+										case: "text", value: expect.objectContaining({ text: `${name} result` }),
+									}),
+								})]),
+							} } },
+						} },
+					} },
+				});
+			}
 		} finally {
 			await agent[Symbol.asyncDispose]();
 		}
