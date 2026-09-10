@@ -1,5 +1,6 @@
 import { readdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
+import ts from "typescript";
 import { FORBIDDEN_IMPORT_PATTERNS } from "../src/constants.ts";
 
 async function walk(dir: string): Promise<string[]> {
@@ -16,22 +17,42 @@ async function walk(dir: string): Promise<string[]> {
 	return files;
 }
 
-const importLine = /^\s*(?:import|export)\s.+from\s+["']([^"']+)["']/;
+// Only these pure conversion exports may cross the built-in Cursor boundary.
+const nativeHistoryImports: Record<string, string> = {
+	"@oh-my-pi/pi-ai/providers/cursor": "buildGrpcRequest",
+	"@oh-my-pi/pi-catalog/discovery/cursor-proto": "ConversationStateStructureSchema",
+	"@oh-my-pi/pi-catalog/discovery/protobuf": "toBinary",
+};
 const root = join(import.meta.dir, "..", "src");
 const files = await walk(root);
 const violations: string[] = [];
 for (const file of files) {
-	if (file.endsWith("/constants.ts")) continue;
 	const text = await readFile(file, "utf8");
-	for (const line of text.split("\n")) {
-		const match = line.match(importLine);
-		if (!match) continue;
-		for (const pattern of FORBIDDEN_IMPORT_PATTERNS) {
-			if (match[1].includes(pattern)) {
-				violations.push(`${file}: ${pattern}`);
+	const source = ts.createSourceFile(file, text, ts.ScriptTarget.Latest, true);
+	function check(node: ts.Node): void {
+		const specifier = ts.isImportDeclaration(node) || ts.isExportDeclaration(node)
+			? node.moduleSpecifier
+			: ts.isCallExpression(node) && (
+				node.expression.kind === ts.SyntaxKind.ImportKeyword ||
+				(ts.isIdentifier(node.expression) && node.expression.text === "require")
+			)
+				? node.arguments[0]
+				: ts.isImportEqualsDeclaration(node) && ts.isExternalModuleReference(node.moduleReference)
+					? node.moduleReference.expression
+					: undefined;
+		if (specifier && ts.isStringLiteralLike(specifier) && FORBIDDEN_IMPORT_PATTERNS.some((pattern) => specifier.text.includes(pattern))) {
+			const bindings = ts.isImportDeclaration(node) && !node.importClause?.name ? node.importClause?.namedBindings : undefined;
+			const allowedName = nativeHistoryImports[specifier.text];
+			const allowed = file === join(root, "native-history.ts") && allowedName &&
+				bindings && ts.isNamedImports(bindings) && bindings.elements.length === 1 &&
+				(bindings.elements[0]!.propertyName ?? bindings.elements[0]!.name).text === allowedName;
+			if (!allowed) {
+				violations.push(`${file}:${source.getLineAndCharacterOfPosition(node.getStart(source)).line + 1}: ${specifier.text}`);
 			}
 		}
+		ts.forEachChild(node, check);
 	}
+	check(source);
 }
 
 if (violations.length > 0) {

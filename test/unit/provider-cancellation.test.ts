@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { ModelListItem, Run, RunResult, SDKAgent } from "@cursor/sdk";
+import type { ModelListItem, Run, RunResult, SDKAgent, SendOptions } from "@cursor/sdk";
 import type { Api, AssistantMessageEvent, Context, Model, SimpleStreamOptions } from "@oh-my-pi/pi-ai";
 import { CURSOR_SDK_API, CURSOR_SDK_PROVIDER_ID } from "../../src/constants.ts";
 import { HOST_BRIDGE_OPTION_KEY } from "../../src/host-option.ts";
@@ -49,6 +49,15 @@ async function bounded<T>(promise: Promise<T>): Promise<T> {
 	} finally {
 		clearTimeout(timer);
 	}
+}
+
+async function awaitEntered(entered: Promise<void>, stream: Promise<AssistantMessageEvent[]>) {
+	await bounded(Promise.race([
+		entered,
+		stream.then((events) => {
+			throw new Error(`stream ended before entering deferred operation: ${JSON.stringify(events)}`);
+		}),
+	]));
 }
 
 // Queue behind discovery, then drain its provider continuations, including failure cleanup.
@@ -120,6 +129,49 @@ describe("provider cancellation before prepareTurn", () => {
 		expect(resumeTestUtils.state.pendingHandle).toBeUndefined();
 	}
 
+	test("late cancelled run events and completion cannot corrupt a newer route", async () => {
+		catalogTestUtils.setListModels(async () => ITEMS);
+		const entered = deferred<void>();
+		const oldResult = deferred<RunResult>();
+		let oldDelta: SendOptions["onDelta"];
+		runtime.__testUtils.setOpenAgent(async () => {
+			const agentId = `agent-${opens.length + 1}`;
+			opens.push(agentId);
+			return {
+				agentId,
+				async [Symbol.asyncDispose]() {},
+				async send(_message: unknown, options?: SendOptions) {
+					sends.push(agentId);
+					if (agentId === "agent-1") {
+						oldDelta = options?.onDelta;
+						entered.resolve();
+						return { supports: () => false, wait: () => oldResult.promise } as unknown as Run;
+					}
+					return { supports: () => false, wait: async () => ({ status: "finished", result: "new answer" }) } as unknown as Run;
+				},
+			} as unknown as SDKAgent;
+		});
+		const oldHost = createFakeHost({ cwd, sessionId: "A", tools: [] });
+		const newerHost = createFakeHost({ cwd, sessionId: "A", tools: [] });
+		const old = collect({ apiKey: "test-key", [HOST_BRIDGE_OPTION_KEY]: oldHost } as SimpleStreamOptions);
+		await awaitEntered(entered.promise, old);
+		const newer = await bounded(collect(
+			{ apiKey: "test-key", [HOST_BRIDGE_OPTION_KEY]: newerHost } as SimpleStreamOptions,
+			{ messages: [{ role: "user", content: "new request", timestamp: 2 }] },
+		));
+		expectAborted(await bounded(old));
+		const pending = structuredClone(resumeTestUtils.state.pendingHandle);
+		await oldDelta?.({ update: { type: "text-delta", text: "stale answer" } });
+		oldResult.resolve({ status: "finished", result: "stale answer" } as RunResult);
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		expect(oldHost.bindings).toEqual([]);
+		expect(newerHost.bindings).toHaveLength(1);
+		expect(newer.filter((event) => event.type === "done")).toMatchObject([{ reason: "stop" }]);
+		expect(sends).toEqual(["agent-1", "agent-2"]);
+		expect([...runtime.__testUtils.slots.values()][0]?.agent?.agentId).toBe("agent-2");
+		expect(resumeTestUtils.state.pendingHandle).toEqual(pending);
+	});
+
 	for (const source of ["options", "host"] as const) {
 		test(`pre-aborted ${source} signal skips cold discovery and runtime mutation`, async () => {
 			let discoveries = 0;
@@ -156,7 +208,7 @@ describe("provider cancellation before prepareTurn", () => {
 			const { host, options } = request(controller.signal);
 			const ended = collect(options);
 			try {
-				await entered.promise;
+				await awaitEntered(entered.promise, ended);
 				controller.abort();
 				// Catalog has not been resolved/rejected: completion must be independent of it.
 				expectAborted(await bounded(ended));
@@ -174,7 +226,7 @@ describe("provider cancellation before prepareTurn", () => {
 				const contextB: Context = { messages: [{ role: "user", content: "committed B", timestamp: 2 }] };
 				const prepared = await runtime.prepareTurn({ cwd, agentInstanceId: "main", apiKey: "test-key", modelSelection: { id: MODEL.id }, modelLimits: { contextWindow: MODEL.contextWindow, maxTokens: MODEL.maxTokens }, context: contextB, grantedTools: [] });
 				runtime.commitTurn(prepared.slot, contextB, false);
-				await runtime.finishLiveKeepAgent(prepared.slot.key, "seed B");
+				await runtime.finishLiveKeepAgent(prepared.slot, "seed B");
 				await handlers.get("turn_end")!({}, ctx);
 				const handle = getMatchingResumeHandle("main", prepared.slot.credentialScopeId, cwd);
 				expect(handle).toMatchObject({ state: "committed", sessionId: "B", agentId: prepared.slot.agent!.agentId });
@@ -212,7 +264,7 @@ describe("provider cancellation before prepareTurn", () => {
 		catalogTestUtils.setListModels(() => { entered.resolve(); return catalog.promise; });
 		const controller = new AbortController();
 		const ended = collect({ apiKey: "test-key", signal: controller.signal });
-		await entered.promise;
+		await awaitEntered(entered.promise, ended);
 		catalog.reject(new Error("discovery failed first"));
 		controller.abort();
 		expectAborted(await bounded(ended));
@@ -228,7 +280,7 @@ describe("provider cancellation before prepareTurn", () => {
 		const controller = new AbortController();
 		const { host, options } = request(controller.signal);
 		const cancelled = collect(options);
-		await entered.promise;
+		await awaitEntered(entered.promise, cancelled);
 		const survivor = collect({ apiKey: "test-key" });
 		try {
 			controller.abort();

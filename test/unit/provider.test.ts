@@ -391,11 +391,13 @@ describe("streamCursorRuntime model selection", () => {
 
 	test("reconstructs a lost parked run on a fresh agent without replaying completed tools", async () => {
 		const opened: Array<string | undefined> = [];
+		const histories: Array<Context["messages"] | undefined> = [];
 		const sent: Array<{ agentId: string; message: unknown; model: ModelSelection | undefined }> = [];
 		let toolExecutions = 0;
 		let oldCallbackResolved = false;
 		runtimeTestUtils.setOpenAgent(async (input) => {
 			opened.push(input.savedAgentId);
+			histories.push(input.bootstrapHistory);
 			const agentId = `agent-${opened.length}`;
 			return {
 				agentId,
@@ -445,20 +447,9 @@ describe("streamCursorRuntime model selection", () => {
 		expect(opened).toEqual([undefined, undefined]);
 		expect(sent.map(({ agentId }) => agentId)).toEqual(["agent-1", "agent-2"]);
 		expect(param(sent[1]?.model, "fast")).toBe("true");
-		const message = sent[1]?.message;
-		if (!message || typeof message !== "object" || !("text" in message) || typeof message.text !== "string") {
-			throw new Error("Expected a text bootstrap prompt");
-		}
-		const prompt = message.text;
-		expect(prompt).toContain("Completed read: export const answer = 42;");
-		expect(prompt).toContain("Inspect a.ts, then summarize.");
-		expect(prompt).toContain("call-1");
-		expect(prompt).toContain("a.ts");
-		expect(prompt).toContain("toolResult read (capture): Previously captured screen [attached image 1]");
-		expect(message).toMatchObject({ images: [{ data: "screen-payload", mimeType: "image/png" }] });
-		expect(prompt).toContain("Current continuation request:");
-		expect(prompt).not.toContain("Current user request:");
-		expect(prompt).toMatch(/do not (?:repeat|re-?run|re-?execute)/i);
+		expect(histories[1]).toEqual(recoveredContext.messages);
+		expect(sent[1]?.message).toMatchObject({ images: [{ data: "screen-payload", mimeType: "image/png" }] });
+		expect(sent[1]?.message).toMatchObject({ text: expect.not.stringContaining("Inspect a.ts, then summarize.") });
 		expect(toolExecutions).toBe(1);
 		expect(oldCallbackResolved).toBe(false);
 		expect(recovered.some((event) => event.type === "toolcall_start")).toBe(false);

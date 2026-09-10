@@ -4,7 +4,7 @@ import type { Context } from "@oh-my-pi/pi-ai";
 import { credentialScopeId } from "./auth.js";
 import { DEFAULT_AGENT_INSTANCE_ID } from "./constants.js";
 import type { BindingState, GrantedTool, OmpHostBridgeV1 } from "./contracts.js";
-import { computeContextFingerprint, emptySendState, planSend, turnPrompt, type ModelInputLimits, type SendState } from "./context.js";
+import { computeContextFingerprint, emptySendState, planSend, prepareSendInput, type ModelInputLimits, type SendState } from "./context.js";
 import { createSharedToolExec, type SharedToolExec } from "./host-exec.js";
 import {
 	createLiveRun,
@@ -35,6 +35,7 @@ export interface RuntimeSlot {
 	sendState: SendState;
 	bindingState: BindingState;
 	storeIdentity: ResumeStoreIdentity;
+	preparation?: AbortController;
 }
 
 const slots = new Map<string, RuntimeSlot>();
@@ -91,6 +92,7 @@ export interface OpenRuntimeTurnInput {
 	context: Context;
 	grantedTools: readonly GrantedTool[];
 	host?: OmpHostBridgeV1;
+	signal?: AbortSignal;
 }
 
 export interface PreparedTurn {
@@ -153,14 +155,13 @@ function persistDirtyHandle(slot: RuntimeSlot, handle: {
 async function persistDirtyAndDisposeAgent(slot: RuntimeSlot): Promise<void> {
 	const dirty = resumePending(slot, "dirty");
 	if (dirty) persistDirtyHandle(slot, dirty);
-	if (slot.agent) {
-		await disposeAgent(slot.agent);
-		slot.agent = undefined;
-	}
+	const agent = slot.agent;
+	slot.agent = undefined;
 	slot.bindingState = "dirty";
 	slot.createCwd = undefined;
 	slot.credentialScopeId = undefined;
 	slot.sendState = emptySendState();
+	if (agent) await disposeAgent(agent);
 }
 
 function invalidateBindingBeforeSend(slot: RuntimeSlot, agentId: string): void {
@@ -181,10 +182,11 @@ function invalidateBindingBeforeSend(slot: RuntimeSlot, agentId: string): void {
 }
 
 export async function prepareTurn(input: OpenRuntimeTurnInput): Promise<PreparedTurn> {
+	input.signal?.throwIfAborted();
 	const scopeKey = getCursorSessionScopeKey();
 	const cwd = normalizeRuntimeCwd(input.cwd || getCursorSessionCwd());
 	const nextCredential = credentialScopeId(input.apiKey);
-	const slot = getOrCreateSlot(scopeKey, input.agentInstanceId, cwd);
+	let slot = getOrCreateSlot(scopeKey, input.agentInstanceId, cwd);
 	const existingLive = getLiveRun(slot.key);
 	const trailing = trailingToolResults(input.context);
 	const continuing = Boolean(existingLive && trailing.length > 0);
@@ -202,89 +204,112 @@ export async function prepareTurn(input: OpenRuntimeTurnInput): Promise<Prepared
 		throw new Error("Cannot open a Cursor SDK agent without a model selection");
 	}
 
-	if (existingLive) {
-		await disposeLiveRun(slot.key, "OMP started a new user turn", false);
-	}
-
 	const configMismatch = agentConfigMismatch(slot, cwd, nextCredential);
 	const unsafeBinding = Boolean(slot.agent) && (slot.bindingState !== "committed" || configMismatch);
-	if (unsafeBinding) {
-		await persistDirtyAndDisposeAgent(slot);
-	}
-
-	const resumeHandle = getMatchingResumeHandle(input.agentInstanceId, nextCredential, cwd);
-	if (resumeHandle && !slot.agent) {
-		slot.sendState = { ...resumeHandle.sendState };
-		slot.bindingState = "committed";
-		slot.createCwd = resumeHandle.cwd;
-		slot.credentialScopeId = resumeHandle.credentialScopeId;
-		slot.storeIdentity = resumeHandle.storeIdentity ?? slot.storeIdentity;
-	} else if (!slot.agent) {
-		slot.sendState = emptySendState();
-	}
-
+	const resumeHandle = unsafeBinding ? undefined : getMatchingResumeHandle(input.agentInstanceId, nextCredential, cwd);
+	const sendState = unsafeBinding ? emptySendState() : slot.agent ? slot.sendState : resumeHandle?.sendState ?? emptySendState();
 	const plan = trailing.length > 0
 		? { mode: "bootstrap" as const, resetAgent: true, reason: "context_divergence" as const }
-		: planSend(slot.sendState, input.context);
-	const prompt = turnPrompt(plan, input.context, input.modelLimits);
-	if (plan.resetAgent) {
-		if (slot.agent) {
-			await persistDirtyAndDisposeAgent(slot);
-		} else if (resumeHandle) {
-			persistDirtyHandle(slot, resumeHandle);
-			slot.bindingState = "dirty";
-			slot.createCwd = undefined;
-			slot.credentialScopeId = undefined;
+		: planSend(sendState, input.context);
+	const { prompt, history } = prepareSendInput(plan, input.context, input.modelLimits);
+
+	slot.preparation?.abort();
+	const preparation = new AbortController();
+	slot = { ...slot, preparation };
+	slots.set(slot.key, slot);
+	const signal = input.signal ? AbortSignal.any([input.signal, preparation.signal]) : preparation.signal;
+	const assertCurrent = () => {
+		signal.throwIfAborted();
+		if (slots.get(slot.key) !== slot) throw new Error("Cursor SDK preparation was superseded");
+	};
+	try {
+		if (existingLive || unsafeBinding) {
+			await Promise.all([
+				existingLive ? disposeLiveRun(slot.key, "OMP started a new user turn", false) : undefined,
+				unsafeBinding ? persistDirtyAndDisposeAgent(slot) : undefined,
+			]);
+			assertCurrent();
+		}
+		if (resumeHandle && !slot.agent) {
+			slot.sendState = { ...resumeHandle.sendState };
+			slot.bindingState = "committed";
+			slot.createCwd = resumeHandle.cwd;
+			slot.credentialScopeId = resumeHandle.credentialScopeId;
+			slot.storeIdentity = resumeHandle.storeIdentity ?? slot.storeIdentity;
+		} else if (!slot.agent) {
 			slot.sendState = emptySendState();
 		}
-	}
+		if (plan.resetAgent) {
+			if (slot.agent) {
+				await persistDirtyAndDisposeAgent(slot);
+				assertCurrent();
+			} else if (resumeHandle) {
+				persistDirtyHandle(slot, resumeHandle);
+				slot.bindingState = "dirty";
+				slot.createCwd = undefined;
+				slot.credentialScopeId = undefined;
+				slot.sendState = emptySendState();
+			}
+		}
 
-	const savedAgentId = slot.agent?.agentId ?? (slot.bindingState === "committed" ? resumeHandle?.agentId : undefined);
-	const store = openScopedJsonlStore(cwd, scopeKey);
-	slot.storeIdentity = { version: 1, stateRoot: storeRootForScope(cwd, scopeKey) };
+		const savedAgentId = slot.agent?.agentId ?? (slot.bindingState === "committed" ? resumeHandle?.agentId : undefined);
+		const store = openScopedJsonlStore(cwd, scopeKey);
+		slot.storeIdentity = { version: 1, stateRoot: storeRootForScope(cwd, scopeKey) };
 
-	const reuseId = savedAgentId ?? slot.agent?.agentId;
-	if (reuseId) {
-		invalidateBindingBeforeSend(slot, reuseId);
-	}
+		const reuseId = savedAgentId ?? slot.agent?.agentId;
+		if (reuseId) {
+			invalidateBindingBeforeSend(slot, reuseId);
+		}
 
-	const live = createLiveRun(createSharedToolExec(input.grantedTools, async () => {
-		throw new Error("tool executor is not attached");
-	}, newBridgeRunId()));
-	const toolExec = attachParkExecutor(live, input.grantedTools, input.host);
-	const customTools = buildCustomTools(input.grantedTools, toolExec.execute, toolExec.dedupe);
+		const live = createLiveRun(createSharedToolExec(input.grantedTools, async () => {
+			throw new Error("tool executor is not attached");
+		}, newBridgeRunId()));
+		const toolExec = attachParkExecutor(live, input.grantedTools, input.host);
+		const customTools = buildCustomTools(input.grantedTools, toolExec.execute, toolExec.dedupe);
 
-	if (!slot.agent) {
-		slot.agent = await withSdkExitSuppressed(() =>
-			openAgentImpl({
-				apiKey: input.apiKey,
-				cwd,
-				model: modelSelection,
-				store,
-				customTools,
-				savedAgentId,
-			}),
-		);
-		slot.createCwd = cwd;
+		if (!slot.agent) {
+			const agent = await withSdkExitSuppressed(() =>
+				openAgentImpl({
+					apiKey: input.apiKey,
+					cwd,
+					model: modelSelection,
+					store,
+					customTools,
+					savedAgentId,
+					...(!savedAgentId ? { bootstrapHistory: history } : {}),
+					signal,
+				}),
+			);
+			if (signal.aborted || slots.get(slot.key) !== slot) {
+				await disposeAgent(agent);
+				assertCurrent();
+			}
+			slot.agent = agent;
+			slot.createCwd = cwd;
+			slot.credentialScopeId = nextCredential;
+		}
+		live.agent = slot.agent;
+		setLiveRun(slot.key, live);
+		slot.bindingState = "in-flight";
+		slot.cwd = cwd;
 		slot.credentialScopeId = nextCredential;
-	}
-	live.agent = slot.agent;
-	setLiveRun(slot.key, live);
-	slot.bindingState = "in-flight";
-	slot.cwd = cwd;
-	slot.credentialScopeId = nextCredential;
 
-	return {
-		slot,
-		live,
-		continuing: false,
-		customTools,
-		prompt,
-		incremental: plan.mode === "incremental",
-	};
+		return {
+			slot,
+			live,
+			continuing: false,
+			customTools,
+			prompt,
+			incremental: plan.mode === "incremental",
+		};
+	} catch (error) {
+		if (slots.get(slot.key) === slot) await persistDirtyAndDisposeAgent(slot);
+		throw error;
+	}
 }
 
 export function commitTurn(slot: RuntimeSlot, context: Context, incremental: boolean): void {
+	if (slots.get(slot.key) !== slot || slot.preparation?.signal.aborted || getLiveRun(slot.key)?.cancelled) return;
 	slot.sendState = {
 		bootstrapped: true,
 		contextFingerprint: computeContextFingerprint(context),
@@ -305,6 +330,8 @@ export function commitTurn(slot: RuntimeSlot, context: Context, incremental: boo
 }
 
 export function markTurnDirty(slot: RuntimeSlot): void {
+	if (slots.get(slot.key) !== slot) return;
+	slot.preparation?.abort();
 	slot.bindingState = "dirty";
 	const dirty = resumePending(slot, "dirty");
 	if (dirty) {
@@ -318,11 +345,13 @@ export function markTurnDirty(slot: RuntimeSlot): void {
 	slot.sendState = emptySendState();
 }
 
-export async function finishLiveKeepAgent(key: string, reason: string): Promise<void> {
-	await disposeLiveRun(key, reason, false);
+export async function finishLiveKeepAgent(slot: RuntimeSlot, reason: string): Promise<void> {
+	if (slots.get(slot.key) !== slot) return;
+	await disposeLiveRun(slot.key, reason, false);
 }
 
 export async function finishTurnFailed(slot: RuntimeSlot, reason: string): Promise<void> {
+	if (slots.get(slot.key) !== slot) return;
 	markTurnDirty(slot);
 	await disposeLiveRun(slot.key, reason, true);
 }
@@ -342,9 +371,10 @@ export function invalidateRuntime(_reason: string): void {
 export async function disposeRuntimeForScope(scopeKey = getCursorSessionScopeKey()): Promise<void> {
 	for (const [key, slot] of [...slots.entries()]) {
 		if (slot.scopeKey !== scopeKey) continue;
+		slot.preparation?.abort();
+		slots.delete(key);
 		await disposeLiveRun(key, "session scope closed", false);
 		if (slot.agent) await disposeAgent(slot.agent);
-		slots.delete(key);
 	}
 }
 
@@ -355,6 +385,7 @@ export async function disposeRuntimeForShutdown(): Promise<void> {
 
 export const __testUtils = {
 	clear() {
+		for (const slot of slots.values()) slot.preparation?.abort();
 		slots.clear();
 		openAgentImpl = openAgent;
 	},

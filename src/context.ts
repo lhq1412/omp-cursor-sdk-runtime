@@ -1,8 +1,7 @@
 import { createHash } from "node:crypto";
 import type { SDKImage, SDKUserMessage } from "@cursor/sdk";
 import type { Context } from "@oh-my-pi/pi-ai";
-import { MAX_COMPLETED_INCREMENTAL_SENDS_BEFORE_REBOOTSTRAP } from "./constants.js";
-import { trailingToolResults } from "./omp-tools.js";
+import { MAX_COMPLETED_INCREMENTAL_SENDS_BEFORE_REBOOTSTRAP, SDK_TOOL_CONTEXT } from "./constants.js";
 
 export type SendMode = "bootstrap" | "incremental";
 
@@ -23,6 +22,13 @@ export interface ModelInputLimits {
 	contextWindow: number | null;
 	maxTokens: number | null;
 }
+
+export interface PreparedSendInput {
+	prompt: SDKUserMessage;
+	history?: Context["messages"];
+}
+
+const NATIVE_HISTORY_FORMAT = "native-checkpoint-v1";
 
 function hashValue(value: string): string {
 	return createHash("sha256").update(value).digest("hex").slice(0, 16);
@@ -51,7 +57,7 @@ export function computeContextFingerprint(context: Context): string {
 		const role = "role" in message && typeof message.role === "string" ? message.role : "unknown";
 		return hashValue(`${index}:${role}:${JSON.stringify(message)}`);
 	});
-	return JSON.stringify({ systemHash, messageHashes });
+	return JSON.stringify({ format: NATIVE_HISTORY_FORMAT, systemHash, messageHashes });
 }
 
 export function emptySendState(): SendState {
@@ -95,8 +101,8 @@ export function planSend(sendState: SendState, context: Context): SendPlan {
 
 function parseFingerprint(value: string): { systemHash: string; messageHashes: string[] } | undefined {
 	try {
-		const parsed = JSON.parse(value) as { systemHash?: unknown; messageHashes?: unknown };
-		if (typeof parsed.systemHash !== "string" || !Array.isArray(parsed.messageHashes)) return undefined;
+		const parsed = JSON.parse(value) as { format?: unknown; systemHash?: unknown; messageHashes?: unknown };
+		if (parsed.format !== NATIVE_HISTORY_FORMAT || typeof parsed.systemHash !== "string" || !Array.isArray(parsed.messageHashes)) return undefined;
 		if (!parsed.messageHashes.every((item) => typeof item === "string")) return undefined;
 		return { systemHash: parsed.systemHash, messageHashes: parsed.messageHashes };
 	} catch {
@@ -137,77 +143,41 @@ function imagesFromContent(content: unknown): SDKImage[] {
 	return images;
 }
 
-
-function serializeToolCall(block: Record<string, unknown>): string {
-	const name = typeof block.name === "string" ? block.name : "tool";
-	const id = typeof block.id === "string" ? block.id : typeof block.toolCallId === "string" ? block.toolCallId : "";
-	const args = "arguments" in block ? block.arguments : block.args;
-	return `toolCall ${name}${id ? ` (${id})` : ""}: ${typeof args === "string" ? args : JSON.stringify(args ?? {})}`;
-}
-
-function serializeMessage(message: unknown, attachedImages?: SDKImage[]): string {
-	if (!isRecord(message)) return "";
-	const role = typeof message.role === "string" ? message.role : "unknown";
-	const images = imagesFromContent(message.content);
-	const imageNote = images.length > 0 && attachedImages
-		? ` ${images.map((image) => {
-			attachedImages.push(image);
-			return `[attached image ${attachedImages.length}]`;
-		}).join(" ")}`
-		: images.length > 0 ? " [image omitted]" : "";
-	if (role === "toolCall" || role === "toolUse") {
-		return serializeToolCall(message);
-	}
-	if (role === "toolResult") {
-		const name = typeof message.toolName === "string" ? message.toolName : "tool";
-		const id = typeof message.toolCallId === "string" ? message.toolCallId : "";
-		const text = textFromContent(message.content);
-		const error = message.isError ? " error" : "";
-		return `toolResult ${name}${id ? ` (${id})` : ""}${error}: ${text}${attachedImages ? imageNote : ""}`;
-	}
-	if (role === "user" || role === "developer" || role === "assistant") {
-		const lines: string[] = [];
-		const text = textFromContent(message.content);
-		if (text || images.length > 0) {
-			lines.push(`${role}: ${text}${imageNote}`.trimEnd());
+function historyUnits(messages: Context["messages"], recoveryStart?: number): Context["messages"][] {
+	const units: Context["messages"][] = [];
+	let unit: Context["messages"] = [];
+	const pending = new Set<string>();
+	for (const [index, message] of messages.entries()) {
+		if ((message.role === "user" || message.role === "developer") && pending.size === 0 && unit.length > 0 && (recoveryStart === undefined || index <= recoveryStart)) {
+			units.push(unit);
+			unit = [];
 		}
 		if (Array.isArray(message.content)) {
 			for (const block of message.content) {
-				if (!isRecord(block)) continue;
-				if (block.type === "toolCall" || block.type === "toolUse") {
-					lines.push(serializeToolCall(block));
-				}
+				if (isRecord(block) && block.type === "toolCall" && typeof block.id === "string") pending.add(block.id);
 			}
 		}
-		return lines.join("\n");
+		if (message.role === "toolResult") pending.delete(message.toolCallId);
+		unit.push(message);
 	}
-	return `${role}: ${JSON.stringify(message)}`;
+	if (unit.length > 0) units.push(unit);
+	return units;
 }
 
-function historyUnits(messages: readonly unknown[], recoveryStart?: number, attachedImages?: SDKImage[]): string[] {
-	const units: string[] = [];
-	let lines: string[] = [];
-	const pending = new Set<string>();
-	for (const [index, message] of messages.entries()) {
-		if (!isRecord(message)) continue;
-		if ((message.role === "user" || message.role === "developer") && pending.size === 0 && lines.length > 0 && (recoveryStart === undefined || index <= recoveryStart)) {
-			units.push(lines.join("\n"));
-			lines = [];
-		}
-		const blocks = Array.isArray(message.content) ? message.content : [];
-		for (const block of [message, ...blocks]) {
-			if (!isRecord(block)) continue;
-			if (block.type === "toolCall" || block.type === "toolUse" || block.role === "toolCall" || block.role === "toolUse") {
-				const id = block.id ?? block.toolCallId;
-				if (typeof id === "string") pending.add(id);
+function estimatedHistoryTokens(messages: Context["messages"]): number {
+	let tokens = messages.length + 1;
+	for (const message of messages) {
+		const text = JSON.stringify(message, (_key, value: unknown) => {
+			if (isRecord(value) && value.type === "image") {
+				// Native tool results contain placeholders; recovery attaches their bytes separately.
+				if (message.role !== "toolResult") tokens += 4096;
+				return { type: "image", mimeType: value.mimeType };
 			}
-		}
-		if (message.role === "toolResult" && typeof message.toolCallId === "string") pending.delete(message.toolCallId);
-		const line = serializeMessage(message, recoveryStart !== undefined && index >= recoveryStart ? attachedImages : undefined);
-		if (line) lines.push(line);
+			return value;
+		});
+		tokens += estimatedTextTokens(text);
 	}
-	if (lines.length > 0) units.push(lines.join("\n"));
-	return units;
+	return tokens;
 }
 
 function estimatedTextTokens(text: string): number {
@@ -223,10 +193,10 @@ function inputTextBudget(current: SDKUserMessage, limits: ModelInputLimits): num
 	if (typeof limits.contextWindow !== "number" || typeof limits.maxTokens !== "number" || !Number.isSafeInteger(limits.contextWindow) || !Number.isSafeInteger(limits.maxTokens) || limits.contextWindow <= 0 || limits.maxTokens < 0) {
 		throw new Error("Cursor SDK model context/output limits are unknown or invalid");
 	}
-	// ponytail: 4096/image reserve for history trim only; SDK image tokens are unpublished.
-	// Encoded payload bytes are not tokens and must not hard-fail as context overflow.
+	// ponytail: 4096/image reserve; SDK image tokens are unpublished.
+	// Encoded payload bytes are not tokens.
 	const imageReserve = (current.images?.length ?? 0) * 4096;
-	return Math.max(0, limits.contextWindow - limits.maxTokens - imageReserve - 1024);
+	return limits.contextWindow - limits.maxTokens - imageReserve - 1024;
 }
 
 /**
@@ -245,40 +215,30 @@ export function activeUserInput(context: Context, continueOnly = false): SDKUser
 }
 
 function validateToolResultRecovery(context: Context): number | undefined {
-	const results = trailingToolResults(context);
-	if (results.length === 0) return undefined;
-	const batchIndex = context.messages.length - results.length - 1;
-	const batch = context.messages[batchIndex];
-	if (batch?.role !== "assistant") {
-		throw new Error("Cannot recover Cursor SDK tool results without their preceding assistant tool-call batch");
-	}
-	const pending = new Set<string>();
-	for (const block of batch.content) {
-		if (block.type !== "toolCall") continue;
-		if (!block.id || pending.has(block.id)) {
-			throw new Error("Cannot recover Cursor SDK tool results: assistant tool-call IDs are missing or duplicated");
-		}
-		pending.add(block.id);
-	}
-	for (const result of results) {
-		if (!pending.delete(result.toolCallId)) {
-			throw new Error("Cannot recover Cursor SDK tool results: duplicate or unmatched result ID");
-		}
-	}
-	if (pending.size > 0) {
-		throw new Error("Cannot recover Cursor SDK tool results: missing results for the latest assistant tool-call batch");
-	}
-	let requestIndex = batchIndex - 1;
-	while (requestIndex >= 0) {
-		const role = context.messages[requestIndex]!.role;
-		if (role === "user" || role === "developer") break;
-		requestIndex -= 1;
-	}
-	if (requestIndex < 0) {
+	if (context.messages.at(-1)?.role !== "toolResult") return undefined;
+	const units = historyUnits(context.messages);
+	const requestIndex = units.slice(0, -1).reduce((count, unit) => count + unit.length, 0);
+	if (context.messages[requestIndex]?.role !== "user" && context.messages[requestIndex]?.role !== "developer") {
 		throw new Error("Cannot recover Cursor SDK tool results without their initiating user or developer request");
 	}
+	const pending = new Set<string>();
 	for (let index = requestIndex; index < context.messages.length; index += 1) {
 		const message = context.messages[index]!;
+		if (message.role === "assistant") {
+			if (!Array.isArray(message.content) || message.content.some((block) => !isRecord(block))) {
+				throw new Error("Cannot recover Cursor SDK history: unsupported or malformed assistant content");
+			}
+			for (const block of message.content) {
+				if (block.type !== "toolCall") continue;
+				if (!block.id || pending.has(block.id)) {
+					throw new Error("Cannot recover Cursor SDK tool results: assistant tool-call IDs are missing or duplicated");
+				}
+				pending.add(block.id);
+			}
+		}
+		if (message.role === "toolResult" && !pending.delete(message.toolCallId)) {
+			throw new Error("Cannot recover Cursor SDK tool results: duplicate or unmatched result ID");
+		}
 		if (message.role !== "toolResult" && message.role !== "user" && message.role !== "developer") continue;
 		const content: unknown = message.content;
 		if (message.role !== "toolResult" && typeof content === "string") continue;
@@ -290,51 +250,59 @@ function validateToolResultRecovery(context: Context): number | undefined {
 			throw new Error("Cannot recover Cursor SDK history: unsupported or malformed text/image content");
 		}
 	}
+	if (pending.size > 0) {
+		throw new Error("Cannot recover Cursor SDK tool results: missing results for an assistant tool-call batch");
+	}
 	return requestIndex;
 }
 
-/**
- * New SDK agent input: sanitized OMP system instructions (when nonempty), prior
- * visible history, then the current input or continuation. Native SDK systemPrompt is never
- * set. Historical images are noted, not re-attached, except in required tool recovery history.
- */
-export function bootstrapUserInput(context: Context, limits: ModelInputLimits, continueOnly = false): SDKUserMessage {
+/** Bootstrap instructions stay in the send text; conversation history is imported natively. */
+export function prepareSendInput(plan: SendPlan, context: Context, limits: ModelInputLimits): PreparedSendInput {
+	const current = activeUserInput(context, plan.continueOnly);
+	if (plan.mode === "incremental") {
+		if (estimatedTextTokens(current.text) > inputTextBudget(current, limits)) throwContextOverflow();
+		return { prompt: current };
+	}
 	const recoveryStart = validateToolResultRecovery(context);
-	const recovering = recoveryStart !== undefined;
-	const message = currentInputMessage(context, continueOnly);
+	const message = currentInputMessage(context, plan.continueOnly);
 	const prior = message ? context.messages.slice(0, -1) : context.messages;
-	const current: SDKUserMessage = recovering
-		? { text: "Continue the initiating request using the recorded tool results above. These tool calls have already completed; do not repeat completed actions or retry recorded tool calls. Treat their results as existing evidence and continue with the remaining work." }
-		: activeUserInput(context, continueOnly);
-	const images: SDKImage[] = [];
-	const units = historyUnits(prior, recoveryStart, images);
-	if (images.length > 0) current.images = images;
+	if (recoveryStart !== undefined) {
+		current.text = "Continue the initiating request using the recorded tool results. These tool calls have already completed; do not repeat completed actions or retry recorded tool calls. Treat their results as existing evidence and continue with the remaining work.";
+		const images: SDKImage[] = [];
+		for (let index = recoveryStart; index < context.messages.length; index += 1) {
+			const result = context.messages[index]!;
+			if (result.role !== "toolResult") continue;
+			for (const image of imagesFromContent(result.content)) {
+				images.push(image);
+				current.text += `\nAttached image ${images.length}: toolCallId=${JSON.stringify(result.toolCallId)}, toolName=${JSON.stringify(result.toolName)}.`;
+			}
+		}
+		if (images.length > 0) current.images = images;
+	}
 	const sanitized = sanitizeSystemPromptForCursor(serializeSystemPrompt(context.systemPrompt));
 	const system = sanitized ? `System instructions from OMP:\n${sanitized}\n\n` : "";
 	const budget = inputTextBudget(current, limits);
-	if (estimatedTextTokens(system + current.text) > budget) throwContextOverflow();
-	const suffix = `\n\n---\nCurrent ${message?.role === "developer" ? "developer" : message ? "user" : "continuation"} request:\n${current.text}`;
-	const header = "Previous OMP conversation (reconstructed context, not live Cursor history):\n";
-	let remaining = budget - estimatedTextTokens(system + header + suffix);
+	let text = system + current.text;
+	const requiredTokens = estimatedTextTokens(text);
+	if (requiredTokens > budget) throwContextOverflow();
+	const units = historyUnits(prior, recoveryStart);
+	const toolContext = prior.length > 0 ? `${SDK_TOOL_CONTEXT}\n\n` : "";
+	let remaining = budget - requiredTokens - estimatedTextTokens(toolContext);
 	let start = units.length;
 	while (start > 0) {
-		const cost = estimatedTextTokens(units[start - 1]! + "\n");
+		const cost = estimatedHistoryTokens(units[start - 1]!);
 		if (cost > remaining) break;
 		remaining -= cost;
 		start -= 1;
 	}
-	if (recovering && start === units.length) {
+	if (recoveryStart !== undefined && start === units.length) {
 		throw new Error("Context window exceeded: required tool recovery history, initiating request, and continuation exceed the model input budget (conservative estimate)");
 	}
-	const text = start < units.length ? system + header + units.slice(start).join("\n") + suffix : system + current.text;
-	return current.images?.length ? { text, images: current.images } : { text };
-}
-
-export function turnPrompt(plan: SendPlan, context: Context, limits: ModelInputLimits): SDKUserMessage {
-	if (plan.mode === "bootstrap") return bootstrapUserInput(context, limits, plan.continueOnly);
-	const current = activeUserInput(context, plan.continueOnly);
-	if (estimatedTextTokens(current.text) > inputTextBudget(current, limits)) throwContextOverflow();
-	return current;
+	if (start < units.length) text = system + toolContext + current.text;
+	return {
+		prompt: { ...current, text },
+		history: structuredClone(units.slice(start).flat()),
+	};
 }
 
 export function activeUserText(context: Context): string {

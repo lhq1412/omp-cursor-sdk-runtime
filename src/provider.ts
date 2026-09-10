@@ -18,7 +18,7 @@ import {
 	bindLiveAbort,
 	getLiveRun,
 } from "./live-run.js";
-import { commitTurn, finishLiveKeepAgent, finishTurnFailed, prepareTurn, runtimeKey, type RuntimeSlot } from "./session-runtime.js";
+import { commitTurn, finishLiveKeepAgent, finishTurnFailed, getRuntimeSlot, prepareTurn, runtimeKey, type RuntimeSlot } from "./session-runtime.js";
 import { getCursorSessionCwd } from "./session-scope.js";
 import { withSdkExitSuppressed } from "./sdk-exit-guard.js";
 import { ensureCursorModels, getModelMetadata, buildModelSelection } from "./catalog.js";
@@ -60,9 +60,14 @@ export function streamCursorRuntime(
 		let slot: RuntimeSlot | undefined;
 		let abortSignal = options?.signal;
 		let apiKey: string | undefined;
+		const assertCurrent = () => {
+			abortSignal?.throwIfAborted();
+			slot?.preparation?.signal.throwIfAborted();
+			if (slot && getRuntimeSlot(slot.key) !== slot) throw new Error("Cursor SDK turn was superseded");
+		};
 		try {
 			const host = readHostBridge((options as Record<string, unknown> | undefined)?.[HOST_BRIDGE_OPTION_KEY]);
-			abortSignal = host?.signal ?? options?.signal;
+			abortSignal = host?.signal && options?.signal ? AbortSignal.any([host.signal, options.signal]) : host?.signal ?? options?.signal;
 			abortSignal?.throwIfAborted();
 			const snapshot = host?.snapshot();
 			const cwd = snapshot?.cwd ?? (typeof options?.cwd === "string" && options.cwd ? options.cwd : getCursorSessionCwd());
@@ -105,9 +110,11 @@ export function streamCursorRuntime(
 				context,
 				grantedTools,
 				host,
+				signal: abortSignal,
 			});
 			const { slot: preparedSlot, live, continuing, customTools, prompt, incremental } = prepared;
 			slot = preparedSlot;
+			assertCurrent();
 			live.sink = { stream, partial };
 
 			bindLiveAbort(live, abortSignal, () => {
@@ -141,7 +148,7 @@ export function streamCursorRuntime(
 							local: { customTools },
 							onDelta: ({ update }) => {
 								const sink = live.sink;
-								if (!sink) return;
+								if (!sink || live.cancelled || getRuntimeSlot(preparedSlot.key) !== preparedSlot) return;
 								applyInteractionUpdate(sink.stream, sink.partial, update, live.projection);
 							},
 						}),
@@ -165,6 +172,7 @@ export function streamCursorRuntime(
 				}
 				if (first.kind === "parked") {
 					const batch = await collectParkedBatch(live);
+					assertCurrent();
 					projectRunUsage(partial, live.projection, live.run?.usage);
 					for (const call of batch) {
 						applyToolCall(stream, partial, { id: call.toolCallId, name: call.name, arguments: call.args });
@@ -179,6 +187,7 @@ export function streamCursorRuntime(
 				projectRunUsage(partial, live.projection, first.result.usage ?? live.run?.usage);
 				reconcileRunResult(stream, partial, live.projection, first.result);
 				if (host) await host.flushToolResults();
+				assertCurrent();
 				closeOpenBlocks(stream, partial);
 				partial.stopReason = runResultToStopReason(first.result);
 				if (first.result.status === "error") {
@@ -213,12 +222,13 @@ export function streamCursorRuntime(
 						state: "committed",
 					});
 				}
+				assertCurrent();
 				stream.push({ type: "done", reason: "stop", message: partial });
 				stream.end(partial);
-				await finishLiveKeepAgent(preparedSlot.key, "run finished");
+				await finishLiveKeepAgent(preparedSlot, "run finished");
 		} catch (error) {
+			const aborted = abortSignal?.aborted || slot?.preparation?.signal.aborted;
 			if (slot) await finishTurnFailed(slot, "send failed");
-			const aborted = abortSignal?.aborted;
 			partial.stopReason = aborted ? "aborted" : "error";
 			partial.errorMessage = aborted ? "Cancelled" : sanitizeCursorProviderError(error, apiKey);
 			stream.push({ type: "error", reason: aborted ? "aborted" : "error", error: partial });

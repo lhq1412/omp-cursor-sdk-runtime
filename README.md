@@ -2,7 +2,7 @@
 
 Independent [Oh My Pi (OMP)](https://github.com/can1357/oh-my-pi) provider adapter for the official `@cursor/sdk` **local** agent runtime.
 
-The extension registers models under **`cursor-sdk/*`**. It does not replace, modify, or reuse OMP's built-in **`cursor/*`** provider.
+The extension registers models under **`cursor-sdk/*`**. It does not replace or modify OMP's built-in **`cursor/*`** provider. The sole reuse is its pure local history mapper and protobuf codec; authentication, transport, agent execution, and resume remain on the official Cursor SDK, never the built-in provider's network or executor paths.
 
 OMP owns sessions, permissions, tools, and UI. This package binds a local Cursor SDK agent onto the current OMP session leaf and executes tools only through the OMP host. Native Cursor executors stay disallowed.
 
@@ -12,6 +12,9 @@ Pinned baselines:
 
 - OMP `18.1.14` (`daf07999`)
 - `@cursor/sdk` `1.0.31`
+- Direct history-codec dependency: `@oh-my-pi/pi-catalog` `18.1.14`
+
+Native checkpoint conversion is coupled to these fixed versions, not a promise of compatibility with arbitrary OMP or SDK releases.
 
 ## Requirements
 
@@ -109,30 +112,32 @@ On stock brew OMP, `context.tools` plus xd://-mounted tools (including enabled `
 
 When the model calls a tool, the adapter emits OMP `toolUse`, parks the SDK callbacks, and yields back to OMP. OMP runs the tool with its own permissions and approval (MCP included via the xd:// fallback). The next `streamSimple` resumes the parked callbacks with the trailing `toolResult`s.
 
-If those callbacks are gone (for example after a restart or a completed Run), complete recorded text/image tool results can continue on a **fresh agent** instead. Recovery validates the latest assistant batch's call/result IDs, keeps the initiating request and completed interaction within the bootstrap budget, and sends an explicit continuation rather than resending the old request as new input. Images from the initiating request and its completed tool results are attached in recorded order, with numbered references in the reconstructed text. A saved agent handle is not resumed for this path. Missing, duplicate or unmatched results, missing initiating requests, unsupported or malformed text/image content, and recovery evidence that cannot fit the budget fail explicitly. Existing live callbacks still resume normally without model rediscovery.
+If those callbacks are gone (for example after a restart or a completed Run), complete recorded text/image tool results can continue on a **fresh agent** instead. Recovery validates the latest assistant batch's call/result IDs, keeps the initiating request and completed interaction within the history budget, imports them as a native checkpoint, and sends an explicit continuation rather than resending the old request as new input. Historical user/developer images remain in native history; current-input images use the SDK send attachments. Required completed **tool-result images** are attached to the recovery continuation in recorded order, with numbered call/result references: the codec's root model projection otherwise contains only image placeholders for tool results. A previously saved agent handle is not reused for this path. Missing, duplicate or unmatched results, missing initiating requests, unsupported or malformed text/image content, and recovery evidence that cannot fit the budget fail explicitly. Existing live callbacks still resume normally without model rediscovery.
 
 Recovery does not execute or re-emit historical tool calls. It tells the model to use the recorded results and not repeat completed actions; this is **not an exactly-once guarantee** for new tool calls the model may subsequently request. OMP still owns tool permissions and approval.
 
 An explicit host grant is used as-is. Stock extras only add currently enabled `mcp__*` names; an empty or read-only grant stays empty.
 
-## Capability gap: native `systemPrompt` unsupported
+## System instructions: native `systemPrompt` omitted
 
-Live probe against this account (2026-09-08) rejected `AgentOptions.systemPrompt` with:
+Official SDK `1.0.31` supports an account-gated `AgentOptions.systemPrompt` option, but this adapter **does not set it**. The live probe against this account (2026-09-08) rejected it with:
 
 ```text
 [invalid_argument] unknown option '--system-prompt'
 ```
 
-v1 therefore **does not set `systemPrompt`**. Cursor's built-in harness prompt remains in effect. That native system-role option is unused; sanitized bootstrap text is not a replacement for it.
+Cursor's built-in harness prompt remains in effect. The adapter does not guarantee native system-role delivery or replacement; importing native history does not change that boundary.
 
-A **fresh bootstrap** prepends sanitized OMP system instructions when nonempty to send text as:
+A **fresh bootstrap** imports prior history separately and prepends sanitized OMP system instructions when nonempty to the current/continuation send text as:
 
 ```text
 System instructions from OMP:
 ${sanitized}
 ```
 
-then prior visible history and the current user/developer input (including a first turn). Incremental rounds omit that prefix; the existing agent already has it from bootstrap. Empty or missing system text leaves history/images-only behavior unchanged. `activeUserInput` selects only the final user/developer message, never an older user request; otherwise it supplies an explicit continuation. The reuse fingerprint still uses the raw system text, so a system change forces a fresh bootstrap.
+followed by the current user/developer input (including a first turn), or an explicit continuation. For bootstrap with nonempty selected history after whole-interaction trimming, `SDK_TOOL_CONTEXT` plus a blank line sits after the sanitized system prefix and before the current input/continuation. Prior history is not flattened into this send. Incremental rounds omit both prefixes; first-user/no-history sends omit only the tool-context cue. Empty or missing system text omits the OMP system prefix. `activeUserInput` selects only the final user/developer message, never an older user request. The reuse fingerprint hashes the original raw joined system text and full messages and requires `native-checkpoint-v1`: raw system changes and old flattened-history bindings force fresh import.
+
+Imported history bypasses the SDK's initial environment block advertising its public `custom-user-tools` namespace. The minimal cue tells the model to discover schemas there for any tools granted in this run and that native Cursor tools are unavailable; it does not grant tools or copy SDK environment/user rules or schemas. Its full text counts toward the existing bootstrap budget. If optional history trims to empty, the cue is omitted; required recovery still fails if its retained interaction and cue cannot fit. The default SDK system prompt remains native and separate from the sanitized OMP prefix.
 
 Sanitizer (`serializeSystemPrompt` joins `string | string[]` with newlines):
 
@@ -142,11 +147,15 @@ Sanitizer (`serializeSystemPrompt` joins `string | string[]` with newlines):
 
 ## Session behavior
 
-Local agents are bound to the current OMP JSONL session leaf, cwd, and credential identity. Same-session incremental turns reuse the agent and send only the current user/developer input, or an explicit continuation when no new input exists. Parked tool callbacks retain precedence. A new agent bootstraps with sanitized OMP system instructions when nonempty, plus reconstructed visible history and the current turn. Resume records persist the agent's execution cwd; a matching committed handle can be resumed after process restart. Branch navigation, compaction, failed turns, and cwd/key changes start a new agent.
+Local agents are bound to the current OMP JSONL session leaf, cwd, and credential identity. Same-session incremental turns reuse the agent and send only the current user/developer input, or an explicit continuation when no new input exists. Parked tool callbacks retain precedence. Fresh agents import budgeted prior history as native checkpoint blobs, then send the separate sanitized system prefix, the tool-context cue for nonempty history, and current input/continuation. Empty history uses normal `Agent.create`. Resume records persist the agent's execution cwd; a matching committed handle can be resumed after process restart. Branch navigation, compaction, failed turns, cwd/key changes, and the existing 20-completed-incremental-send threshold start a fresh bootstrap.
+
+For a nonempty import, the adapter creates and disposes a fresh SDK seed, cancels only that seed's owned, unstarted queued initialization Run, writes all checkpoint blobs, and publishes the agent's root checkpoint reference last before official `Agent.resume`. It refuses to cancel active or unowned initialization work or overwrite a changed agent. No built-in Cursor transport, authentication, or executors run: `src/native-history.ts` uses only `buildGrpcRequest`, `ConversationStateStructureSchema`, and `toBinary` for local conversion and discards the generated request bytes.
+
+The imported format follows the pinned codec's model-family limits, not lossless arbitrary-history semantics. Thinking is omitted for non-K3 models. For K3, assistant history is accepted only with `api=cursor-agent`, `provider=cursor`, and the exact target K3 model; even accepted same-model turns may lack thinking. This adapter's `cursor-sdk` assistant identity is **not relabeled** to bypass that check, so K3 imports containing its own assistant turns fail closed. Catalog availability does not guarantee that every model can import every session.
 
 Cancellation while model discovery is pending ends that request before any runtime binding is prepared; shared discovery may finish for other requests, but its late result cannot resume the cancelled request or touch a newly selected session. Once prepared, cancellation belongs to the in-flight live run (including park-and-yield). SDK `process.reallyExit(0|1)` during teardown is swallowed so `/quit` does not throw `ExtensionExitError`.
 
-Bootstrap budgeting reserves the model's output limit, framing overhead, and 4096 tokens per attached image (including required recovery images), then removes oldest complete history interaction units without splitting tool calls/results. Necessary system instructions and the current input are never silently truncated: oversized **text** fails before opening/resuming an agent. Recovery also retains its initiating request and completed interaction as one unit; image reserves can make that required unit exceed the budget. Image payload size is not treated as model tokens and does not by itself produce a context-overflow error. The text estimator deliberately counts UTF-8 bytes conservatively rather than claiming exact tokenization. Unknown model limits fail explicitly. Backend overflow is reported separately from quota/rate limits; no automatic retries or tool reexecution are added.
+Bootstrap budgeting reserves the model's output limit, framing overhead, and 4096 tokens per image in native user/developer history or send attachments (including required recovery tool-result images), then removes oldest complete history interaction units without splitting tool calls/results. Necessary system instructions and the current input are never silently truncated: oversized **text** fails before opening/resuming an agent. Recovery also retains its initiating request and completed interaction as one unit; image reserves can make that required unit exceed the budget. Image payload size is not treated as model tokens and does not by itself produce a context-overflow error. The text estimator deliberately counts UTF-8 bytes conservatively rather than claiming exact tokenization. Unknown model limits fail explicitly. Backend overflow is reported separately from quota/rate limits; no automatic retries or tool reexecution are added.
 
 ## Results, usage, and diagnostics
 
@@ -176,7 +185,9 @@ export CURSOR_API_KEY=...
 npm run probe:sdk
 ```
 
-The probe records that native `AgentOptions.systemPrompt` is omitted, then checks custom-tool callbacks, `toolCallId`, and `Agent.resume` without that option.
+The probe records that native `AgentOptions.systemPrompt` is omitted, imports a synthetic history token through the production importer, prefixes only its first imported-history send with the provider's shared `SDK_TOOL_CONTEXT`, checks one new custom-tool callback and its `toolCallId`, then verifies that `Agent.resume` retains the token without another tool execution.
+
+Native-history smoke verification exercised the real provider and official SDK with synthetic OMP lifecycle hooks and session JSONL in isolated scratch, not the full OMP TUI or every model. Eight scenarios passed, covering native history continuation, one actual new-tool side effect, parked-result continuation on the same Agent, persisted resume retaining system/history, raw system-change reimport, cancelled parked Run followed by an isolated branch, compaction reimport, and completed screenshot-result recovery identifying blue/magenta/orange. This separate smoke is not part of the probe command above.
 
 ## Provenance and license
 
