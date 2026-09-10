@@ -7,14 +7,14 @@ export interface RunProjection {
 	answerText: string;
 	stepId?: number;
 	reportedUsage?: TokenUsage;
-	contextEstimate?: number;
 }
 
 export interface CursorAssistantMessage extends AssistantMessage {
 	cursorSdk: {
 		tokenUsage: "actual" | "unavailable";
 		cost: "unavailable";
-		contextOccupancy: { status: "estimated"; tokens: number } | { status: "unavailable" };
+		// Public SDK usage is cumulative billing, not an authoritative context snapshot.
+		contextOccupancy: { status: "unavailable" };
 	};
 }
 
@@ -92,10 +92,6 @@ export function applyInteractionUpdate(
 			projection.answerText = "";
 		} else if (update.type === "text-delta") {
 			projection.answerText += update.text;
-		} else if (update.type === "turn-ended" && update.usage) {
-			// A turn's prompt plus output estimates occupancy; it is not an SDK context snapshot.
-			projection.contextEstimate = update.usage.inputTokens + update.usage.cacheReadTokens
-				+ update.usage.cacheWriteTokens + update.usage.outputTokens;
 		}
 	}
 	if (update.type === "text-delta") {
@@ -179,9 +175,6 @@ export function projectRunUsage(
 	projection: RunProjection,
 	usage: TokenUsage | undefined,
 ): void {
-	if (projection.contextEstimate !== undefined) {
-		partial.cursorSdk.contextOccupancy = { status: "estimated", tokens: projection.contextEstimate };
-	}
 	if (!usage) return;
 	partial.cursorSdk.tokenUsage = "actual";
 	const previous = projection.reportedUsage;

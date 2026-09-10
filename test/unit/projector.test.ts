@@ -118,13 +118,39 @@ describe("projector", () => {
 		expect(unavailable.cursorSdk.tokenUsage).toBe("unavailable");
 	});
 
-	test("labels latest turn occupancy as estimated rather than cumulative authoritative context", () => {
+	test("keeps cumulative turn aggregates as deduplicated billing, not context occupancy", () => {
 		const stream = createAssistantMessageEventStream();
-		const partial = createEmptyAssistantMessage({ id: "composer-2.5" } as Model<Api>);
+		const model = { id: "composer-2.5" } as Model<Api>;
+		const partial = createEmptyAssistantMessage(model);
 		const projection: RunProjection = { answerText: "" };
-		applyInteractionUpdate(stream, partial, { type: "turn-ended", usage: { inputTokens: 10, outputTokens: 2, cacheReadTokens: 30, cacheWriteTokens: 4 } }, projection);
-		projectRunUsage(partial, projection, { inputTokens: 500, outputTokens: 100, cacheReadTokens: 800, cacheWriteTokens: 200, totalTokens: 1600 });
-		expect(partial.cursorSdk.contextOccupancy).toEqual({ status: "estimated", tokens: 46 });
+		const usage: TokenUsage = {
+			inputTokens: 1_180_000, outputTokens: 20_000,
+			cacheReadTokens: 5_040_000, cacheWriteTokens: 1_560_000,
+			totalTokens: 7_800_000, reasoningTokens: 5_000,
+		};
+		projectRunUsage(partial, projection, usage);
+		applyInteractionUpdate(stream, partial, { type: "turn-ended", usage }, projection);
+		const result: RunResult = { id: "run", status: "finished", usage };
+		projectRunUsage(partial, projection, result.usage);
+		expect(partial.usage).toMatchObject({
+			input: 1_180_000, output: 20_000, cacheRead: 5_040_000, cacheWrite: 1_560_000,
+			totalTokens: 7_800_000, reasoningTokens: 5_000,
+		});
+		expect(partial.cursorSdk.tokenUsage).toBe("actual");
+		expect(partial.cursorSdk.contextOccupancy).toEqual({ status: "unavailable" });
 		expect(partial.usage.contextTokens).toBeUndefined();
+
+		const resumed = createEmptyAssistantMessage(model);
+		projectRunUsage(resumed, projection, {
+			inputTokens: 100, outputTokens: 20, cacheReadTokens: 40, cacheWriteTokens: 10,
+			totalTokens: 170, reasoningTokens: 5,
+		});
+		projectRunUsage(resumed, projection, result.usage);
+		expect(resumed.usage).toMatchObject({
+			input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, reasoningTokens: 0,
+		});
+		expect(resumed.cursorSdk.tokenUsage).toBe("actual");
+		expect(resumed.cursorSdk.contextOccupancy).toEqual({ status: "unavailable" });
+		expect(resumed.usage.contextTokens).toBeUndefined();
 	});
 });

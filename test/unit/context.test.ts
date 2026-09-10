@@ -254,6 +254,53 @@ describe("send policy", () => {
 		expect(prompt).not.toContain("Current user request:");
 	});
 
+	test("recovery attaches initiating developer images and earlier completed image results in recorded order", () => {
+		const requestImage = { type: "image" as const, data: "request-payload", mimeType: "image/png" };
+		const resultImage = { type: "image" as const, data: "result-payload", mimeType: "image/jpeg" };
+		const ctx = context([
+			{ role: "user", content: "OBSOLETE " + "x".repeat(20_000), timestamp: 1 },
+			{ role: "developer", content: [{ type: "text", text: "Compare the screenshots" }, requestImage], timestamp: 2 },
+			{ role: "assistant", content: [{ type: "toolCall", id: "capture", name: "read", arguments: { path: "screenshot.png" } }], timestamp: 3 },
+			{ role: "toolResult", toolCallId: "capture", toolName: "read", content: [{ type: "text", text: "Captured screen" }, resultImage], timestamp: 4 },
+			{ role: "assistant", content: [{ type: "toolCall", id: "inspect", name: "read", arguments: { path: "notes.txt" } }], timestamp: 5 },
+			{ role: "toolResult", toolCallId: "inspect", toolName: "read", content: [{ type: "text", text: "Final text evidence" }], timestamp: 6 },
+		] as Context["messages"]);
+		const prompt = bootstrapUserInput(ctx, { contextWindow: 12_000, maxTokens: 500 });
+		expect(prompt.images).toEqual([
+			{ data: requestImage.data, mimeType: requestImage.mimeType },
+			{ data: resultImage.data, mimeType: resultImage.mimeType },
+		]);
+		expect(prompt.text).toContain("developer: Compare the screenshots [attached image 1]");
+		expect(prompt.text).toContain("toolResult read (capture): Captured screen [attached image 2]");
+		expect(prompt.text).toContain("toolCall read (capture)");
+		expect(prompt.text).toContain("toolResult read (inspect): Final text evidence");
+		expect(prompt.text).not.toContain("OBSOLETE");
+		expect(prompt.text).not.toContain(requestImage.data);
+		expect(prompt.text).not.toContain(resultImage.data);
+		expect(() => bootstrapUserInput(ctx, { contextWindow: 10_000, maxTokens: 500 })).toThrow(/context window exceeded/i);
+		const ordinary = bootstrapUserInput({ ...ctx, messages: [...ctx.messages, { role: "user", content: "New request", timestamp: 7 }] }, modelLimits);
+		expect(ordinary.images).toBeUndefined();
+		expect(ordinary.text).not.toContain("[attached image");
+	});
+
+	test.each([
+		[{ type: "audio", data: "unsupported" }],
+		[{ type: "image", mimeType: "image/png" }],
+		[{ type: "image", data: "", mimeType: "image/png" }],
+		[{ type: "image", data: "payload", mimeType: "text/plain" }],
+		[{ type: "text", text: 42 }],
+		[null],
+	])("rejects malformed or unsupported completed recovery content %j", (content) => {
+		const ctx = context([
+			{ role: "user", content: "Inspect then summarize", timestamp: 1 },
+			{ role: "assistant", content: [{ type: "toolCall", id: "earlier", name: "read", arguments: {} }], timestamp: 2 },
+			{ role: "toolResult", toolCallId: "earlier", toolName: "read", content: [content], timestamp: 3 },
+			{ role: "assistant", content: [{ type: "toolCall", id: "final", name: "read", arguments: {} }], timestamp: 4 },
+			{ role: "toolResult", toolCallId: "final", toolName: "read", content: [{ type: "text", text: "Done" }], timestamp: 5 },
+		] as unknown as Context["messages"]);
+		expect(() => bootstrapUserInput(ctx, modelLimits)).toThrow(/unsupported or malformed/i);
+	});
+
 	test("reserves output and images and fails rather than truncating required input", () => {
 		const limits = { contextWindow: 6000, maxTokens: 500 };
 		const ctx = context([{ role: "user", content: "x".repeat(1000), timestamp: 1 }], "required system");

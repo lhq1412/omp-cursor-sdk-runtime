@@ -430,6 +430,8 @@ describe("streamCursorRuntime model selection", () => {
 			...initial,
 			messages: [
 				...initial.messages,
+				{ role: "assistant", content: [{ type: "toolCall", id: "capture", name: "read", arguments: { path: "screenshot.png" } }], timestamp: 1 },
+				{ role: "toolResult", toolCallId: "capture", toolName: "read", content: [{ type: "text", text: "Previously captured screen" }, { type: "image", data: "screen-payload", mimeType: "image/png" }], isError: false, timestamp: 2 },
 				done.message,
 				{ role: "toolResult", toolCallId: "call-1", toolName: "read", content: [{ type: "text", text: "Completed read: export const answer = 42;" }], isError: false, timestamp: 3 },
 			],
@@ -452,6 +454,8 @@ describe("streamCursorRuntime model selection", () => {
 		expect(prompt).toContain("Inspect a.ts, then summarize.");
 		expect(prompt).toContain("call-1");
 		expect(prompt).toContain("a.ts");
+		expect(prompt).toContain("toolResult read (capture): Previously captured screen [attached image 1]");
+		expect(message).toMatchObject({ images: [{ data: "screen-payload", mimeType: "image/png" }] });
 		expect(prompt).toContain("Current continuation request:");
 		expect(prompt).not.toContain("Current user request:");
 		expect(prompt).toMatch(/do not (?:repeat|re-?run|re-?execute)/i);
@@ -477,10 +481,12 @@ describe("streamCursorRuntime model selection", () => {
 		expect(sent).toEqual([]);
 	});
 
-	test.each(["request", "result"])("fails recovery rather than dropping its required oversized %s", async (oversized) => {
+	test.each(["request", "result", "images"])("fails recovery rather than dropping its required oversized %s", async (oversized) => {
 		const context = recordedToolContext();
 		if (oversized === "request") {
 			context.messages[0] = { role: "user", content: "Required initiating request " + "x".repeat(20_000), timestamp: 1 };
+		} else if (oversized === "images") {
+			context.messages[3] = { role: "toolResult", toolCallId: "call-2", toolName: "read", content: Array.from({ length: 3 }, () => ({ type: "image" as const, data: "screen-payload", mimeType: "image/png" })), isError: false, timestamp: 4 };
 		} else {
 			context.messages[3] = { role: "toolResult", toolCallId: "call-2", toolName: "read", content: [{ type: "text", text: "Required completed result " + "x".repeat(20_000) }], isError: false, timestamp: 4 };
 		}

@@ -145,9 +145,16 @@ function serializeToolCall(block: Record<string, unknown>): string {
 	return `toolCall ${name}${id ? ` (${id})` : ""}: ${typeof args === "string" ? args : JSON.stringify(args ?? {})}`;
 }
 
-function serializeMessage(message: unknown): string {
+function serializeMessage(message: unknown, attachedImages?: SDKImage[]): string {
 	if (!isRecord(message)) return "";
 	const role = typeof message.role === "string" ? message.role : "unknown";
+	const images = imagesFromContent(message.content);
+	const imageNote = images.length > 0 && attachedImages
+		? ` ${images.map((image) => {
+			attachedImages.push(image);
+			return `[attached image ${attachedImages.length}]`;
+		}).join(" ")}`
+		: images.length > 0 ? " [image omitted]" : "";
 	if (role === "toolCall" || role === "toolUse") {
 		return serializeToolCall(message);
 	}
@@ -156,13 +163,11 @@ function serializeMessage(message: unknown): string {
 		const id = typeof message.toolCallId === "string" ? message.toolCallId : "";
 		const text = textFromContent(message.content);
 		const error = message.isError ? " error" : "";
-		return `toolResult ${name}${id ? ` (${id})` : ""}${error}: ${text}`;
+		return `toolResult ${name}${id ? ` (${id})` : ""}${error}: ${text}${attachedImages ? imageNote : ""}`;
 	}
 	if (role === "user" || role === "developer" || role === "assistant") {
 		const lines: string[] = [];
 		const text = textFromContent(message.content);
-		const images = imagesFromContent(message.content);
-		const imageNote = images.length > 0 ? " [image omitted]" : "";
 		if (text || images.length > 0) {
 			lines.push(`${role}: ${text}${imageNote}`.trimEnd());
 		}
@@ -179,13 +184,13 @@ function serializeMessage(message: unknown): string {
 	return `${role}: ${JSON.stringify(message)}`;
 }
 
-function historyUnits(messages: readonly unknown[]): string[] {
+function historyUnits(messages: readonly unknown[], recoveryStart?: number, attachedImages?: SDKImage[]): string[] {
 	const units: string[] = [];
 	let lines: string[] = [];
 	const pending = new Set<string>();
-	for (const message of messages) {
+	for (const [index, message] of messages.entries()) {
 		if (!isRecord(message)) continue;
-		if ((message.role === "user" || message.role === "developer") && pending.size === 0 && lines.length > 0) {
+		if ((message.role === "user" || message.role === "developer") && pending.size === 0 && lines.length > 0 && (recoveryStart === undefined || index <= recoveryStart)) {
 			units.push(lines.join("\n"));
 			lines = [];
 		}
@@ -198,7 +203,7 @@ function historyUnits(messages: readonly unknown[]): string[] {
 			}
 		}
 		if (message.role === "toolResult" && typeof message.toolCallId === "string") pending.delete(message.toolCallId);
-		const line = serializeMessage(message);
+		const line = serializeMessage(message, recoveryStart !== undefined && index >= recoveryStart ? attachedImages : undefined);
 		if (line) lines.push(line);
 	}
 	if (lines.length > 0) units.push(lines.join("\n"));
@@ -239,9 +244,9 @@ export function activeUserInput(context: Context, continueOnly = false): SDKUser
 	return images.length > 0 ? { text, images } : { text };
 }
 
-function validateToolResultRecovery(context: Context): boolean {
+function validateToolResultRecovery(context: Context): number | undefined {
 	const results = trailingToolResults(context);
-	if (results.length === 0) return false;
+	if (results.length === 0) return undefined;
 	const batchIndex = context.messages.length - results.length - 1;
 	const batch = context.messages[batchIndex];
 	if (batch?.role !== "assistant") {
@@ -274,30 +279,40 @@ function validateToolResultRecovery(context: Context): boolean {
 	}
 	for (let index = requestIndex; index < context.messages.length; index += 1) {
 		const message = context.messages[index]!;
-		if (message.role === "toolResult" && message.content.some((block) => block.type !== "text")) {
-			throw new Error("Cannot recover Cursor SDK non-text tool results from reconstructed text history");
+		if (message.role !== "toolResult" && message.role !== "user" && message.role !== "developer") continue;
+		const content: unknown = message.content;
+		if (message.role !== "toolResult" && typeof content === "string") continue;
+		if (!Array.isArray(content) || content.some((block) => !isRecord(block) || (
+			block.type === "text" ? typeof block.text !== "string"
+				: block.type === "image" ? typeof block.data !== "string" || !block.data.trim() || typeof block.mimeType !== "string" || !/^image\/\S+$/.test(block.mimeType)
+					: true
+		))) {
+			throw new Error("Cannot recover Cursor SDK history: unsupported or malformed text/image content");
 		}
 	}
-	return true;
+	return requestIndex;
 }
 
 /**
  * New SDK agent input: sanitized OMP system instructions (when nonempty), prior
  * visible history, then the current input or continuation. Native SDK systemPrompt is never
- * set. Historical images are noted, not re-attached.
+ * set. Historical images are noted, not re-attached, except in required tool recovery history.
  */
 export function bootstrapUserInput(context: Context, limits: ModelInputLimits, continueOnly = false): SDKUserMessage {
-	const recovering = validateToolResultRecovery(context);
+	const recoveryStart = validateToolResultRecovery(context);
+	const recovering = recoveryStart !== undefined;
 	const message = currentInputMessage(context, continueOnly);
 	const prior = message ? context.messages.slice(0, -1) : context.messages;
 	const current: SDKUserMessage = recovering
 		? { text: "Continue the initiating request using the recorded tool results above. These tool calls have already completed; do not repeat completed actions or retry recorded tool calls. Treat their results as existing evidence and continue with the remaining work." }
 		: activeUserInput(context, continueOnly);
+	const images: SDKImage[] = [];
+	const units = historyUnits(prior, recoveryStart, images);
+	if (images.length > 0) current.images = images;
 	const sanitized = sanitizeSystemPromptForCursor(serializeSystemPrompt(context.systemPrompt));
 	const system = sanitized ? `System instructions from OMP:\n${sanitized}\n\n` : "";
 	const budget = inputTextBudget(current, limits);
 	if (estimatedTextTokens(system + current.text) > budget) throwContextOverflow();
-	const units = historyUnits(prior);
 	const suffix = `\n\n---\nCurrent ${message?.role === "developer" ? "developer" : message ? "user" : "continuation"} request:\n${current.text}`;
 	const header = "Previous OMP conversation (reconstructed context, not live Cursor history):\n";
 	let remaining = budget - estimatedTextTokens(system + header + suffix);
