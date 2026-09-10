@@ -2,6 +2,7 @@ import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@o
 import { resolveCursorApiKey } from "./auth.js";
 import { ensureCursorModels, fallbackModels, getModelMetadata } from "./catalog.js";
 import { CURSOR_API_KEY_ENV_VAR, CURSOR_SDK_PROVIDER_ID } from "./constants.js";
+import { sanitizeCursorProviderError } from "./errors.js";
 
 const FAST_ENTRY_TYPE = "cursor-fast-state";
 const FAST_USAGE = "Usage: /cursor-fast [on|off|status]";
@@ -22,7 +23,7 @@ let lastDynamicFetch: { ok: boolean; error?: string } | undefined;
 
 /** OMP can swallow discovery failures and return cached rows from refreshProvider. */
 export function recordDynamicModelFetch(ok: boolean, error?: string): void {
-	lastDynamicFetch = { ok, error };
+	lastDynamicFetch = { ok, error: error === undefined ? undefined : sanitizeCursorProviderError(error) };
 }
 
 function lookupCatalogMetadata(id: string, apiKey?: string): FastMetadata | undefined {
@@ -153,9 +154,6 @@ function formatFastStatus(resolution: FastResolution): string {
 	return `Cursor fast is ${label}.`;
 }
 
-function errorMessage(error: unknown): string {
-	return error instanceof Error ? error.message : String(error);
-}
 
 
 export function registerModelControls(
@@ -185,14 +183,20 @@ export function registerModelControls(
 			const normalized = args.trim().toLowerCase();
 			const action = normalized === "" || normalized === "status" ? "status" : normalized;
 			if (action !== "on" && action !== "off" && action !== "status") {
-				ctx.ui.notify(`Invalid Cursor fast argument "${args.trim()}". ${FAST_USAGE}`, "error");
+				ctx.ui.notify(`Invalid Cursor fast argument. ${FAST_USAGE}`, "error");
 				return;
 			}
 			const generation = preferenceGeneration;
 			const sessionId = ctx.sessionManager.getSessionId();
 			const sessionFile = ctx.sessionManager.getSessionFile();
 			const model = ctx.model ? { ...ctx.model } : undefined;
-			const apiKey = await hydrateCatalogMetadata({ model, modelRegistry: ctx.modelRegistry });
+			let apiKey: string | undefined;
+			try {
+				apiKey = await hydrateCatalogMetadata({ model, modelRegistry: ctx.modelRegistry });
+			} catch (error) {
+				ctx.ui.notify(`Failed to load Cursor model capabilities: ${sanitizeCursorProviderError(error, apiKey)}`, "error");
+				return;
+			}
 			if (
 				generation !== preferenceGeneration ||
 				sessionId !== ctx.sessionManager.getSessionId() ||
@@ -200,7 +204,7 @@ export function registerModelControls(
 			) return;
 			const target = currentFastTarget({ model }, apiKey);
 			if (!target.ok) {
-				ctx.ui.notify(target.message, "error");
+				ctx.ui.notify(sanitizeCursorProviderError(target.message, apiKey), "error");
 				return;
 			}
 			const resolution = resolveFast(target.metadata.baseModelId);
@@ -216,7 +220,7 @@ export function registerModelControls(
 			try {
 				persistFastPreference(target.metadata.baseModelId, next);
 			} catch (error) {
-				ctx.ui.notify(`Failed to save Cursor fast preference: ${errorMessage(error)}`, "error");
+				ctx.ui.notify(`Failed to save Cursor fast preference: ${sanitizeCursorProviderError(error, apiKey)}`, "error");
 				return;
 			}
 			ctx.ui.notify(`Cursor fast ${next ? "enabled" : "disabled"}.`, "info");
@@ -227,20 +231,22 @@ export function registerModelControls(
 		description: "Refresh the live Cursor SDK model catalog through OMP",
 		handler: async (_args, ctx) => {
 			lastDynamicFetch = undefined;
+			let apiKey: string | undefined;
 			try {
-				if (!(await resolveRegistryApiKey(ctx))) {
+				apiKey = await resolveRegistryApiKey(ctx);
+				if (!apiKey) {
 					ctx.ui.notify("Set CURSOR_API_KEY or use /login cursor-sdk before refreshing models.", "error");
 					return;
 				}
 				await ctx.modelRegistry.refreshProvider(CURSOR_SDK_PROVIDER_ID, "online");
 				const outcome = lastDynamicFetch as { ok: boolean; error?: string } | undefined;
 				if (!outcome?.ok) {
-					ctx.ui.notify(`Failed to refresh Cursor SDK models: ${outcome?.error ?? FAILED_LIVE_REFRESH}`, "error");
+					ctx.ui.notify(`Failed to refresh Cursor SDK models: ${sanitizeCursorProviderError(outcome?.error ?? FAILED_LIVE_REFRESH, apiKey)}`, "error");
 					return;
 				}
 				ctx.ui.notify("Cursor SDK model catalog refreshed.", "info");
 			} catch (error) {
-				ctx.ui.notify(`Failed to refresh Cursor SDK models: ${errorMessage(error)}`, "error");
+				ctx.ui.notify(`Failed to refresh Cursor SDK models: ${sanitizeCursorProviderError(error, apiKey)}`, "error");
 			}
 		},
 	});

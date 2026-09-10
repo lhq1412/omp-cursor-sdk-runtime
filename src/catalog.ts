@@ -9,11 +9,14 @@ import { Effort, type ModelCost } from "@oh-my-pi/pi-ai";
 import type { ProviderModelConfig } from "@oh-my-pi/pi-coding-agent";
 import { credentialScopeId } from "./auth.js";
 import { CURSOR_SDK_PROVIDER_ID, DEFAULT_MODEL_ID } from "./constants.js";
+import { sanitizeCursorProviderError } from "./errors.js";
+import { modelCacheRoot, readModelCache, validatedModelItems, writeModelCache } from "./model-cache.js";
 
 export type ModelThinkingLevel = "off" | Effort;
 type ThinkingLevelMap = Partial<Record<ModelThinkingLevel, string | null>>;
 
 export interface CursorModelMetadata {
+	source: "sdk" | "cache" | "fallback";
 	piModelId: string;
 	baseModelId: string;
 	displayName: string;
@@ -86,6 +89,7 @@ const catalogsByCredential = new Map<string, Map<string, CursorModelMetadata>>()
 let listModelsImpl: ListModels | undefined;
 let catalogMutation: Promise<void> = Promise.resolve();
 let composerFallbackMetadata: Map<string, CursorModelMetadata> | undefined;
+let cacheRoot: string | null | undefined;
 
 function serializeCatalogMutation<T>(fn: () => Promise<T>): Promise<T> {
 	const run = catalogMutation.then(fn, fn);
@@ -313,6 +317,7 @@ function toMetadata(identity: SelectionIdentity, defaultParams: ModelParameterVa
 			}
 		: undefined;
 	return {
+		source: "sdk",
 		piModelId,
 		baseModelId: model.id,
 		displayName: model.displayName || model.id,
@@ -368,7 +373,7 @@ function getModelName(item: Pick<ModelListItem, "id" | "displayName">, context?:
 	return context ? `${displayName} @ ${context}` : displayName;
 }
 
-function projectItems(items: readonly ModelListItem[]): {
+function projectItems(items: readonly ModelListItem[], source: CursorModelMetadata["source"] = "sdk"): {
 	metadata: Map<string, CursorModelMetadata>;
 	models: ProviderModelConfig[];
 } {
@@ -378,6 +383,7 @@ function projectItems(items: readonly ModelListItem[]): {
 		const defaultParams = getDefaultParams(identity.model);
 		const params = identity.context ? replaceParam(defaultParams, "context", identity.context) : defaultParams;
 		const row = toMetadata(identity, params);
+		row.source = source;
 		metadata.set(identity.piModelId, row);
 		models.push(toModelConfig(row, getModelName(identity.model, identity.context)));
 	}
@@ -385,12 +391,12 @@ function projectItems(items: readonly ModelListItem[]): {
 }
 
 function composerFallbackMap(): Map<string, CursorModelMetadata> {
-	composerFallbackMetadata ??= projectItems([COMPOSER_FALLBACK_ITEM]).metadata;
+	composerFallbackMetadata ??= projectItems([COMPOSER_FALLBACK_ITEM], "fallback").metadata;
 	return composerFallbackMetadata;
 }
 
-function registerModelItems(items: readonly ModelListItem[], key?: string): ProviderModelConfig[] {
-	const projected = projectItems(items);
+function registerModelItems(items: readonly ModelListItem[], key?: string, source: CursorModelMetadata["source"] = "sdk"): ProviderModelConfig[] {
+	const projected = projectItems(items, source);
 	if (key) catalogsByCredential.set(key, projected.metadata);
 	state = { key, metadata: projected.metadata };
 	return projected.models;
@@ -469,7 +475,12 @@ export function buildModelSelection(
 	options: ModelSelectionRuntimeOptions = {},
 ): ModelSelection {
 	const metadata = lookupMetadata(modelId, options.apiKey);
-	if (!metadata) return { id: modelId };
+	if (!metadata) {
+		if (metadataFor(options.apiKey).values().next().value?.source === "cache") {
+			throw new Error("Cursor SDK model discovery is unavailable and the selected model has no verified cached configuration.");
+		}
+		return { id: modelId };
+	}
 	const params = cloneParams(metadata.defaultParams);
 	if (metadata.extendedContext && options.extendedContextEnabled !== undefined) {
 		setParam(
@@ -485,11 +496,6 @@ export function buildModelSelection(
 	return params.length > 0 ? { id: metadata.baseModelId, params } : { id: metadata.baseModelId };
 }
 
-function sanitizeDiscoveryError(error: unknown, apiKey: string): Error {
-	const raw = error instanceof Error ? error.message : typeof error === "string" ? error : "";
-	const detail = raw.split(apiKey).join("<redacted>").trim();
-	return new Error(`Cursor SDK model discovery failed${detail ? `: ${detail}` : "."}`);
-}
 
 async function listCursorModels(apiKey: string): Promise<readonly ModelListItem[]> {
 	return listModelsImpl ? listModelsImpl(apiKey) : Cursor.models.list({ apiKey });
@@ -497,13 +503,15 @@ async function listCursorModels(apiKey: string): Promise<readonly ModelListItem[
 
 async function fetchCursorModelsUnlocked(apiKey: string): Promise<ProviderModelConfig[]> {
 	try {
-		const models = await listCursorModels(apiKey);
-		if (models.length === 0) {
-			throw new Error("empty model catalog");
+		const models = validatedModelItems(await listCursorModels(apiKey));
+		const key = credentialScopeId(apiKey);
+		const registered = registerModelItems(models, key);
+		if (cacheRoot !== null && !JSON.stringify(models).includes(apiKey)) {
+			await writeModelCache(cacheRoot ?? modelCacheRoot(), key, models);
 		}
-		return registerModelItems(models, credentialScopeId(apiKey));
+		return registered;
 	} catch (error) {
-		throw sanitizeDiscoveryError(error, apiKey);
+		throw new Error(`Cursor SDK model discovery failed: ${sanitizeCursorProviderError(error, apiKey)}`);
 	}
 }
 
@@ -515,7 +523,13 @@ export async function ensureCursorModels(apiKey: string): Promise<void> {
 	const key = credentialScopeId(apiKey);
 	await serializeCatalogMutation(async () => {
 		if ((catalogsByCredential.get(key)?.size ?? 0) > 0) return;
-		await fetchCursorModelsUnlocked(apiKey);
+		try {
+			await fetchCursorModelsUnlocked(apiKey);
+		} catch (error) {
+			const cached = cacheRoot === null ? undefined : await readModelCache(cacheRoot ?? modelCacheRoot(), key);
+			if (!cached) throw error;
+			registerModelItems(cached, key, "cache");
+		}
 	});
 }
 
@@ -533,8 +547,12 @@ export const __testUtils = {
 		catalogsByCredential.clear();
 		listModelsImpl = undefined;
 		catalogMutation = Promise.resolve();
+		cacheRoot = null;
 	},
 	setListModels(fn: ListModels | undefined): void {
 		listModelsImpl = fn;
+	},
+	setCacheRoot(root: string): void {
+		cacheRoot = root;
 	},
 };

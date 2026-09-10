@@ -2,6 +2,7 @@ import type { AssistantMessageEventStream, Context, Model, SimpleStreamOptions }
 import type { Api } from "@oh-my-pi/pi-ai";
 import { CURSOR_SDK_API, CURSOR_SDK_PROVIDER_ID, DEFAULT_AGENT_INSTANCE_ID } from "./constants.js";
 import { requireCursorApiKey } from "./auth.js";
+import { sanitizeCursorProviderError } from "./errors.js";
 import { readHostBridge } from "./contracts.js";
 import { HOST_BRIDGE_OPTION_KEY } from "./host-option.js";
 import { grantedToolsFromContext, trailingToolResults } from "./omp-tools.js";
@@ -15,8 +16,9 @@ import {
 	waitForParked,
 	waitForResult,
 	bindLiveAbort,
+	getLiveRun,
 } from "./live-run.js";
-import { commitTurn, finishLiveKeepAgent, finishTurnFailed, prepareTurn, type RuntimeSlot } from "./session-runtime.js";
+import { commitTurn, finishLiveKeepAgent, finishTurnFailed, prepareTurn, runtimeKey, type RuntimeSlot } from "./session-runtime.js";
 import { getCursorSessionCwd } from "./session-scope.js";
 import { withSdkExitSuppressed } from "./sdk-exit-guard.js";
 import { ensureCursorModels, getModelMetadata, buildModelSelection } from "./catalog.js";
@@ -29,6 +31,8 @@ import {
 	createEmptyAssistantMessage,
 	createProviderStream,
 	runResultToStopReason,
+	projectRunUsage,
+	reconcileRunResult,
 } from "./projector.js";
 
 function selectionForTurn(model: Model<Api>, apiKey: string, options?: SimpleStreamOptions): ModelSelection {
@@ -55,6 +59,7 @@ export function streamCursorRuntime(
 	queueMicrotask(async () => {
 		let slot: RuntimeSlot | undefined;
 		let abortSignal = options?.signal;
+		let apiKey: string | undefined;
 		try {
 			const host = readHostBridge((options as Record<string, unknown> | undefined)?.[HOST_BRIDGE_OPTION_KEY]);
 			abortSignal = host?.signal ?? options?.signal;
@@ -62,14 +67,14 @@ export function streamCursorRuntime(
 			const snapshot = host?.snapshot();
 			const cwd = snapshot?.cwd ?? (typeof options?.cwd === "string" && options.cwd ? options.cwd : getCursorSessionCwd());
 			const agentInstanceId = snapshot?.agentInstanceId ?? DEFAULT_AGENT_INSTANCE_ID;
-			const apiKey = requireCursorApiKey(typeof options?.apiKey === "string" ? options.apiKey : undefined);
+			apiKey = requireCursorApiKey(typeof options?.apiKey === "string" ? options.apiKey : undefined);
 			const grantedTools = snapshot
 				? [...snapshot.grantedTools]
 				: mergeGrantedTools(grantedToolsFromContext(context));
 			stream.push({ type: "start", partial });
 
 			let modelSelection: ModelSelection | undefined;
-			if (trailingToolResults(context).length === 0) {
+			if (trailingToolResults(context).length === 0 || !getLiveRun(runtimeKey(undefined, agentInstanceId))) {
 				const discovery = ensureCursorModels(apiKey);
 				if (abortSignal) {
 					const signal = abortSignal;
@@ -96,6 +101,7 @@ export function streamCursorRuntime(
 				agentInstanceId,
 				apiKey,
 				modelSelection,
+				modelLimits: { contextWindow: model.contextWindow, maxTokens: model.maxTokens },
 				context,
 				grantedTools,
 				host,
@@ -136,7 +142,7 @@ export function streamCursorRuntime(
 							onDelta: ({ update }) => {
 								const sink = live.sink;
 								if (!sink) return;
-								applyInteractionUpdate(sink.stream, sink.partial, update);
+								applyInteractionUpdate(sink.stream, sink.partial, update, live.projection);
 							},
 						}),
 					),
@@ -149,6 +155,7 @@ export function streamCursorRuntime(
 				const cancelled = waitForCancelled(live).then(() => ({ kind: "cancelled" as const }));
 				const first = await Promise.race([parked.then(() => ({ kind: "parked" as const })), finished, cancelled]);
 				if (first.kind === "cancelled" || live.cancelled) {
+					projectRunUsage(partial, live.projection, live.run?.usage);
 					partial.stopReason = "aborted";
 					partial.errorMessage = "Cancelled";
 					stream.push({ type: "error", reason: "aborted", error: partial });
@@ -158,20 +165,26 @@ export function streamCursorRuntime(
 				}
 				if (first.kind === "parked") {
 					const batch = await collectParkedBatch(live);
+					projectRunUsage(partial, live.projection, live.run?.usage);
 					for (const call of batch) {
 						applyToolCall(stream, partial, { id: call.toolCallId, name: call.name, arguments: call.args });
 					}
+					live.projection.answerText = "";
 					partial.stopReason = "toolUse";
 					stream.push({ type: "done", reason: "toolUse", message: partial });
 					stream.end(partial);
 					return;
 				}
 				stopWaitingForPark(live);
+				projectRunUsage(partial, live.projection, first.result.usage ?? live.run?.usage);
+				reconcileRunResult(stream, partial, live.projection, first.result);
 				if (host) await host.flushToolResults();
 				closeOpenBlocks(stream, partial);
 				partial.stopReason = runResultToStopReason(first.result);
 				if (first.result.status === "error") {
-					partial.errorMessage = first.result.error?.message ?? "Cursor SDK run failed";
+					partial.errorMessage = sanitizeCursorProviderError(
+						{ ...first.result.error, requestId: first.result.requestId }, apiKey,
+					);
 					stream.push({ type: "error", reason: "error", error: partial });
 					stream.end(partial);
 					await finishTurnFailed(preparedSlot, "run error");
@@ -207,7 +220,7 @@ export function streamCursorRuntime(
 			if (slot) await finishTurnFailed(slot, "send failed");
 			const aborted = abortSignal?.aborted;
 			partial.stopReason = aborted ? "aborted" : "error";
-			partial.errorMessage = aborted ? "Cancelled" : error instanceof Error ? error.message : String(error);
+			partial.errorMessage = aborted ? "Cancelled" : sanitizeCursorProviderError(error, apiKey);
 			stream.push({ type: "error", reason: aborted ? "aborted" : "error", error: partial });
 			stream.end(partial);
 		}

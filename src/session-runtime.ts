@@ -4,7 +4,7 @@ import type { Context } from "@oh-my-pi/pi-ai";
 import { credentialScopeId } from "./auth.js";
 import { DEFAULT_AGENT_INSTANCE_ID } from "./constants.js";
 import type { BindingState, GrantedTool, OmpHostBridgeV1 } from "./contracts.js";
-import { computeContextFingerprint, emptySendState, planSend, turnPrompt, type SendState } from "./context.js";
+import { computeContextFingerprint, emptySendState, planSend, turnPrompt, type ModelInputLimits, type SendState } from "./context.js";
 import { createSharedToolExec, type SharedToolExec } from "./host-exec.js";
 import {
 	createLiveRun,
@@ -87,6 +87,7 @@ export interface OpenRuntimeTurnInput {
 	agentInstanceId: string;
 	apiKey: string;
 	modelSelection?: ModelSelection;
+	modelLimits: ModelInputLimits;
 	context: Context;
 	grantedTools: readonly GrantedTool[];
 	host?: OmpHostBridgeV1;
@@ -188,10 +189,6 @@ export async function prepareTurn(input: OpenRuntimeTurnInput): Promise<Prepared
 	const trailing = trailingToolResults(input.context);
 	const continuing = Boolean(existingLive && trailing.length > 0);
 
-	if (trailing.length > 0 && !existingLive) {
-		throw new Error("Cannot continue parked Cursor SDK tool calls after the adapter restarted; send a new user turn");
-	}
-
 	if (existingLive && continuing) {
 		if (slotIdentityMismatch(slot, cwd, nextCredential)) {
 			await finishTurnFailed(slot, "identity changed during parked tool calls");
@@ -226,7 +223,10 @@ export async function prepareTurn(input: OpenRuntimeTurnInput): Promise<Prepared
 		slot.sendState = emptySendState();
 	}
 
-	let plan = planSend(slot.sendState, input.context);
+	const plan = trailing.length > 0
+		? { mode: "bootstrap" as const, resetAgent: true, reason: "context_divergence" as const }
+		: planSend(slot.sendState, input.context);
+	const prompt = turnPrompt(plan, input.context, input.modelLimits);
 	if (plan.resetAgent) {
 		if (slot.agent) {
 			await persistDirtyAndDisposeAgent(slot);
@@ -237,7 +237,6 @@ export async function prepareTurn(input: OpenRuntimeTurnInput): Promise<Prepared
 			slot.credentialScopeId = undefined;
 			slot.sendState = emptySendState();
 		}
-		plan = planSend(slot.sendState, input.context);
 	}
 
 	const savedAgentId = slot.agent?.agentId ?? (slot.bindingState === "committed" ? resumeHandle?.agentId : undefined);
@@ -280,7 +279,7 @@ export async function prepareTurn(input: OpenRuntimeTurnInput): Promise<Prepared
 		live,
 		continuing: false,
 		customTools,
-		prompt: turnPrompt(plan, input.context),
+		prompt,
 		incremental: plan.mode === "incremental",
 	};
 }

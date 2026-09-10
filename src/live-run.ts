@@ -4,6 +4,7 @@ import type { HostToolResult } from "./contracts.js";
 import { toolResultToHost, trailingToolResults } from "./omp-tools.js";
 import { withSdkExitSuppressed } from "./sdk-exit-guard.js";
 import type { SharedToolExec } from "./host-exec.js";
+import type { RunProjection } from "./projector.js";
 
 export interface ParkedToolCall {
 	name: string;
@@ -24,6 +25,7 @@ export interface LiveRun {
 	toolExec: SharedToolExec;
 	sink?: { stream: AssistantMessageEventStream; partial: AssistantMessage };
 	cancelled: boolean;
+	projection: RunProjection;
 	abortSignal?: AbortSignal;
 	abortHandler?: () => void;
 }
@@ -48,6 +50,7 @@ export function createLiveRun(toolExec: SharedToolExec): LiveRun {
 		parked: [],
 		toolExec,
 		cancelled: false,
+		projection: { answerText: "" },
 	};
 }
 

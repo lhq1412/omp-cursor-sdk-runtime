@@ -1,4 +1,8 @@
-import { beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { chmod, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { credentialScopeId } from "../../src/auth.ts";
 import type { ModelListItem, ModelParameterDefinition, ModelParameterValue } from "@cursor/sdk";
 import {
 	__testUtils,
@@ -238,7 +242,9 @@ describe("hydration", () => {
 		__testUtils.setListModels(async () => {
 			throw new Error(`upstream rejected ${key}`);
 		});
-		await expect(fetchCursorModels(key)).rejects.toThrow(/Cursor SDK model discovery failed: upstream rejected <redacted>/);
+		const failure = await fetchCursorModels(key).catch((error: Error) => error);
+		expect(failure).toBeInstanceOf(Error);
+		expect((failure as Error).message).not.toContain(key);
 		expect(getModelMetadata("gpt-5.5")?.contextWindow).toBe(1_000_000);
 	});
 
@@ -317,5 +323,147 @@ describe("hydration", () => {
 		expect(getModelMetadata("composer-2.5")?.supportsReasoning).toBe(false);
 		expect(getModelMetadata("gpt-5.5")).toBeUndefined();
 		expect(buildModelSelection("missing", "high")).toEqual({ id: "missing" });
+	});
+});
+
+describe("persisted catalog", () => {
+	let root: string;
+	const key = "cache-key-secret";
+	const discovered = item({
+		id: "cached-model",
+		parameters: [param("context", ["200k", "1m"]), param("fast", ["false", "true"])],
+		variants: defaultVariant([{ id: "context", value: "1m" }, { id: "fast", value: "true" }]),
+	});
+
+	function restartOffline() {
+		__testUtils.resetCatalog();
+		__testUtils.setCacheRoot(root);
+		__testUtils.setListModels(async () => { throw new Error("discovery offline"); });
+	}
+
+	beforeEach(async () => {
+		root = await mkdtemp(join(tmpdir(), "cursor-model-cache-"));
+		__testUtils.setCacheRoot(root);
+		__testUtils.setListModels(async () => [discovered]);
+	});
+
+	afterEach(async () => {
+		await rm(root, { recursive: true, force: true });
+	});
+
+	test("reloads validated same-key selection across reset without turning refresh into success", async () => {
+		await fetchCursorModels(key);
+		expect(getModelMetadata("cached-model", key)?.source).toBe("sdk");
+		const path = join(root, `${credentialScopeId(key)}.json`);
+		expect(await readFile(path, "utf8")).not.toContain(key);
+		expect((await stat(path)).mode & 0o777).toBe(0o600);
+		restartOffline();
+		await ensureCursorModels(key);
+		expect(getModelMetadata("cached-model", key)?.source).toBe("cache");
+		expect(buildModelSelection("cached-model", "off", { apiKey: key, extendedContextEnabled: false, fastEnabled: false })).toEqual({
+			id: "cached-model",
+			params: [{ id: "context", value: "200k" }, { id: "fast", value: "false" }],
+		});
+		expect(getModelMetadata("unknown-model", key)).toBeUndefined();
+		expect(() => buildModelSelection("unknown-model", "off", { apiKey: key })).toThrow();
+		expect(buildModelSelection("unknown-model", "off", { apiKey: "other-key" })).toEqual({ id: "unknown-model" });
+		await expect(fetchCursorModels(key)).rejects.toThrow("discovery offline");
+		await expect(ensureCursorModels("other-key")).rejects.toThrow("discovery offline");
+		expect(getModelMetadata("cached-model", "other-key")).toBeUndefined();
+	});
+
+	test("preserves variant-only parameter IDs and values through live discovery and disk reload", async () => {
+		const models = [
+			item({
+				id: "variant-only",
+				variants: defaultVariant([{ id: "routing", value: "Auto" }]),
+			}),
+			item({
+				id: "unadvertised-value",
+				parameters: [param("routing", ["standard"]), param("region", [])],
+				variants: [
+					...defaultVariant([{ id: "routing", value: "Premium" }, { id: "region", value: "" }]),
+					{ displayName: "alternate", params: [{ id: "routing", value: "Preview" }] },
+				],
+			}),
+		];
+		const selections = [
+			{ id: "variant-only", params: [{ id: "routing", value: "Auto" }] },
+			{ id: "unadvertised-value", params: [{ id: "routing", value: "Premium" }, { id: "region", value: "" }] },
+		];
+		__testUtils.setListModels(async () => models);
+		expect((await fetchCursorModels(key)).map((model) => model.id).sort()).toEqual(models.map((model) => model.id).sort());
+		expect(models.map((model) => buildModelSelection(model.id, "off", { apiKey: key }))).toEqual(selections);
+		const persisted = JSON.parse(await readFile(join(root, `${credentialScopeId(key)}.json`), "utf8"));
+		expect(persisted.models.map((model: ModelListItem) => model.variants)).toEqual(models.map((model) => model.variants));
+		expect(persisted.models.map((model: ModelListItem) => model.parameters)).toEqual(models.map((model) => model.parameters ?? []));
+		restartOffline();
+		await ensureCursorModels(key);
+		expect(models.map((model) => getModelMetadata(model.id, key)?.source)).toEqual(["cache", "cache"]);
+		expect(models.map((model) => buildModelSelection(model.id, "off", { apiKey: key }))).toEqual(selections);
+	});
+
+	test("rejects malformed, foreign credential, foreign model and ambiguous variant data", async () => {
+		await fetchCursorModels(key);
+		const path = join(root, `${credentialScopeId(key)}.json`);
+		const valid = JSON.parse(await readFile(path, "utf8"));
+		for (const content of [
+			"{",
+			JSON.stringify({ ...valid, credential: credentialScopeId("other-key") }),
+			JSON.stringify({ ...valid, version: 2 }),
+			JSON.stringify({ ...valid, models: [{ ...discovered, id: "other-provider/model" }] }),
+			JSON.stringify({ ...valid, models: [{ ...discovered, variants: [{ displayName: "default", params: [{ id: 1, value: "true" }] }] }] }),
+			JSON.stringify({ ...valid, models: [{ ...discovered, variants: [{ displayName: "default", params: [{ id: "fast", value: true }] }] }] }),
+			JSON.stringify({ ...valid, models: [{ ...discovered, variants: defaultVariant([{ id: "fast", value: "true" }, { id: "fast", value: "false" }]) }] }),
+		]) {
+			await writeFile(path, content);
+			restartOffline();
+			await expect(ensureCursorModels(key)).rejects.toThrow("discovery offline");
+			expect(getModelMetadata("cached-model", key)).toBeUndefined();
+		}
+		__testUtils.setListModels(async () => [discovered]);
+		await ensureCursorModels(key);
+		expect(getModelMetadata("cached-model", key)?.source).toBe("sdk");
+	});
+	test("invalid live metadata cannot replace a previously validated cache", async () => {
+		await fetchCursorModels(key);
+		__testUtils.setListModels(async () => [{
+			...discovered,
+			variants: defaultVariant([{ id: "fast", value: "true" }, { id: "fast", value: "false" }]),
+		}]);
+		await expect(fetchCursorModels(key)).rejects.toThrow();
+		restartOffline();
+		await ensureCursorModels(key);
+		expect(buildModelSelection("cached-model", "off", { apiKey: key }).params).toEqual([
+			{ id: "context", value: "1m" }, { id: "fast", value: "true" },
+		]);
+	});
+
+
+	test("rejects unsafe permissions and symlinks without expanding existing modes", async () => {
+		await fetchCursorModels(key);
+		const path = join(root, `${credentialScopeId(key)}.json`);
+		await chmod(path, 0o644);
+		restartOffline();
+		await expect(ensureCursorModels(key)).rejects.toThrow("discovery offline");
+		__testUtils.setListModels(async () => [discovered]);
+		await fetchCursorModels(key);
+		expect((await stat(path)).mode & 0o777).toBe(0o644);
+		await chmod(path, 0o400);
+		await fetchCursorModels(key);
+		expect((await stat(path)).mode & 0o777).toBe(0o400);
+		const target = join(root, "target.json");
+		await writeFile(target, await readFile(path), { mode: 0o600 });
+		await rm(path);
+		await symlink(target, path);
+		restartOffline();
+		await expect(ensureCursorModels(key)).rejects.toThrow("discovery offline");
+		await rm(path);
+		await chmod(root, 0o755);
+		__testUtils.setListModels(async () => [discovered]);
+		await fetchCursorModels(key);
+		restartOffline();
+		await expect(ensureCursorModels(key)).rejects.toThrow("discovery offline");
+		expect((await stat(root)).mode & 0o777).toBe(0o755);
 	});
 });

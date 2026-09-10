@@ -99,13 +99,19 @@ In-session:
 - `/cursor-fast [on|off|status]` — per canonical model; `--cursor-no-fast` wins `--cursor-fast`; otherwise session custom entries. Takes effect on the next new send, not an in-flight parked run. Captures the selected model and actual session identity when invoked; pending commands are discarded without saving or notifying if navigation starts or the identity changes while capabilities load, including before navigation-completed events. If navigation is cancelled, rerun the command.
 - `/cursor-refresh-models` — requires a Cursor SDK key and calls native `modelRegistry.refreshProvider("cursor-sdk", "online")`. Success requires a successful live discovery callback, not a silently reused cache; failures retain the previous catalog. `omp models refresh` also goes through `fetchDynamicModels`.
 
-Raw SDK parameter metadata is hydrated once per credential when OMP serves cached model rows. `/cursor-fast` works offline for the known `composer-2.5` fallback; other models require known capabilities and fail clearly if discovery is unavailable. Authentication uses the `cursor-sdk` provider key with `CURSOR_API_KEY` fallback; credential-scoped metadata cannot leak between accounts. Empty live catalogs are errors, not successful refreshes. Cloud `bc-*` agent IDs remain rejected.
+Validated SDK parameter/variant metadata is persisted per credential hash under the SDK workspace state root at `omp-cursor-runtime/model-cache/<credential-hash>.json`. Files are private, bounded, validated on read, and atomically replaced; no API key is stored. When live discovery fails, `ensureCursorModels()` may use that credential's cached configuration for known models only. Metadata `source` distinguishes `sdk`, `cache`, and the existing `fallback`; cached configuration never grants account access. Explicit refresh still reports live discovery failures. `/cursor-fast` also works offline for the known `composer-2.5` fallback. Empty live catalogs are errors, not successful refreshes. Cloud `bc-*` agent IDs remain rejected.
+
+SDK preset variants are valid selections independently of advertised parameter definitions. Live discovery and disk validation preserve their opaque string values, including empty values, without requiring preset IDs/values to appear in `parameters`; malformed structures and duplicate parameter IDs are still rejected.
 
 ## Tools
 
 On stock brew OMP, `context.tools` plus xd://-mounted tools (including enabled `mcp__*` MCP tools) are mapped to Cursor SDK custom tools. Native Cursor executors (`shell`, `edit`, `read`, `grep`, `glob`, `ls`, `delete`, `task`) stay disallowed. SDK `settingSources` is always `[]`; `mcpServers` is always `{}`.
 
 When the model calls a tool, the adapter emits OMP `toolUse`, parks the SDK callbacks, and yields back to OMP. OMP runs the tool with its own permissions and approval (MCP included via the xd:// fallback). The next `streamSimple` resumes the parked callbacks with the trailing `toolResult`s.
+
+If those callbacks are gone (for example after a restart or a completed Run), complete recorded text/image tool results can continue on a **fresh agent** instead. Recovery validates the latest assistant batch's call/result IDs, keeps the initiating request and completed interaction within the bootstrap budget, and sends an explicit continuation rather than resending the old request as new input. Images from the initiating request and its completed tool results are attached in recorded order, with numbered references in the reconstructed text. A saved agent handle is not resumed for this path. Missing, duplicate or unmatched results, missing initiating requests, unsupported or malformed text/image content, and recovery evidence that cannot fit the budget fail explicitly. Existing live callbacks still resume normally without model rediscovery.
+
+Recovery does not execute or re-emit historical tool calls. It tells the model to use the recorded results and not repeat completed actions; this is **not an exactly-once guarantee** for new tool calls the model may subsequently request. OMP still owns tool permissions and approval.
 
 An explicit host grant is used as-is. Stock extras only add currently enabled `mcp__*` names; an empty or read-only grant stays empty.
 
@@ -126,7 +132,7 @@ System instructions from OMP:
 ${sanitized}
 ```
 
-then prior visible history and the current user turn (including a first user turn). Incremental rounds omit that prefix; the existing agent already has it from bootstrap. Empty or missing system text leaves history/images-only behavior unchanged. `activeUserInput` stays the current user turn only. The reuse fingerprint still uses the raw system text, so a system change forces a fresh bootstrap.
+then prior visible history and the current user/developer input (including a first turn). Incremental rounds omit that prefix; the existing agent already has it from bootstrap. Empty or missing system text leaves history/images-only behavior unchanged. `activeUserInput` selects only the final user/developer message, never an older user request; otherwise it supplies an explicit continuation. The reuse fingerprint still uses the raw system text, so a system change forces a fresh bootstrap.
 
 Sanitizer (`serializeSystemPrompt` joins `string | string[]` with newlines):
 
@@ -136,9 +142,21 @@ Sanitizer (`serializeSystemPrompt` joins `string | string[]` with newlines):
 
 ## Session behavior
 
-Local agents are bound to the current OMP JSONL session leaf, cwd, and credential identity. Same-session incremental turns reuse the agent and send only the current user input. A new agent bootstraps with sanitized OMP system instructions when nonempty, plus reconstructed visible history and the current turn. Resume records persist the agent's execution cwd; a matching committed handle can be resumed after process restart. Branch navigation, compaction, failed turns, and cwd/key changes start a new agent.
+Local agents are bound to the current OMP JSONL session leaf, cwd, and credential identity. Same-session incremental turns reuse the agent and send only the current user/developer input, or an explicit continuation when no new input exists. Parked tool callbacks retain precedence. A new agent bootstraps with sanitized OMP system instructions when nonempty, plus reconstructed visible history and the current turn. Resume records persist the agent's execution cwd; a matching committed handle can be resumed after process restart. Branch navigation, compaction, failed turns, and cwd/key changes start a new agent.
 
 Cancellation while model discovery is pending ends that request before any runtime binding is prepared; shared discovery may finish for other requests, but its late result cannot resume the cancelled request or touch a newly selected session. Once prepared, cancellation belongs to the in-flight live run (including park-and-yield). SDK `process.reallyExit(0|1)` during teardown is swallowed so `/quit` does not throw `ExtensionExitError`.
+
+Bootstrap budgeting reserves the model's output limit, framing overhead, and 4096 tokens per attached image (including required recovery images), then removes oldest complete history interaction units without splitting tool calls/results. Necessary system instructions and the current input are never silently truncated: oversized **text** fails before opening/resuming an agent. Recovery also retains its initiating request and completed interaction as one unit; image reserves can make that required unit exceed the budget. Image payload size is not treated as model tokens and does not by itself produce a context-overflow error. The text estimator deliberately counts UTF-8 bytes conservatively rather than claiming exact tokenization. Unknown model limits fail explicitly. Backend overflow is reported separately from quota/rate limits; no automatic retries or tool reexecution are added.
+
+## Results, usage, and diagnostics
+
+Final SDK results fill missing answer text against the current answer step. A matching prefix appends only the suffix; other mismatches replace that step's text instead of concatenating a second copy. Tools are not replayed. Public `run.usage` / `RunResult.usage` counters map input, output, cache reads/writes and reasoning tokens into OMP usage. A high-water mark belongs to the SDK Run, so parked and cancelled returns report only newly observed usage, not the same cumulative counts again.
+
+Assistant messages carry `cursorSdk` availability metadata: `tokenUsage` is `actual` or `unavailable`; `contextOccupancy` is currently `unavailable`. Neither Run billing totals nor `turn-ended` billing totals establish current context occupancy, so they are not labeled as occupancy estimates. Authoritative OMP `contextTokens` stays unset. `cost` is currently `unavailable`: OMP requires numeric cost fields, so their zero placeholders **do not mean free usage**. The adapter does not guess billing attribution from agent-wide records; local billed IDs are per-turn identities, not SDK Run IDs, and costs can settle later. See the [public SDK usage contracts](https://cursor.com/docs/sdk/typescript#token-usage).
+
+**Host compatibility limitation:** the pinned OMP 18.1.14 implementation falls back to billable totals for context sizing and treats `input + cacheRead + cacheWrite > contextWindow` as overflow even on a successful `stop`. A multi-step SDK Run can therefore still trigger false compaction/recovery. Its overflow check also ignores `usage.contextTokens`, so setting that field alone would not fix the problem. This adapter preserves real cumulative billing rather than zeroing or relabeling it; it does not patch the OMP host. The image recovery fix and honest occupancy metadata do **not** resolve that host accounting incompatibility.
+
+Provider errors and diagnostic notifications redact credentials, authorization/cookie headers and sensitive query values before display/persistence, while retaining useful error categories and request IDs. Normal assistant/tool content is not globally rewritten.
 
 ## Development and verification
 

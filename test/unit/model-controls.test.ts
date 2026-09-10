@@ -377,6 +377,29 @@ describe("model controls", () => {
 		expect(host.notifications.map((item) => item.type)).toEqual(["error"]);
 	});
 
+	test("refresh diagnostics scrub the active key in thrown and host-swallowed failures", async () => {
+		const key = "private-registry-key";
+		let swallowed = false;
+		const host = createHost({
+			getApiKeyForProvider: async () => key,
+			refreshProvider: async () => {
+				const message = `network unavailable ${key}; Authorization: Bearer other-secret; requestId=req-42`;
+				if (swallowed) recordDynamicModelFetch(false, message);
+				else throw new Error(message);
+			},
+		});
+		registerModelControls(host.pi);
+		await host.run("cursor-refresh-models");
+		swallowed = true;
+		await host.run("cursor-refresh-models");
+		for (const notification of host.notifications) {
+			expect(notification.type).toBe("error");
+			expect(notification.message).not.toContain(key);
+			expect(notification.message).not.toContain("other-secret");
+			expect(notification.message).toContain("req-42");
+		}
+	});
+
 	test("seeds composer fallback metadata so /cursor-fast works without credentials", async () => {
 		controlsTestUtils.reset();
 		const host = createHost();

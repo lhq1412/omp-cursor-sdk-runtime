@@ -2,6 +2,8 @@ import { describe, expect, test } from "bun:test";
 import { activeUserInput, activeUserText, bootstrapUserInput, computeContextFingerprint, emptySendState, planSend, turnPrompt } from "../../src/context.ts";
 import type { Context } from "@oh-my-pi/pi-ai";
 
+const modelLimits = { contextWindow: 200_000, maxTokens: 20_000 };
+
 function context(messages: Context["messages"], systemPrompt: Context["systemPrompt"] = ["sys"]): Context {
 	return { systemPrompt, messages };
 }
@@ -13,8 +15,8 @@ describe("send policy", () => {
 		const ctx = context(firstUser, ["Keep going.", "Be brief."]);
 		const plan = planSend(emptySendState(), ctx);
 		expect(plan.mode).toBe("bootstrap");
-		expect(turnPrompt(plan, ctx).text).toBe("System instructions from OMP:\nKeep going.\nBe brief.\n\nhi");
-		expect(bootstrapUserInput(context(firstUser, "")).text).toBe("hi");
+		expect(turnPrompt(plan, ctx, modelLimits).text).toBe("System instructions from OMP:\nKeep going.\nBe brief.\n\nhi");
+		expect(bootstrapUserInput(context(firstUser, ""), modelLimits).text).toBe("hi");
 	});
 
 	test("incrementals when only a user message is appended", () => {
@@ -26,7 +28,7 @@ describe("send policy", () => {
 		]);
 		const plan = planSend({ bootstrapped: true, contextFingerprint: fingerprint, incrementalSendCount: 0 }, second);
 		expect(plan).toEqual({ mode: "incremental", resetAgent: false, reason: "incremental" });
-		expect(turnPrompt(plan, second).text).toBe("again");
+		expect(turnPrompt(plan, second, modelLimits).text).toBe("again");
 	});
 
 	test("rebuilds after a shortened history", () => {
@@ -52,7 +54,10 @@ describe("send policy", () => {
 		);
 		expect(plan.mode).toBe("bootstrap");
 		expect(plan.resetAgent).toBe(true);
-		expect(turnPrompt(plan, second).text).toBe("System instructions from OMP:\nnew policy\n\nhi");
+		const prompt = turnPrompt(plan, second, modelLimits).text;
+		expect(prompt).toContain("new policy");
+		expect(prompt).toContain("user: hi");
+		expect(prompt).toContain("Current continuation request:");
 	});
 
 	test("sends only the active user text, never the system prompt", () => {
@@ -78,7 +83,7 @@ describe("send policy", () => {
 			text: "",
 			images: [{ data: "abc", mimeType: "image/png" }],
 		});
-		expect(bootstrapUserInput(ctx).images).toEqual([{ data: "abc", mimeType: "image/png" }]);
+		expect(bootstrapUserInput(ctx, modelLimits).images).toEqual([{ data: "abc", mimeType: "image/png" }]);
 	});
 
 	test("bootstraps assistant.content toolCall blocks with name, id, arguments, and later toolResult", () => {
@@ -102,7 +107,7 @@ describe("send policy", () => {
 			} as Context["messages"][number],
 			{ role: "user", content: "continue", timestamp: 4 } as Context["messages"][number],
 		]);
-		const prompt = bootstrapUserInput(ctx);
+		const prompt = bootstrapUserInput(ctx, modelLimits);
 		expect(prompt.text).toContain("toolCall bash (call-1)");
 		expect(prompt.text).toContain("ls -la");
 		expect(prompt.text).toContain("toolResult bash (call-1): a.ts");
@@ -119,7 +124,7 @@ describe("send policy", () => {
 			],
 			["You are an OMP agent with extra instructions."],
 		);
-		expect(bootstrapUserInput(ctx).text).toBe(
+		expect(bootstrapUserInput(ctx, modelLimits).text).toBe(
 			[
 				"System instructions from OMP:",
 				"You are an OMP agent with extra instructions.",
@@ -133,7 +138,7 @@ describe("send policy", () => {
 				"continue that edit",
 			].join("\n"),
 		);
-		expect(turnPrompt({ mode: "incremental", resetAgent: false, reason: "incremental" }, ctx)).toEqual({
+		expect(turnPrompt({ mode: "incremental", resetAgent: false, reason: "incremental" }, ctx, modelLimits)).toEqual({
 			text: "continue that edit",
 		});
 	});
@@ -147,7 +152,7 @@ describe("send policy", () => {
 			"§ Workflow",
 			"Keep this workflow.",
 		].join("\n");
-		expect(bootstrapUserInput(context(firstUser, structured)).text).toBe(
+		expect(bootstrapUserInput(context(firstUser, structured), modelLimits).text).toBe(
 			[
 				"System instructions from OMP:",
 				"<system-conventions>",
@@ -163,11 +168,174 @@ describe("send policy", () => {
 		);
 
 		const unmarked = "  Be terse. Extra.  ";
-		expect(bootstrapUserInput(context(firstUser, unmarked)).text).toBe("System instructions from OMP:\nBe terse. Extra.\n\nhi");
+		expect(bootstrapUserInput(context(firstUser, unmarked), modelLimits).text).toBe("System instructions from OMP:\nBe terse. Extra.\n\nhi");
 
 		const incomplete = "<system-conventions>\n# Internal URLs\nHOST_CATALOG stays\nno workflow marker";
-		expect(bootstrapUserInput(context(firstUser, incomplete)).text).toBe(
+		expect(bootstrapUserInput(context(firstUser, incomplete), modelLimits).text).toBe(
 			`System instructions from OMP:\n${incomplete}\n\nhi`,
 		);
+	});
+	test("uses the final developer instruction including images instead of an earlier user", () => {
+		const ctx = context([
+			...firstUser,
+			{ role: "developer", content: [{ type: "text", text: "  New instruction\n" }, { type: "image", data: "abc", mimeType: "image/png" }], timestamp: 2 },
+		]);
+		expect(activeUserInput(ctx)).toEqual({ text: "  New instruction\n", images: [{ data: "abc", mimeType: "image/png" }] });
+		const prompt = bootstrapUserInput(ctx, modelLimits);
+		expect(prompt.text).toContain("Current developer request:\n  New instruction\n");
+		expect(prompt.images).toEqual([{ data: "abc", mimeType: "image/png" }]);
+	});
+
+	test("continues without replaying old input when no final input exists", () => {
+		const empty = activeUserInput(context([]));
+		const completed = context([
+			...firstUser,
+			{ role: "assistant", content: [{ type: "text", text: "Already finished" }], timestamp: 2 } as Context["messages"][number],
+		]);
+		expect(activeUserInput(completed)).toEqual(empty);
+		expect(empty.text).toMatch(/continue/i);
+		expect(empty.text).not.toContain("hi");
+		expect(bootstrapUserInput(completed, modelLimits).text).toContain("Already finished");
+	});
+
+	test("identical committed input continues even when a periodic bootstrap is due", () => {
+		const ctx = context(firstUser);
+		for (const incrementalSendCount of [0, 1000]) {
+			const plan = planSend({ bootstrapped: true, contextFingerprint: computeContextFingerprint(ctx), incrementalSendCount }, ctx);
+			const prompt = turnPrompt(plan, ctx, modelLimits).text;
+			expect(prompt).not.toBe("hi");
+			expect(prompt).toMatch(/continue/i);
+			if (plan.mode === "bootstrap") expect(prompt).toContain("Current continuation request:");
+		}
+	});
+
+	test("trims oldest interaction units without splitting tool calls across injected developer input", () => {
+		const ctx = context([
+			{ role: "user", content: "OLD " + "x".repeat(3000), timestamp: 1 },
+			{ role: "assistant", content: [{ type: "toolCall", id: "old-call", name: "read", arguments: {} }], timestamp: 2 },
+			{ role: "developer", content: "injected policy", timestamp: 3 },
+			{ role: "toolResult", toolCallId: "old-call", toolName: "read", content: [{ type: "text", text: "old-result" }], timestamp: 4 },
+			{ role: "user", content: "RECENT", timestamp: 5 },
+			{ role: "assistant", content: [{ type: "toolCall", id: "recent-call", name: "read", arguments: {} }], timestamp: 6 },
+			{ role: "toolResult", toolCallId: "recent-call", toolName: "read", content: [{ type: "text", text: "recent-result" }], timestamp: 7 },
+			{ role: "user", content: "CURRENT", timestamp: 8 },
+		] as Context["messages"], "required system");
+		const prompt = bootstrapUserInput(ctx, { contextWindow: 2200, maxTokens: 200 }).text;
+		expect(prompt).not.toContain("OLD");
+		expect(prompt).not.toContain("old-call");
+		expect(prompt).not.toContain("old-result");
+		expect(prompt).not.toContain("injected policy");
+		expect(prompt).toContain("RECENT");
+		expect(prompt).toContain("toolCall read (recent-call)");
+		expect(prompt).toContain("toolResult read (recent-call): recent-result");
+		expect(prompt).toContain("required system");
+		expect(prompt).toContain("CURRENT");
+	});
+
+	test("recovery trims older turns but keeps the initiating request and all completed batches", () => {
+		const ctx = context([
+			{ role: "user", content: "OBSOLETE " + "x".repeat(5000), timestamp: 1 },
+			{ role: "assistant", content: [{ type: "text", text: "Old answer" }], timestamp: 2 },
+			{ role: "user", content: "Compare a.ts and b.ts", timestamp: 3 },
+			{ role: "assistant", content: [{ type: "toolCall", id: "call-a", name: "read", arguments: { path: "a.ts" } }], timestamp: 4 },
+			{ role: "toolResult", toolCallId: "call-a", toolName: "read", content: [{ type: "text", text: "contents of a.ts" }], timestamp: 5 },
+			{ role: "assistant", content: [{ type: "toolCall", id: "call-b", name: "read", arguments: { path: "b.ts" } }], timestamp: 6 },
+			{ role: "toolResult", toolCallId: "call-b", toolName: "read", content: [{ type: "text", text: "contents of b.ts" }], timestamp: 7 },
+		] as Context["messages"], "required system");
+		const prompt = bootstrapUserInput(ctx, { contextWindow: 2400, maxTokens: 200 }).text;
+		expect(prompt).not.toContain("OBSOLETE");
+		expect(prompt).toContain("required system");
+		expect(prompt).toContain("Compare a.ts and b.ts");
+		expect(prompt).toContain("toolCall read (call-a)");
+		expect(prompt).toContain("toolResult read (call-a): contents of a.ts");
+		expect(prompt).toContain("toolCall read (call-b)");
+		expect(prompt).toContain("toolResult read (call-b): contents of b.ts");
+		expect(prompt).toContain("Current continuation request:");
+		expect(prompt).not.toContain("Current user request:");
+	});
+
+	test("recovery attaches initiating developer images and earlier completed image results in recorded order", () => {
+		const requestImage = { type: "image" as const, data: "request-payload", mimeType: "image/png" };
+		const resultImage = { type: "image" as const, data: "result-payload", mimeType: "image/jpeg" };
+		const ctx = context([
+			{ role: "user", content: "OBSOLETE " + "x".repeat(20_000), timestamp: 1 },
+			{ role: "developer", content: [{ type: "text", text: "Compare the screenshots" }, requestImage], timestamp: 2 },
+			{ role: "assistant", content: [{ type: "toolCall", id: "capture", name: "read", arguments: { path: "screenshot.png" } }], timestamp: 3 },
+			{ role: "toolResult", toolCallId: "capture", toolName: "read", content: [{ type: "text", text: "Captured screen" }, resultImage], timestamp: 4 },
+			{ role: "assistant", content: [{ type: "toolCall", id: "inspect", name: "read", arguments: { path: "notes.txt" } }], timestamp: 5 },
+			{ role: "toolResult", toolCallId: "inspect", toolName: "read", content: [{ type: "text", text: "Final text evidence" }], timestamp: 6 },
+		] as Context["messages"]);
+		const prompt = bootstrapUserInput(ctx, { contextWindow: 12_000, maxTokens: 500 });
+		expect(prompt.images).toEqual([
+			{ data: requestImage.data, mimeType: requestImage.mimeType },
+			{ data: resultImage.data, mimeType: resultImage.mimeType },
+		]);
+		expect(prompt.text).toContain("developer: Compare the screenshots [attached image 1]");
+		expect(prompt.text).toContain("toolResult read (capture): Captured screen [attached image 2]");
+		expect(prompt.text).toContain("toolCall read (capture)");
+		expect(prompt.text).toContain("toolResult read (inspect): Final text evidence");
+		expect(prompt.text).not.toContain("OBSOLETE");
+		expect(prompt.text).not.toContain(requestImage.data);
+		expect(prompt.text).not.toContain(resultImage.data);
+		expect(() => bootstrapUserInput(ctx, { contextWindow: 10_000, maxTokens: 500 })).toThrow(/context window exceeded/i);
+		const ordinary = bootstrapUserInput({ ...ctx, messages: [...ctx.messages, { role: "user", content: "New request", timestamp: 7 }] }, modelLimits);
+		expect(ordinary.images).toBeUndefined();
+		expect(ordinary.text).not.toContain("[attached image");
+	});
+
+	test.each([
+		[{ type: "audio", data: "unsupported" }],
+		[{ type: "image", mimeType: "image/png" }],
+		[{ type: "image", data: "", mimeType: "image/png" }],
+		[{ type: "image", data: "payload", mimeType: "text/plain" }],
+		[{ type: "text", text: 42 }],
+		[null],
+	])("rejects malformed or unsupported completed recovery content %j", (content) => {
+		const ctx = context([
+			{ role: "user", content: "Inspect then summarize", timestamp: 1 },
+			{ role: "assistant", content: [{ type: "toolCall", id: "earlier", name: "read", arguments: {} }], timestamp: 2 },
+			{ role: "toolResult", toolCallId: "earlier", toolName: "read", content: [content], timestamp: 3 },
+			{ role: "assistant", content: [{ type: "toolCall", id: "final", name: "read", arguments: {} }], timestamp: 4 },
+			{ role: "toolResult", toolCallId: "final", toolName: "read", content: [{ type: "text", text: "Done" }], timestamp: 5 },
+		] as unknown as Context["messages"]);
+		expect(() => bootstrapUserInput(ctx, modelLimits)).toThrow(/unsupported or malformed/i);
+	});
+
+	test("reserves output and images and fails rather than truncating required input", () => {
+		const limits = { contextWindow: 6000, maxTokens: 500 };
+		const ctx = context([{ role: "user", content: "x".repeat(1000), timestamp: 1 }], "required system");
+		expect(bootstrapUserInput(ctx, limits).text).toContain("x".repeat(1000));
+		expect(() => bootstrapUserInput(ctx, { ...limits, maxTokens: 5000 })).toThrow(/context window exceeded/i);
+		expect(() => bootstrapUserInput({ ...ctx, systemPrompt: ["s".repeat(6000)] }, limits)).toThrow(/context window exceeded/i);
+		const withImage = context([{ role: "user", content: [{ type: "text", text: "x".repeat(1000) }, { type: "image", data: "abc", mimeType: "image/png" }], timestamp: 1 }]);
+		expect(() => bootstrapUserInput(withImage, limits)).toThrow(/context window exceeded/i);
+	});
+
+	test("does not treat image encoding size as context tokens", () => {
+		const limits = { contextWindow: 200_000, maxTokens: 64_000 };
+		const png = (bytes: number) => Buffer.alloc(bytes).toString("base64");
+		const compact = context([{
+			role: "user",
+			content: [{ type: "text", text: "see" }, { type: "image", data: png(1_489), mimeType: "image/png" }],
+			timestamp: 1,
+		}]);
+		const uncompressed = context([{
+			role: "user",
+			content: [{ type: "text", text: "see" }, { type: "image", data: png(787_271), mimeType: "image/png" }],
+			timestamp: 1,
+		}]);
+		const multi = context([{
+			role: "user",
+			content: [
+				{ type: "text", text: "see" },
+				{ type: "image", data: png(787_271), mimeType: "image/png" },
+				{ type: "image", data: png(1_489), mimeType: "image/png" },
+			],
+			timestamp: 1,
+		}]);
+		expect(bootstrapUserInput(compact, limits).images).toHaveLength(1);
+		expect(bootstrapUserInput(uncompressed, limits).images?.[0]?.data.length).toBeGreaterThan(1_000_000);
+		expect(bootstrapUserInput(multi, limits).images).toHaveLength(2);
+		expect(turnPrompt({ mode: "incremental", resetAgent: false, reason: "incremental" }, uncompressed, limits).images).toHaveLength(1);
 	});
 });

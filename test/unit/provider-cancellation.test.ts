@@ -15,7 +15,7 @@ import { getMatchingResumeHandle, registerCursorSessionResume, __testUtils as re
 import { createFakeHost } from "../helpers/fake-host.ts";
 
 const ITEMS: ModelListItem[] = [{ id: "composer-2.5", displayName: "Composer 2.5" }];
-const MODEL = { id: "composer-2.5", provider: CURSOR_SDK_PROVIDER_ID, api: CURSOR_SDK_API, contextWindow: 200_000 } as Model<Api>;
+const MODEL = { id: "composer-2.5", provider: CURSOR_SDK_PROVIDER_ID, api: CURSOR_SDK_API, contextWindow: 200_000, maxTokens: 8_192 } as Model<Api>;
 const CONTEXT: Context = { messages: [{ role: "user", content: "request A", timestamp: 1 }] };
 
 function deferred<T>() {
@@ -172,7 +172,7 @@ describe("provider cancellation before prepareTurn", () => {
 				const ctx = { cwd, sessionManager: { getSessionFile: () => sessionFile, getSessionId: () => "B", getBranch: () => [], getEntries: () => [] } };
 				await handlers.get("session_start")!({}, ctx);
 				const contextB: Context = { messages: [{ role: "user", content: "committed B", timestamp: 2 }] };
-				const prepared = await runtime.prepareTurn({ cwd, agentInstanceId: "main", apiKey: "test-key", modelSelection: { id: MODEL.id }, context: contextB, grantedTools: [] });
+				const prepared = await runtime.prepareTurn({ cwd, agentInstanceId: "main", apiKey: "test-key", modelSelection: { id: MODEL.id }, modelLimits: { contextWindow: MODEL.contextWindow, maxTokens: MODEL.maxTokens }, context: contextB, grantedTools: [] });
 				runtime.commitTurn(prepared.slot, contextB, false);
 				await runtime.finishLiveKeepAgent(prepared.slot.key, "seed B");
 				await handlers.get("turn_end")!({}, ctx);

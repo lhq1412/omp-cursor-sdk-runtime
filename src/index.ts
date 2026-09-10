@@ -9,6 +9,7 @@ import { registerCursorSessionResume } from "./session-resume.js";
 import { registerCursorSessionLifecycle } from "./session-lifecycle.js";
 import { registerHostToolCatalog } from "./tool-catalog.js";
 import { recordDynamicModelFetch, registerModelControls } from "./model-controls.js";
+import { sanitizeCursorProviderError } from "./errors.js";
 
 export default async function (pi: ExtensionAPI): Promise<void> {
 	registerCursorSessionScope(pi);
@@ -35,8 +36,9 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		},
 		streamSimple: streamCursorRuntime,
 		fetchDynamicModels: async (apiKey) => {
+			let resolved: string | undefined;
 			try {
-				const resolved = resolveCursorApiKey(apiKey);
+				resolved = resolveCursorApiKey(apiKey);
 				if (!resolved) {
 					recordDynamicModelFetch(false, "No Cursor SDK API key configured; using fallback models.");
 					return fallbackModels();
@@ -45,8 +47,9 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 				recordDynamicModelFetch(true);
 				return models;
 			} catch (error) {
-				recordDynamicModelFetch(false, error instanceof Error ? error.message : String(error));
-				throw error;
+				const message = sanitizeCursorProviderError(error, resolved);
+				recordDynamicModelFetch(false, message);
+				throw new Error(message);
 			}
 		},
 	});

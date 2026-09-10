@@ -104,8 +104,12 @@ export function buildCustomTools(
 			description: tool.description,
 			inputSchema: tool.inputSchema as SDKCustomTool["inputSchema"],
 			async execute(args, context) {
-				const result = await dedupe.execute(context.toolCallId, tool.name, asRecord(args), () =>
-					execute(tool.name, asRecord(args), context.toolCallId ?? ""),
+				const prepared = prepareGrepArgs(tool.name, asRecord(args));
+				if ("error" in prepared) {
+					return hostResultToSdk({ content: [{ type: "text", text: prepared.error }], isError: true });
+				}
+				const result = await dedupe.execute(context.toolCallId, tool.name, prepared.args, () =>
+					execute(tool.name, prepared.args, context.toolCallId ?? ""),
 				);
 				return hostResultToSdk(result);
 			},
@@ -117,10 +121,28 @@ export function buildCustomTools(
 export function newBridgeRunId(): string {
 	return randomUUID();
 }
-
 function asRecord(value: unknown): Record<string, unknown> {
 	if (value !== null && typeof value === "object" && !Array.isArray(value)) {
 		return value as Record<string, unknown>;
 	}
 	return {};
+}
+
+/** Cursor grepArgs: reject empty pattern before OMP validation; compose path only when glob is set. */
+function prepareGrepArgs(name: string, args: Record<string, unknown>): { args: Record<string, unknown> } | { error: string } {
+	if (name !== "grep") return { args };
+	const pattern = args.pattern;
+	const glob = typeof args.glob === "string" ? args.glob : "";
+	if (typeof pattern !== "string" || !pattern.trim()) {
+		if (glob) {
+			return {
+				error: `grep pattern is required (received an empty pattern). To list files matching "${glob}", pass a non-empty regex (e.g. ".") and set path to that glob, or use the ls/read tool instead.`,
+			};
+		}
+		return { error: "grep pattern is required (received an empty pattern)." };
+	}
+	if (!glob) return { args };
+	const next: Record<string, unknown> = { ...args, path: `${typeof args.path === "string" && args.path ? args.path : "."}/${glob}` };
+	delete next.glob;
+	return { args: next };
 }
