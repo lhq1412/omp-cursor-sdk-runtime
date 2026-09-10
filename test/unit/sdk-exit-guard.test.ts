@@ -32,6 +32,57 @@ describe("sdk exit guard", () => {
 		expect(() => captured(2)).toThrow(ExtensionExitError);
 	});
 
+	test("host SIGINT unwraps native reallyExit through the OMP stamp", () => {
+		const nativeExit = Symbol.for("omp.postmortem.nativeProcessExit");
+		const seen: number[] = [];
+		const native = (code?: number) => {
+			seen.push(code ?? -1);
+		};
+		const guarded = (code?: number) => {
+			throw new ExtensionExitError(code);
+		};
+		Reflect.set(guarded, nativeExit, native);
+		const captured = wrapReallyExitForSdk(guarded);
+		const behind = Reflect.get(captured, nativeExit);
+		expect(typeof behind).toBe("function");
+		(behind as (code?: number) => void).call(process, 130);
+		expect(seen).toEqual([130]);
+	});
+
+	test("withSdkExitSuppressed keeps the native-exit stamp on both slots", async () => {
+		const nativeExit = Symbol.for("omp.postmortem.nativeProcessExit");
+		const originalExit = process.exit;
+		const proc = process as NodeJS.Process & { reallyExit?: (code?: number) => void };
+		const originalReally = proc.reallyExit;
+		const seen: number[] = [];
+		const native = (code?: number) => {
+			seen.push(code ?? -1);
+		};
+		const guardedExit = ((code?: number) => {
+			throw new ExtensionExitError(code, "process.exit");
+		}) as typeof process.exit;
+		const guardedReally = (code?: number) => {
+			throw new ExtensionExitError(code);
+		};
+		Reflect.set(guardedExit, nativeExit, native);
+		Reflect.set(guardedReally, nativeExit, native);
+		process.exit = guardedExit;
+		proc.reallyExit = guardedReally;
+		try {
+			await withSdkExitSuppressed(async () => {
+				process.exit(1);
+				const behind = Reflect.get(proc.reallyExit!, nativeExit);
+				(behind as (code?: number) => void).call(process, 130);
+			});
+			expect(seen).toEqual([130]);
+			expect(process.exit).toBe(guardedExit);
+			expect(proc.reallyExit).toBe(guardedReally);
+		} finally {
+			process.exit = originalExit;
+			proc.reallyExit = originalReally;
+		}
+	});
+
 	test("withSdkExitSuppressed swallows process.exit(1) from SDK teardown", async () => {
 		const original = process.exit;
 		try {
