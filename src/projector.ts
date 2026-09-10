@@ -151,12 +151,23 @@ export function reconcileRunResult(
 	result: RunResult,
 ): void {
 	if (!result.result) return;
-	// RunResult.result is the final answer, not all text from preceding tool steps.
 	const emitted = projection.answerText;
-	const suffix = result.result.startsWith(emitted) ? result.result.slice(emitted.length)
-		: emitted.startsWith(result.result) ? "" : result.result;
-	applyTextDelta(stream, partial, suffix);
-	projection.answerText = result.result;
+	const final = result.result;
+	if (final.startsWith(emitted)) {
+		applyTextDelta(stream, partial, final.slice(emitted.length));
+	} else {
+		for (let index = partial.content.length - 1; index >= 0; index -= 1) {
+			const block = partial.content[index];
+			if (block.type === "toolCall") break;
+			if (block.type === "text") {
+				block.text = final;
+				projection.answerText = final;
+				return;
+			}
+		}
+		applyTextDelta(stream, partial, final);
+	}
+	projection.answerText = final;
 }
 
 export function projectRunUsage(

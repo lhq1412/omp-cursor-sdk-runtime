@@ -263,4 +263,32 @@ describe("send policy", () => {
 		const withImage = context([{ role: "user", content: [{ type: "text", text: "x".repeat(1000) }, { type: "image", data: "abc", mimeType: "image/png" }], timestamp: 1 }]);
 		expect(() => bootstrapUserInput(withImage, limits)).toThrow(/context window exceeded/i);
 	});
+
+	test("does not treat image encoding size as context tokens", () => {
+		const limits = { contextWindow: 200_000, maxTokens: 64_000 };
+		const png = (bytes: number) => Buffer.alloc(bytes).toString("base64");
+		const compact = context([{
+			role: "user",
+			content: [{ type: "text", text: "see" }, { type: "image", data: png(1_489), mimeType: "image/png" }],
+			timestamp: 1,
+		}]);
+		const uncompressed = context([{
+			role: "user",
+			content: [{ type: "text", text: "see" }, { type: "image", data: png(787_271), mimeType: "image/png" }],
+			timestamp: 1,
+		}]);
+		const multi = context([{
+			role: "user",
+			content: [
+				{ type: "text", text: "see" },
+				{ type: "image", data: png(787_271), mimeType: "image/png" },
+				{ type: "image", data: png(1_489), mimeType: "image/png" },
+			],
+			timestamp: 1,
+		}]);
+		expect(bootstrapUserInput(compact, limits).images).toHaveLength(1);
+		expect(bootstrapUserInput(uncompressed, limits).images?.[0]?.data.length).toBeGreaterThan(1_000_000);
+		expect(bootstrapUserInput(multi, limits).images).toHaveLength(2);
+		expect(turnPrompt({ mode: "incremental", resetAgent: false, reason: "incremental" }, uncompressed, limits).images).toHaveLength(1);
+	});
 });

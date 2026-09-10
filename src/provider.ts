@@ -155,6 +155,7 @@ export function streamCursorRuntime(
 				const cancelled = waitForCancelled(live).then(() => ({ kind: "cancelled" as const }));
 				const first = await Promise.race([parked.then(() => ({ kind: "parked" as const })), finished, cancelled]);
 				if (first.kind === "cancelled" || live.cancelled) {
+					projectRunUsage(partial, live.projection, live.run?.usage);
 					partial.stopReason = "aborted";
 					partial.errorMessage = "Cancelled";
 					stream.push({ type: "error", reason: "aborted", error: partial });

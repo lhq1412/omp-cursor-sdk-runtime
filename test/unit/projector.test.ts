@@ -63,6 +63,24 @@ describe("projector", () => {
 		}
 	});
 
+	test("corrects a non-prefix final answer without duplicating earlier steps", () => {
+		const stream = createAssistantMessageEventStream();
+		for (const streamed of ["answer is 42.", "The answer 42."]) {
+			const partial = createEmptyAssistantMessage({ id: "composer-2.5" } as Model<Api>);
+			const projection: RunProjection = { answerText: "" };
+			applyInteractionUpdate(stream, partial, { type: "text-delta", text: "I'll inspect it." }, projection);
+			applyToolCall(stream, partial, { id: "read-1", name: "read", arguments: {} });
+			applyInteractionUpdate(stream, partial, { type: "step-started", stepId: 2 }, projection);
+			applyInteractionUpdate(stream, partial, { type: "text-delta", text: streamed }, projection);
+			reconcileRunResult(stream, partial, projection, { id: "run", status: "finished", result: "The answer is 42." });
+			expect(partial.content).toEqual([
+				{ type: "text", text: "I'll inspect it." },
+				{ type: "toolCall", id: "read-1", name: "read", arguments: {} },
+				{ type: "text", text: "The answer is 42." },
+			]);
+		}
+	});
+
 	test("accounts cumulative usage once across parked messages and keeps unknowns honest", () => {
 		const model = { id: "composer-2.5" } as Model<Api>;
 		const projection: RunProjection = { answerText: "" };

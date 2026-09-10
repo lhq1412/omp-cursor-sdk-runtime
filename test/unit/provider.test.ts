@@ -332,6 +332,63 @@ describe("streamCursorRuntime model selection", () => {
 		});
 	});
 
+	test("abort after parked continuation records only newly reported usage", async () => {
+		let usage: TokenUsage = { inputTokens: 100, outputTokens: 10, cacheReadTokens: 20, cacheWriteTokens: 5, totalTokens: 135 };
+		const { promise: afterResume, resolve: resumed } = Promise.withResolvers<void>();
+		installCapturingAgent([], [], async (options) => {
+			const tool = options?.local?.customTools?.read;
+			if (!tool) return finishedRun();
+			const pending = tool.execute({ path: "a.ts" }, { toolCallId: "call-1" });
+			return {
+				id: "run-current",
+				get usage() {
+					return usage;
+				},
+				supports: (feature: string) => feature === "cancel",
+				cancel: async () => undefined,
+				wait: async () => {
+					await pending;
+					usage = { inputTokens: 160, outputTokens: 18, cacheReadTokens: 20, cacheWriteTokens: 5, totalTokens: 203 };
+					resumed();
+					await new Promise(() => undefined);
+					return { id: "run-current", status: "cancelled", usage } as RunResult;
+				},
+			} as unknown as Run;
+		});
+		const first = await drain(cursorModel("composer-2.5", 1_000_000), userContext("hi", [readTool()]), {
+			apiKey: "test-key",
+			cwd: "/tmp/project",
+		});
+		expect(first.at(-1)).toMatchObject({ type: "done", reason: "toolUse", message: { usage: { totalTokens: 135 } } });
+		const controller = new AbortController();
+		const second = drain(
+			cursorModel("composer-2.5", 200_000),
+			{
+				messages: [
+					{ role: "user", content: "hi", timestamp: 1 } as Context["messages"][number],
+					{
+						role: "toolResult",
+						toolCallId: "call-1",
+						toolName: "read",
+						content: [{ type: "text", text: "ok" }],
+						isError: false,
+						timestamp: 2,
+					},
+				],
+				tools: [readTool()],
+			} as Context,
+			{ apiKey: "test-key", cwd: "/tmp/project", signal: controller.signal },
+		);
+		await afterResume;
+		controller.abort();
+		const events = await second;
+		expect(events.at(-1)).toMatchObject({
+			type: "error",
+			reason: "aborted",
+			error: { stopReason: "aborted", usage: { input: 60, output: 8, cacheRead: 0, cacheWrite: 0, totalTokens: 68 } },
+		});
+	});
+
 	test("reconstructs a lost parked run on a fresh agent without replaying completed tools", async () => {
 		const opened: Array<string | undefined> = [];
 		const sent: Array<{ agentId: string; message: unknown; model: ModelSelection | undefined }> = [];

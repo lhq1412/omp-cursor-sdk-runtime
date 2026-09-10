@@ -218,12 +218,10 @@ function inputTextBudget(current: SDKUserMessage, limits: ModelInputLimits): num
 	if (typeof limits.contextWindow !== "number" || typeof limits.maxTokens !== "number" || !Number.isSafeInteger(limits.contextWindow) || !Number.isSafeInteger(limits.maxTokens) || limits.contextWindow <= 0 || limits.maxTokens < 0) {
 		throw new Error("Cursor SDK model context/output limits are unknown or invalid");
 	}
-	// Image accounting is intentionally conservative: reserve at least 4096 tokens per image,
-	// or its encoded payload size if larger. SDK image tokenization is not public.
-	const imageReserve = current.images?.reduce((sum, image) => sum + Math.max(4096, "data" in image ? estimatedTextTokens(image.data) : 4096), 0) ?? 0;
-	const budget = limits.contextWindow - limits.maxTokens - imageReserve - 1024;
-	if (budget < 0) throwContextOverflow();
-	return budget;
+	// ponytail: 4096/image reserve for history trim only; SDK image tokens are unpublished.
+	// Encoded payload bytes are not tokens and must not hard-fail as context overflow.
+	const imageReserve = (current.images?.length ?? 0) * 4096;
+	return Math.max(0, limits.contextWindow - limits.maxTokens - imageReserve - 1024);
 }
 
 /**
