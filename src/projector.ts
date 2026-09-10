@@ -44,14 +44,17 @@ export function createEmptyAssistantMessage(model: Model<Api>): CursorAssistantM
 	};
 }
 
-export function applyTextDelta(stream: AssistantMessageEventStream, partial: AssistantMessage, text: string): void {
+export function applyTextDelta(stream: AssistantMessageEventStream, partial: AssistantMessage, text: string, startNew = false): void {
 	if (!text) return;
 	const lastIndex = partial.content.length - 1;
 	const last = partial.content[lastIndex];
-	if (last?.type === "text") {
+	if (last?.type === "text" && !startNew) {
 		last.text += text;
 		stream.push({ type: "text_delta", contentIndex: lastIndex, delta: text, partial });
 		return;
+	}
+	if (last?.type === "text") {
+		endLastOpenBlock(stream, partial);
 	}
 	partial.content.push({ type: "text", text });
 	const contentIndex = partial.content.length - 1;
@@ -80,6 +83,7 @@ export function applyInteractionUpdate(
 	update: InteractionUpdate,
 	projection?: RunProjection,
 ): void {
+	const startNew = Boolean(projection && update.type === "text-delta" && projection.answerText === "");
 	if (projection) {
 		if (update.type === "step-started" && update.stepId !== projection.stepId) {
 			projection.stepId = update.stepId;
@@ -95,7 +99,7 @@ export function applyInteractionUpdate(
 		}
 	}
 	if (update.type === "text-delta") {
-		applyTextDelta(stream, partial, update.text);
+		applyTextDelta(stream, partial, update.text, startNew);
 		return;
 	}
 	if (update.type === "thinking-delta") {
@@ -154,7 +158,7 @@ export function reconcileRunResult(
 	const emitted = projection.answerText;
 	const final = result.result;
 	if (final.startsWith(emitted)) {
-		applyTextDelta(stream, partial, final.slice(emitted.length));
+		applyTextDelta(stream, partial, final.slice(emitted.length), emitted === "");
 	} else {
 		for (let index = partial.content.length - 1; index >= 0; index -= 1) {
 			const block = partial.content[index];

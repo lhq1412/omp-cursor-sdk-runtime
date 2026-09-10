@@ -81,6 +81,22 @@ describe("projector", () => {
 		}
 	});
 
+	test("keeps prior-step text when a later answer is corrected without a toolCall separator", () => {
+		const stream = createAssistantMessageEventStream();
+		const partial = createEmptyAssistantMessage({ id: "composer-2.5" } as Model<Api>);
+		const projection: RunProjection = { answerText: "" };
+		applyInteractionUpdate(stream, partial, { type: "step-started", stepId: 1 }, projection);
+		applyInteractionUpdate(stream, partial, { type: "text-delta", text: "Earlier commentary.\n" }, projection);
+		applyInteractionUpdate(stream, partial, { type: "step-started", stepId: 2 }, projection);
+		applyInteractionUpdate(stream, partial, { type: "step-started", stepId: 3 }, projection);
+		applyInteractionUpdate(stream, partial, { type: "text-delta", text: "answer is 42." }, projection);
+		reconcileRunResult(stream, partial, projection, { id: "run", status: "finished", result: "The answer is 42." });
+		expect(partial.content).toEqual([
+			{ type: "text", text: "Earlier commentary.\n" },
+			{ type: "text", text: "The answer is 42." },
+		]);
+	});
+
 	test("accounts cumulative usage once across parked messages and keeps unknowns honest", () => {
 		const model = { id: "composer-2.5" } as Model<Api>;
 		const projection: RunProjection = { answerText: "" };
