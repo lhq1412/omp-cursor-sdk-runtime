@@ -20,12 +20,13 @@ import { trailingToolResults } from "./omp-tools.js";
 import { withSdkExitSuppressed } from "./sdk-exit-guard.js";
 import { openAgent, type OpenAgentInput } from "./sdk-session.js";
 import { flushResumeHandleNow, getMatchingResumeHandle, persistResumeHandle, type ResumeStoreIdentity } from "./session-resume.js";
-import { getCursorSessionCwd, getCursorSessionScopeKey } from "./session-scope.js";
+import { getCursorSessionCwd, getCursorSessionOwner, getCursorSessionScopeKey, withCursorSessionOwner, type CursorSessionOwner } from "./session-scope.js";
 import { openScopedJsonlStore, storeRootForScope } from "./store.js";
 import { buildCustomTools, newBridgeRunId } from "./tools.js";
 
 export interface RuntimeSlot {
 	key: string;
+	owner: CursorSessionOwner;
 	scopeKey: string;
 	agentInstanceId: string;
 	cwd: string;
@@ -72,6 +73,7 @@ function getOrCreateSlot(scopeKey: string, agentInstanceId: string, cwd: string)
 	}
 	const slot: RuntimeSlot = {
 		key,
+		owner: getCursorSessionOwner(),
 		scopeKey,
 		agentInstanceId,
 		cwd,
@@ -146,9 +148,9 @@ function persistDirtyHandle(slot: RuntimeSlot, handle: {
 		...(handle.credentialScopeId ? { credentialScopeId: handle.credentialScopeId } : {}),
 	};
 	try {
-		flushResumeHandleNow(dirty);
+		withCursorSessionOwner(slot.owner, () => flushResumeHandleNow(dirty));
 	} catch {
-		persistResumeHandle(dirty);
+		withCursorSessionOwner(slot.owner, () => persistResumeHandle(dirty));
 	}
 }
 
@@ -168,16 +170,16 @@ function invalidateBindingBeforeSend(slot: RuntimeSlot, agentId: string): void {
 	if (!slot.createCwd) {
 		throw new Error("Cannot invalidate a Cursor SDK binding without the agent's execution cwd");
 	}
-	flushResumeHandleNow({
+	withCursorSessionOwner(slot.owner, () => flushResumeHandleNow({
 		agentId,
 		poolKey: slot.agentInstanceId,
 		sendState: { ...slot.sendState },
 		storeIdentity: slot.storeIdentity,
 		state: "in-flight",
 		agentInstanceId: slot.agentInstanceId,
-		cwd: slot.createCwd,
+		cwd: slot.createCwd!,
 		...(slot.credentialScopeId ? { credentialScopeId: slot.credentialScopeId } : {}),
-	});
+	}));
 	slot.bindingState = "in-flight";
 }
 
@@ -316,17 +318,8 @@ export function commitTurn(slot: RuntimeSlot, context: Context, incremental: boo
 		incrementalSendCount: incremental ? slot.sendState.incrementalSendCount + 1 : 0,
 	};
 	slot.bindingState = "committed";
-	if (!slot.agent || !slot.createCwd) return;
-	persistResumeHandle({
-		agentId: slot.agent.agentId,
-		poolKey: slot.agentInstanceId,
-		sendState: { ...slot.sendState },
-		storeIdentity: slot.storeIdentity,
-		state: "committed",
-		agentInstanceId: slot.agentInstanceId,
-		cwd: slot.createCwd,
-		...(slot.credentialScopeId ? { credentialScopeId: slot.credentialScopeId } : {}),
-	});
+	const pending = resumePending(slot, "committed");
+	if (pending) withCursorSessionOwner(slot.owner, () => persistResumeHandle(pending));
 }
 
 export function markTurnDirty(slot: RuntimeSlot): void {
@@ -336,9 +329,9 @@ export function markTurnDirty(slot: RuntimeSlot): void {
 	const dirty = resumePending(slot, "dirty");
 	if (dirty) {
 		try {
-			flushResumeHandleNow(dirty);
+			withCursorSessionOwner(slot.owner, () => flushResumeHandleNow(dirty));
 		} catch {
-			persistResumeHandle(dirty);
+			withCursorSessionOwner(slot.owner, () => persistResumeHandle(dirty));
 		}
 	}
 	slot.agent = undefined;
@@ -358,13 +351,15 @@ export async function finishTurnFailed(slot: RuntimeSlot, reason: string): Promi
 
 export function invalidateRuntime(_reason: string): void {
 	for (const slot of slots.values()) {
+		if (slot.owner !== getCursorSessionOwner()) continue;
 		const agent = slot.agent;
 		markTurnDirty(slot);
 		slot.sendState = emptySendState();
 		if (agent) void disposeAgent(agent);
 	}
-	for (const key of slots.keys()) {
-		void disposeLiveRun(key, "runtime invalidated", false);
+	for (const slot of slots.values()) {
+		if (slot.owner !== getCursorSessionOwner()) continue;
+		void disposeLiveRun(slot.key, "runtime invalidated", false);
 	}
 }
 
@@ -379,7 +374,7 @@ export async function disposeRuntimeForScope(scopeKey = getCursorSessionScopeKey
 }
 
 export async function disposeRuntimeForShutdown(): Promise<void> {
-	const pending = Promise.all([...new Set([...slots.values()].map((slot) => slot.scopeKey))].map((scopeKey) => disposeRuntimeForScope(scopeKey)));
+	const pending = disposeRuntimeForScope();
 	await Promise.race([pending, new Promise<void>((resolve) => setTimeout(resolve, 1500))]);
 }
 

@@ -19,7 +19,7 @@ import {
 	type PreparedTurn,
 } from "../../src/session-runtime.ts";
 import { __testUtils as liveRunTestUtils } from "../../src/live-run.ts";
-import { __testUtils as scopeTestUtils } from "../../src/session-scope.ts";
+import { __testUtils as scopeTestUtils, getCursorSessionOwner, ownerForRequest, withCursorSessionOwner } from "../../src/session-scope.ts";
 import { parseResumeEntryData, registerCursorSessionResume, __testUtils as resumeTestUtils } from "../../src/session-resume.ts";
 
 const modelLimits = { contextWindow: 200_000, maxTokens: 20_000 };
@@ -65,7 +65,7 @@ function toolResultContext(): Context {
 	} as Context;
 }
 
-function registerResume(mode: "write" | "swallow" = "write"): {
+function registerResume(mode: "write" | "swallow" = "write", sessionId = "sess-1"): {
 	appended: Array<{ type: string; data: unknown }>;
 	sessionFile: string;
 	handlers: Map<string, Array<(event: unknown, ctx: unknown) => unknown>>;
@@ -76,13 +76,13 @@ function registerResume(mode: "write" | "swallow" = "write"): {
 	const handlers = new Map<string, Array<(event: unknown, ctx: unknown) => unknown>>();
 	const sessionFile = join(mkdtempSync(join(tmpdir(), "omp-csr-")), "session.jsonl");
 	writeFileSync(sessionFile, "");
-	scopeTestUtils.set("/tmp/project", sessionFile, "sess-1");
+	scopeTestUtils.set("/tmp/project", sessionFile, sessionId);
 	const branch: Array<{ type: string; id: string; parentId: string | null; customType?: string; data?: unknown; message?: { role: string } }> = [];
 	const ctx = {
 		cwd: "/tmp/project",
 		sessionManager: {
 			getSessionFile: () => sessionFile,
-			getSessionId: () => "sess-1",
+			getSessionId: () => sessionId,
 			getBranch: () => branch,
 			getEntries: () => branch,
 		},
@@ -130,6 +130,78 @@ function seedCommittedHandle(sessionFile: string, context: Context, agentId = "a
 }
 
 describe("session runtime", () => {
+	test("child invalidation cannot abort a parent preparation or redirect its committed writer", async () => {
+		runtimeTestUtils.clear();
+		liveRunTestUtils.clear();
+		scopeTestUtils.reset();
+		const parent = registerResume("write", "parent");
+		const parentOwner = getCursorSessionOwner();
+		let opened!: () => void;
+		let finishOpen!: () => void;
+		const opening = new Promise<void>((resolve) => { opened = resolve; });
+		const gate = new Promise<void>((resolve) => { finishOpen = resolve; });
+		runtimeTestUtils.setOpenAgent(async () => {
+			if (getCursorSessionOwner() === parentOwner) {
+				opened();
+				await gate;
+				return fakeAgent("agent-parent");
+			}
+			return fakeAgent("agent-child");
+		});
+		const input = {
+			cwd: "/tmp/project", agentInstanceId: "main", apiKey: "test-key",
+			modelSelection: { id: "composer-2.5" }, modelLimits,
+			context: userContext("parent request"), grantedTools: [],
+		};
+		const parentTurn = withCursorSessionOwner(parentOwner, () => prepareTurn(input));
+		await opening;
+		const child = registerResume("write", "child");
+		const childTurn = await prepareTurn({ ...input, context: userContext("child request") });
+		invalidateRuntime("child compacted");
+		finishOpen();
+		const prepared = await parentTurn;
+		expect(prepared.slot.preparation?.signal.aborted).toBe(false);
+		expect(childTurn.slot.preparation?.signal.aborted).toBe(true);
+		// Commit deliberately runs while the caller owns the child.
+		commitTurn(prepared.slot, input.context, false);
+		await parent.handlers.get("turn_end")?.[0]?.({}, parent.ctx);
+		const parentCommit = parent.appended.find((entry) => parseResumeEntryData(entry.data)?.state === "committed");
+		expect(parentCommit?.data).toMatchObject({
+			agentId: "agent-parent", scopeKey: parent.sessionFile, sessionId: "parent",
+		});
+		expect(child.appended.some((entry) => parseResumeEntryData(entry.data)?.agentId === "agent-parent")).toBe(false);
+		await disposeRuntimeForScope(parentOwner.scopeKey);
+		await disposeRuntimeForScope(childTurn.slot.scopeKey);
+	});
+
+	test("a one-shot title owner never reuses or persists the parent agent", async () => {
+		runtimeTestUtils.clear();
+		liveRunTestUtils.clear();
+		scopeTestUtils.reset();
+		const parent = registerResume("write", "parent");
+		const parentOwner = getCursorSessionOwner();
+		let opens = 0;
+		runtimeTestUtils.setOpenAgent(async () => fakeAgent(`agent-${++opens}`));
+		const input = {
+			cwd: "/tmp/project", agentInstanceId: "main", apiKey: "test-key",
+			modelSelection: { id: "composer-2.5" }, modelLimits,
+			context: userContext("parent request"), grantedTools: [],
+		};
+		const parentTurn = await prepareTurn(input);
+		const titleOwner = ownerForRequest();
+		const titleTurn = await withCursorSessionOwner(titleOwner, () => prepareTurn({
+			...input, context: userContext("generate title"),
+		}));
+		commitTurn(titleTurn.slot, input.context, false);
+		await withCursorSessionOwner(titleOwner, () => disposeRuntimeForScope());
+		expect(parentTurn.slot.preparation?.signal.aborted).toBe(false);
+		expect(opens).toBe(2);
+		commitTurn(parentTurn.slot, input.context, false);
+		await parent.handlers.get("turn_end")?.[0]?.({}, parent.ctx);
+		expect(parent.appended.map((entry) => parseResumeEntryData(entry.data)?.agentId)).toEqual(["agent-1"]);
+		await disposeRuntimeForScope(parentOwner.scopeKey);
+	});
+
 	for (const interruption of ["abort", "scope", "invalidate", "newer"] as const) {
 		test(`late initialization cannot attach after ${interruption}`, async () => {
 			runtimeTestUtils.clear();

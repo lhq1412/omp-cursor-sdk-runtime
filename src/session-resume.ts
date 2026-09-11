@@ -5,7 +5,7 @@ import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import { CURSOR_SESSION_AGENT_RESUME_ENTRY_TYPE } from "./constants.js";
 import type { BindingState } from "./contracts.js";
 import type { SendState } from "./context.js";
-import { getCursorSessionScopeKey } from "./session-scope.js";
+import { getCursorSessionOwner, getCursorSessionScopeKey, sessionEvents, type CursorSessionOwner } from "./session-scope.js";
 
 export const RESUME_ENTRY_VERSION = 3;
 
@@ -295,15 +295,28 @@ export function foldResumeHandle(
 	return fold;
 }
 
-const state: ResumeState = {
-	scopeKey: getCursorSessionScopeKey(),
-	cwd: process.cwd(),
-	branchPathHash: EMPTY_BRANCH_HASH,
-	compactionGeneration: 0,
-	unownedUserEntryIds: new Set(),
-};
+const states = new WeakMap<CursorSessionOwner, ResumeState>();
+
+function getResumeState(): ResumeState {
+	const owner = getCursorSessionOwner();
+	let state = states.get(owner);
+	if (!state) {
+		state = {
+			scopeKey: owner.scopeKey,
+			sessionFile: owner.sessionFile,
+			sessionId: owner.sessionId,
+			cwd: owner.cwd,
+			branchPathHash: EMPTY_BRANCH_HASH,
+			compactionGeneration: 0,
+			unownedUserEntryIds: new Set(),
+		};
+		states.set(owner, state);
+	}
+	return state;
+}
 
 function restoreFromBranch(branch: readonly ResumeSessionEntry[], allEntries: readonly ResumeSessionEntry[] = branch): void {
+	const state = getResumeState();
 	const fold = foldResumeHandle(branch, state, state.unownedUserEntryIds, allEntries);
 	state.branchPathHash = fold.branchPathHash;
 	state.compactionGeneration = fold.compactionGeneration;
@@ -311,18 +324,21 @@ function restoreFromBranch(branch: readonly ResumeSessionEntry[], allEntries: re
 }
 
 export function getResumeCompactionGeneration(): number {
+	const state = getResumeState();
 	return state.compactionGeneration;
 }
 
 export function getResumeBranchPathHash(): string {
+	const state = getResumeState();
 	return state.branchPathHash;
 }
 
 export function getMatchingResumeHandle(
 	poolKey: string,
 	credentialScopeId?: string,
-	cwd = state.cwd,
+	cwd = getResumeState().cwd,
 ): ResumeEntryData | undefined {
+	const state = getResumeState();
 	const handle = state.activeHandle;
 	if (!handle || !isLocalAgentId(handle.agentId)) return undefined;
 	if (handle.state !== "committed") return undefined;
@@ -340,6 +356,8 @@ export function getMatchingResumeHandle(
 }
 
 export function persistResumeHandle(input: PendingResumeHandle): void {
+	const state = getResumeState();
+	if (!getCursorSessionOwner().persistent) return;
 	if (!isLocalAgentId(input.agentId)) return;
 	state.pendingHandle = {
 		agentId: input.agentId,
@@ -354,6 +372,7 @@ export function persistResumeHandle(input: PendingResumeHandle): void {
 }
 
 function resumeEntryFromPending(pending: PendingResumeHandle): ResumeEntryData {
+	const state = getResumeState();
 	return {
 		version: RESUME_ENTRY_VERSION,
 		runtime: "local",
@@ -379,6 +398,8 @@ function resumeEntryFromPending(pending: PendingResumeHandle): ResumeEntryData {
  * binding before the SDK agent is advanced. Failure must not start send.
  */
 export function flushResumeHandleNow(input: PendingResumeHandle): void {
+	const state = getResumeState();
+	if (!getCursorSessionOwner().persistent) return;
 	if (!isLocalAgentId(input.agentId)) {
 		throw new Error("Cannot persist a Cursor SDK resume handle without a local agent id");
 	}
@@ -403,6 +424,7 @@ export function flushResumeHandleNow(input: PendingResumeHandle): void {
 }
 
 function flushPendingHandle(branch: readonly ResumeSessionEntry[]): void {
+	const state = getResumeState();
 	restoreFromBranch(branch);
 	const pending = state.pendingHandle;
 	state.pendingHandle = undefined;
@@ -426,12 +448,18 @@ function restoreFromSessionManager(sessionManager: {
 }
 
 export function registerCursorSessionResume(pi: Pick<ExtensionAPI, "on" | "appendEntry">): void {
-	// Keep `this` on the ExtensionAPI. Detaching `pi.appendEntry` makes OMP
-	// evaluate `this.runtime.appendEntry` against the wrong object.
-	state.appendEntry = (customType, data) => {
-		pi.appendEntry(customType, data);
-	};
-	pi.on("session_start", (_event, ctx) => {
+	const on = sessionEvents(pi);
+	on("session_start", (_event, ctx) => {
+		const state = getResumeState();
+		// Capture the extension writer and its session identity together.
+		const sessionId = ctx.sessionManager.getSessionId?.();
+		const sessionFile = ctx.sessionManager.getSessionFile?.();
+		state.appendEntry = (customType, data) => {
+			if (ctx.sessionManager.getSessionId?.() !== sessionId || ctx.sessionManager.getSessionFile?.() !== sessionFile) {
+				throw new Error("Cannot persist Cursor SDK resume state after its session changed");
+			}
+			pi.appendEntry(customType, data);
+		};
 		state.scopeKey = getCursorSessionScopeKey();
 		state.sessionFile = ctx.sessionManager.getSessionFile?.() ?? undefined;
 		state.sessionId = ctx.sessionManager.getSessionId?.() ?? undefined;
@@ -443,13 +471,14 @@ export function registerCursorSessionResume(pi: Pick<ExtensionAPI, "on" | "appen
 		);
 		restoreFromSessionManager(ctx.sessionManager);
 	});
-	pi.on("before_agent_start", (_event, ctx) => {
+	on("before_agent_start", (_event, ctx) => {
 		restoreFromSessionManager(ctx.sessionManager);
 	});
-	pi.on("turn_end", (_event, ctx) => {
+	on("turn_end", (_event, ctx) => {
 		flushPendingHandle(ctx.sessionManager.getBranch());
 	});
-	pi.on("session_tree", (_event, ctx) => {
+	on("session_tree", (_event, ctx) => {
+		const state = getResumeState();
 		for (const entry of ctx.sessionManager.getBranch()) {
 			if (entry.type === "message" && "message" in entry && entry.message.role === "user") {
 				state.unownedUserEntryIds.add(entry.id);
@@ -457,7 +486,8 @@ export function registerCursorSessionResume(pi: Pick<ExtensionAPI, "on" | "appen
 		}
 		restoreFromSessionManager(ctx.sessionManager);
 	});
-	pi.on("session_compact", (event, ctx) => {
+	on("session_compact", (event, ctx) => {
+		const state = getResumeState();
 		state.pendingHandle = undefined;
 		const branch = ctx.sessionManager.getBranch();
 		if (branch.length > 0) {
@@ -471,6 +501,7 @@ export function registerCursorSessionResume(pi: Pick<ExtensionAPI, "on" | "appen
 }
 
 export function clearResumeHandle(): void {
+	const state = getResumeState();
 	state.activeHandle = undefined;
 	state.pendingHandle = undefined;
 }
@@ -478,6 +509,7 @@ export function clearResumeHandle(): void {
 export const __testUtils = {
 	EMPTY_BRANCH_HASH,
 	reset() {
+		const state = getResumeState();
 		state.appendEntry = undefined;
 		state.scopeKey = getCursorSessionScopeKey();
 		state.sessionFile = undefined;
@@ -489,5 +521,5 @@ export const __testUtils = {
 		state.pendingHandle = undefined;
 		state.unownedUserEntryIds = new Set();
 	},
-	state,
+	get state() { return getResumeState(); },
 };

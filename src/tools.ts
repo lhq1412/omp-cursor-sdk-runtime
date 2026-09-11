@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { SDKCustomTool, SDKCustomToolResult } from "@cursor/sdk";
+import { sanitizeSchemaForCursor } from "@oh-my-pi/pi-ai/utils/schema";
 import type { GrantedTool, HostToolResult } from "./contracts.js";
 import { toolNameHash } from "./tool-catalog.js";
 
@@ -100,9 +101,11 @@ export function buildCustomTools(
 	for (const tool of grantedTools) {
 		if (tool.inputSchema.type !== "object") continue;
 		const sdkName = uniqueSdkToolName(tool.name, usedNames);
+		const inputSchema = sanitizeSchemaForCursor(tool.inputSchema);
+		if (inputSchema.type !== "object") continue;
 		tools[sdkName] = {
 			description: tool.description,
-			inputSchema: tool.inputSchema as SDKCustomTool["inputSchema"],
+			inputSchema: inputSchema as SDKCustomTool["inputSchema"],
 			async execute(args, context) {
 				const prepared = prepareGrepArgs(tool.name, asRecord(args));
 				if ("error" in prepared) {

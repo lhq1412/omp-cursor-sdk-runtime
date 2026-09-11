@@ -108,7 +108,7 @@ function param(selection: ModelSelection | undefined, id: string): string | unde
 
 async function drain(model: Model<Api>, context: Context, options?: SimpleStreamOptions) {
 	const events = [];
-	for await (const event of streamCursorRuntime(model, context, options)) {
+	for await (const event of streamCursorRuntime(model, context, { ...options, onPayload: options?.onPayload ?? scopeTestUtils.bindRequest })) {
 		events.push(event);
 	}
 	return events;
@@ -294,7 +294,7 @@ describe("streamCursorRuntime model selection", () => {
 			cwd: "/tmp/project",
 		});
 		expect(first.at(-1)).toMatchObject({ type: "done", reason: "toolUse" });
-		expect(first.at(-1)).toMatchObject({ message: { usage: { input: 100, output: 10, cacheRead: 20, cacheWrite: 5, totalTokens: 135 } } });
+		expect(first.at(-1)).toMatchObject({ message: { usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 135, orchestration: { input: 105, output: 10, cacheRead: 20 } } } });
 		expect(created).toHaveLength(1);
 		expect(sent).toHaveLength(1);
 		catalogTestUtils.resetCatalog();
@@ -326,7 +326,7 @@ describe("streamCursorRuntime model selection", () => {
 			type: "done",
 			message: {
 				content: [{ type: "text", text: "All done." }],
-				usage: { input: 40, output: 6, cacheRead: 10, cacheWrite: 0, totalTokens: 56 },
+				usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 56, orchestration: { input: 40, output: 6, cacheRead: 10 } },
 				cursorSdk: { tokenUsage: "actual", cost: "unavailable" },
 			},
 		});
@@ -385,7 +385,7 @@ describe("streamCursorRuntime model selection", () => {
 		expect(events.at(-1)).toMatchObject({
 			type: "error",
 			reason: "aborted",
-			error: { stopReason: "aborted", usage: { input: 60, output: 8, cacheRead: 0, cacheWrite: 0, totalTokens: 68 } },
+			error: { stopReason: "aborted", usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 68, orchestration: { input: 60, output: 8, cacheRead: 0 } } },
 		});
 	});
 

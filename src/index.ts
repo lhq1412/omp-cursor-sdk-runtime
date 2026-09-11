@@ -13,12 +13,12 @@ import { sanitizeCursorProviderError } from "./errors.js";
 import { registerCursorToolCallIds } from "./context.js";
 
 export default async function (pi: ExtensionAPI): Promise<void> {
-	registerCursorSessionScope(pi);
 	registerCursorSessionResume(pi);
 	registerCursorSessionLifecycle(pi);
 	registerHostToolCatalog(pi);
 	registerModelControls(pi);
 	registerCursorToolCallIds(pi);
+	registerCursorSessionScope(pi);
 	pi.registerProvider(CURSOR_SDK_PROVIDER_ID, {
 		baseUrl: "https://cursor.com",
 		api: CURSOR_SDK_API,

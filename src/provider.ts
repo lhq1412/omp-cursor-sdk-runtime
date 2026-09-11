@@ -18,8 +18,8 @@ import {
 	bindLiveAbort,
 	getLiveRun,
 } from "./live-run.js";
-import { commitTurn, finishLiveKeepAgent, finishTurnFailed, getRuntimeSlot, prepareTurn, runtimeKey, type RuntimeSlot } from "./session-runtime.js";
-import { getCursorSessionCwd } from "./session-scope.js";
+import { commitTurn, disposeRuntimeForScope, finishLiveKeepAgent, finishTurnFailed, getRuntimeSlot, prepareTurn, runtimeKey, type RuntimeSlot } from "./session-runtime.js";
+import { captureCursorRequestOwner, getCursorSessionCwd, ownerForRequest, withCursorSessionOwner, type CursorSessionOwner } from "./session-scope.js";
 import { withSdkExitSuppressed } from "./sdk-exit-guard.js";
 import { ensureCursorModels, getModelMetadata, buildModelSelection } from "./catalog.js";
 import { getFastMode } from "./model-controls.js";
@@ -34,6 +34,8 @@ import {
 	projectRunUsage,
 	reconcileRunResult,
 } from "./projector.js";
+
+const bridgeOwners = new Map<string, { owner: CursorSessionOwner; signal: AbortSignal; onAbort: () => void }>();
 
 function selectionForTurn(model: Model<Api>, apiKey: string, options?: SimpleStreamOptions): ModelSelection {
 	const thinkingLevel = options?.disableReasoning ? "off" : (options?.reasoning ?? "off");
@@ -60,9 +62,15 @@ export function streamCursorRuntime(
 		let slot: RuntimeSlot | undefined;
 		let abortSignal = options?.signal;
 		let apiKey: string | undefined;
+		let owner: CursorSessionOwner | undefined;
+		let ownerGeneration: number | undefined;
+		let auxiliary = false;
 		const assertCurrent = () => {
 			abortSignal?.throwIfAborted();
 			slot?.preparation?.signal.throwIfAborted();
+			if (owner && ownerGeneration !== undefined && owner.generation !== ownerGeneration) {
+				throw new Error("Cursor SDK session changed during the request");
+			}
 			if (slot && getRuntimeSlot(slot.key) !== slot) throw new Error("Cursor SDK turn was superseded");
 		};
 		try {
@@ -70,94 +78,130 @@ export function streamCursorRuntime(
 			abortSignal = host?.signal && options?.signal ? AbortSignal.any([host.signal, options.signal]) : host?.signal ?? options?.signal;
 			abortSignal?.throwIfAborted();
 			const snapshot = host?.snapshot();
-			const cwd = snapshot?.cwd ?? (typeof options?.cwd === "string" && options.cwd ? options.cwd : getCursorSessionCwd());
-			const agentInstanceId = snapshot?.agentInstanceId ?? DEFAULT_AGENT_INSTANCE_ID;
-			apiKey = requireCursorApiKey(typeof options?.apiKey === "string" ? options.apiKey : undefined);
-			const grantedTools = snapshot
-				? [...snapshot.grantedTools]
-				: mergeGrantedTools(grantedToolsFromContext(context));
-			stream.push({ type: "start", partial });
-
-			let modelSelection: ModelSelection | undefined;
-			if (trailingToolResults(context).length === 0 || !getLiveRun(runtimeKey(undefined, agentInstanceId))) {
-				const discovery = ensureCursorModels(apiKey);
-				if (abortSignal) {
-					const signal = abortSignal;
-					let onAbort: (() => void) | undefined;
-					const cancelled = new Promise<void>((resolve) => {
-						onAbort = resolve;
-						signal.addEventListener("abort", onAbort, { once: true });
-						if (signal.aborted) resolve();
-					});
-					try {
-						await Promise.race([discovery, cancelled]);
-					} finally {
-						if (onAbort) signal.removeEventListener("abort", onAbort);
-					}
-				} else {
-					await discovery;
+			const request = await captureCursorRequestOwner(() => options?.onPayload?.(context, model));
+			if (request.value !== undefined && request.value !== null) {
+				if (typeof request.value !== "object" || !("messages" in request.value) || !Array.isArray(request.value.messages)) {
+					throw new Error("Cursor SDK onPayload must return a Context with a messages array");
 				}
-				abortSignal?.throwIfAborted();
-				modelSelection = selectionForTurn(model, apiKey, options);
+				context = request.value as Context;
 			}
-			abortSignal?.throwIfAborted();
-			const prepared = await prepareTurn({
-				cwd,
-				agentInstanceId,
-				apiKey,
-				modelSelection,
-				modelLimits: { contextWindow: model.contextWindow, maxTokens: model.maxTokens },
-				context,
-				grantedTools,
-				host,
-				signal: abortSignal,
-			});
-			const { slot: preparedSlot, live, continuing, customTools, prompt, incremental } = prepared;
-			slot = preparedSlot;
+			owner = request.owner;
+			if (!owner && host && snapshot) {
+				const key = JSON.stringify([snapshot.sessionId, snapshot.agentInstanceId]);
+				const previous = bridgeOwners.get(key);
+				previous?.signal.removeEventListener("abort", previous.onAbort);
+				const bridgeOwner = previous?.owner ?? ownerForRequest(snapshot.sessionId, snapshot.cwd);
+				const signal = abortSignal ?? host.signal;
+				const binding = {
+					owner: bridgeOwner,
+					signal,
+					onAbort: (): void => {
+						if (bridgeOwners.get(key) !== binding) return;
+						bridgeOwners.delete(key);
+						void disposeRuntimeForScope(bridgeOwner.scopeKey);
+					},
+				};
+				bridgeOwners.set(key, binding);
+				signal.addEventListener("abort", binding.onAbort, { once: true });
+				if (signal.aborted) binding.onAbort();
+				owner = bridgeOwner;
+			}
+			auxiliary = !owner;
+			owner ??= ownerForRequest(options?.sessionId, options?.cwd);
+			ownerGeneration = request.generation ?? owner.generation;
 			assertCurrent();
-			live.sink = { stream, partial };
-
-			bindLiveAbort(live, abortSignal, () => {
-				if (!slot) return;
-				void finishTurnFailed(slot, "aborted");
-			});
-			if (live.cancelled) {
-				partial.stopReason = "aborted";
-				partial.errorMessage = "Cancelled";
-				stream.push({ type: "error", reason: "aborted", error: partial });
-				stream.end(partial);
-				await finishTurnFailed(preparedSlot, "aborted");
-				return;
-			}
-
-			if (continuing) {
-				resumeParked(live, context);
-			} else {
-				if (!live.agent || prompt === undefined) {
-					throw new Error("Cursor SDK live run is missing an agent or user prompt");
+			await withCursorSessionOwner(owner, async () => {
+				const cwd = snapshot?.cwd ?? (typeof options?.cwd === "string" && options.cwd ? options.cwd : getCursorSessionCwd());
+				const agentInstanceId = snapshot?.agentInstanceId ?? options?.sessionId ?? DEFAULT_AGENT_INSTANCE_ID;
+				apiKey = requireCursorApiKey(typeof options?.apiKey === "string" ? options.apiKey : undefined);
+				const grantedTools = snapshot
+					? [...snapshot.grantedTools]
+					: mergeGrantedTools(grantedToolsFromContext(context));
+				if (auxiliary && grantedTools.length > 0) {
+					throw new Error("Cursor SDK tool calls require an OMP request context or an explicit host bridge");
 				}
-				const agent = live.agent;
-				const userPrompt = prompt;
-				if (!modelSelection) {
-					throw new Error("Cannot send a Cursor SDK turn without a model selection");
-				}
-				const starting = startSend(live, () =>
-					withSdkExitSuppressed(() =>
-						agent.send(userPrompt, {
-							model: modelSelection,
-							local: { customTools },
-							onDelta: ({ update }) => {
-								const sink = live.sink;
-								if (!sink || live.cancelled || getRuntimeSlot(preparedSlot.key) !== preparedSlot) return;
-								applyInteractionUpdate(sink.stream, sink.partial, update, live.projection);
-							},
-						}),
-					),
-				);
-				void starting.catch(() => undefined);
-			}
+				stream.push({ type: "start", partial });
 
-			const parked = waitForParked(live);
+				let modelSelection: ModelSelection | undefined;
+				if (trailingToolResults(context).length === 0 || !getLiveRun(runtimeKey(undefined, agentInstanceId))) {
+					const discovery = ensureCursorModels(apiKey);
+					if (abortSignal) {
+						const signal = abortSignal;
+						let onAbort: (() => void) | undefined;
+						const cancelled = new Promise<void>((resolve) => {
+							onAbort = resolve;
+							signal.addEventListener("abort", onAbort, { once: true });
+							if (signal.aborted) resolve();
+						});
+						try {
+							await Promise.race([discovery, cancelled]);
+						} finally {
+							if (onAbort) signal.removeEventListener("abort", onAbort);
+						}
+					} else {
+						await discovery;
+					}
+					assertCurrent();
+					modelSelection = selectionForTurn(model, apiKey, options);
+				}
+				assertCurrent();
+				const prepared = await prepareTurn({
+					cwd,
+					agentInstanceId,
+					apiKey,
+					modelSelection,
+					modelLimits: { contextWindow: model.contextWindow, maxTokens: model.maxTokens },
+					context,
+					grantedTools,
+					host,
+					signal: abortSignal,
+				});
+				const { slot: preparedSlot, live, continuing, customTools, prompt, incremental } = prepared;
+				slot = preparedSlot;
+				assertCurrent();
+				live.sink = { stream, partial };
+
+				bindLiveAbort(live, abortSignal, () => {
+					if (!slot) return;
+					void finishTurnFailed(slot, "aborted");
+				});
+				if (live.cancelled) {
+					partial.stopReason = "aborted";
+					partial.errorMessage = "Cancelled";
+					stream.push({ type: "error", reason: "aborted", error: partial });
+					stream.end(partial);
+					await finishTurnFailed(preparedSlot, "aborted");
+					return;
+				}
+
+				if (continuing) {
+					resumeParked(live, context);
+				} else {
+					if (!live.agent || prompt === undefined) {
+						throw new Error("Cursor SDK live run is missing an agent or user prompt");
+					}
+					const agent = live.agent;
+					const userPrompt = prompt;
+					if (!modelSelection) {
+						throw new Error("Cannot send a Cursor SDK turn without a model selection");
+					}
+					const starting = startSend(live, () =>
+						withSdkExitSuppressed(() =>
+							agent.send(userPrompt, {
+								model: modelSelection,
+								local: { customTools },
+								onDelta: ({ update }) => {
+									const sink = live.sink;
+									if (!sink || live.cancelled || getRuntimeSlot(preparedSlot.key) !== preparedSlot) return;
+									applyInteractionUpdate(sink.stream, sink.partial, update, live.projection);
+								},
+							}),
+						),
+					);
+					void starting.catch(() => undefined);
+				}
+
+				const parked = waitForParked(live);
 				const finished = waitForResult(live).then((result) => ({ kind: "finished" as const, result }));
 				const cancelled = waitForCancelled(live).then(() => ({ kind: "cancelled" as const }));
 				const first = await Promise.race([parked.then(() => ({ kind: "parked" as const })), finished, cancelled]);
@@ -226,13 +270,17 @@ export function streamCursorRuntime(
 				stream.push({ type: "done", reason: "stop", message: partial });
 				stream.end(partial);
 				await finishLiveKeepAgent(preparedSlot, "run finished");
+			});
 		} catch (error) {
-			const aborted = abortSignal?.aborted || slot?.preparation?.signal.aborted;
+			const aborted = abortSignal?.aborted || slot?.preparation?.signal.aborted ||
+				(owner && ownerGeneration !== undefined && owner.generation !== ownerGeneration);
 			if (slot) await finishTurnFailed(slot, "send failed");
 			partial.stopReason = aborted ? "aborted" : "error";
 			partial.errorMessage = aborted ? "Cancelled" : sanitizeCursorProviderError(error, apiKey);
 			stream.push({ type: "error", reason: aborted ? "aborted" : "error", error: partial });
 			stream.end(partial);
+		} finally {
+			if (auxiliary && owner) await disposeRuntimeForScope(owner.scopeKey);
 		}
 	});
 	return stream;

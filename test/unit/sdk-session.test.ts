@@ -26,6 +26,9 @@ describe("buildAgentOptions", () => {
 		});
 		expect(options.tools).toEqual(["mcp"]);
 		expect(options.disallowedTools).toEqual([...SDK_NATIVE_DISALLOWED_TOOLS]);
+		expect(SDK_NATIVE_DISALLOWED_TOOLS).toContain("readMcpResource");
+		expect(SDK_NATIVE_DISALLOWED_TOOLS).toContain("listMcpResources");
+		expect(SDK_NATIVE_DISALLOWED_TOOLS).not.toContain("FetchMcpResource");
 		expect(options.local?.settingSources).toEqual([]);
 		expect(options.local?.enableAgentRetries).toBe(false);
 		expect(options.mcpServers).toEqual({});

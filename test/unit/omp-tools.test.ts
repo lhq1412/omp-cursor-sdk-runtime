@@ -21,6 +21,41 @@ describe("OMP tools from context", () => {
 		expect(granted[0]?.inputSchema.type).toBe("object");
 	});
 
+	test("appends OMP tool examples to the custom-tool description", () => {
+		const granted = grantedToolsFromContext({
+			messages: [],
+			tools: [
+				tool("todo", {
+					description: "Manage todos",
+					examples: [
+						{ caption: "init", call: { op: "init", list: [{ phase: "Smoke", items: ["Probe"] }] } },
+						{ caption: "view", call: { op: "view" } },
+					],
+				}),
+			],
+		});
+		expect(granted[0]?.description).toContain("Manage todos");
+		expect(granted[0]?.description).toContain("<examples>");
+		expect(granted[0]?.description).toContain('{"op":"init"');
+		expect(granted[0]?.description).toContain('{"op":"view"}');
+		expect(granted[0]?.description).not.toContain("tasks");
+	});
+
+	test("does not re-append examples already present on the description", () => {
+		const description = "Manage todos\n\n<examples>\n# view\n<example>\n{\"op\":\"view\"}\n</example>\n</examples>";
+		const granted = grantedToolsFromContext({
+			messages: [],
+			tools: [
+				tool("todo", {
+					description,
+					examples: [{ caption: "init", call: { op: "init", items: ["dup"] } }],
+				}),
+			],
+		});
+		expect(granted[0]?.description).toBe(description);
+		expect(granted[0]?.description).not.toContain("dup");
+	});
+
 	test("collects trailing tool results for park resume", () => {
 		const context = {
 			messages: [

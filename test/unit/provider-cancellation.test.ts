@@ -28,7 +28,7 @@ function deferred<T>() {
 function collect(options: SimpleStreamOptions, context = CONTEXT) {
 	return (async () => {
 		const events: AssistantMessageEvent[] = [];
-		for await (const event of streamCursorRuntime(MODEL, context, options)) events.push(event);
+		for await (const event of streamCursorRuntime(MODEL, context, { ...options, onPayload: options.onPayload ?? scopeTestUtils.bindRequest })) events.push(event);
 		return events;
 	})();
 }

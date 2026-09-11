@@ -62,6 +62,23 @@ const scope = {
 };
 
 describe("session resume fold", () => {
+	test("a captured writer refuses to append after its host switches sessions", () => {
+		scopeTestUtils.reset();
+		const { appended, ctx } = registerResume();
+		ctx.sessionManager.getSessionId = () => "different-session";
+		expect(() => flushResumeHandleNow({
+			agentId: "agent-local-1",
+			poolKey: "main",
+			sendState: { bootstrapped: true, contextFingerprint: "fp", incrementalSendCount: 0 },
+			storeIdentity: { version: 1, stateRoot: "/tmp/store" },
+			state: "in-flight",
+			agentInstanceId: "main",
+			cwd: "/tmp/project",
+			credentialScopeId: "cred-1",
+		})).toThrow(/session changed/);
+		expect(appended).toEqual([]);
+	});
+
 	test("parses a v2 local resume entry", () => {
 		expect(parseResumeEntryData(validData())?.agentId).toBe("agent-local-1");
 		expect(parseResumeEntryData({ ...validData(), runtime: "cloud" })).toBeUndefined();
@@ -180,6 +197,7 @@ describe("session resume fold", () => {
 
 	test("flushResumeHandleNow appends in-flight before send and fails closed without appendEntry", () => {
 		scopeTestUtils.reset();
+		scopeTestUtils.set("/tmp/project", "/tmp/session.jsonl", "sess-without-writer");
 		resumeTestUtils.reset();
 		expect(() =>
 			flushResumeHandleNow({

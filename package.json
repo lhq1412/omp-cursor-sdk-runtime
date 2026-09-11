@@ -30,7 +30,8 @@
     "@cursor/sdk": "1.0.31",
     "@oh-my-pi/pi-ai": "18.1.14",
     "@oh-my-pi/pi-catalog": "18.1.14",
-    "@oh-my-pi/pi-coding-agent": "18.1.14"
+    "@oh-my-pi/pi-coding-agent": "18.1.14",
+    "@oh-my-pi/pi-utils": "18.1.14"
   },
   "devDependencies": {
     "typescript": "^6.0.3"

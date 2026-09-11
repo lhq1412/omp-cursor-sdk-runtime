@@ -2,11 +2,13 @@ import { describe, expect, test } from "bun:test";
 import {
 	__testUtils as catalogTestUtils,
 	mergeGrantedTools,
+	registerHostToolCatalog,
 	snapshotHostToolCatalog,
 } from "../../src/tool-catalog.ts";
 import { grantedToolsFromContext } from "../../src/omp-tools.ts";
 import { uniqueSdkToolName } from "../../src/tools.ts";
 import type { Tool } from "@oh-my-pi/pi-ai";
+import { ownerForRequest, withCursorSessionOwner } from "../../src/session-scope.ts";
 
 function tool(name: string): Tool {
 	return {
@@ -17,6 +19,29 @@ function tool(name: string): Tool {
 }
 
 describe("host tool catalog", () => {
+	test("a child catalog cannot change the parent's enabled MCP grants", () => {
+		const parent = ownerForRequest();
+		const child = ownerForRequest();
+		const fromContext = grantedToolsFromContext({ messages: [], tools: [tool("read")] });
+		withCursorSessionOwner(parent, () => {
+			snapshotHostToolCatalog(["mcp__parent"]);
+			catalogTestUtils.setLiveEnabled(() => ["mcp__parent"]);
+			registerHostToolCatalog({
+				on() {},
+				getAllTools: () => ["mcp__child"],
+				getActiveTools: () => ["mcp__child"],
+			} as Parameters<typeof registerHostToolCatalog>[0]);
+		});
+		withCursorSessionOwner(child, () => {
+			snapshotHostToolCatalog(["mcp__child"]);
+			catalogTestUtils.setLiveEnabled(() => ["mcp__child"]);
+			expect(mergeGrantedTools(fromContext).map((item) => item.name)).toEqual(["read", "mcp__child"]);
+		});
+		withCursorSessionOwner(parent, () => {
+			expect(mergeGrantedTools(fromContext).map((item) => item.name)).toEqual(["read", "mcp__parent"]);
+		});
+	});
+
 	test("adds enabled xd://-mounted MCP tools even when they appear in getActiveTools", () => {
 		catalogTestUtils.clear();
 		snapshotHostToolCatalog([
