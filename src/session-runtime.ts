@@ -32,6 +32,7 @@ export interface RuntimeSlot {
 	cwd: string;
 	createCwd?: string;
 	credentialScopeId?: string;
+	includeWebSearch?: boolean;
 	agent?: SDKAgent;
 	sendState: SendState;
 	bindingState: BindingState;
@@ -93,6 +94,7 @@ export interface OpenRuntimeTurnInput {
 	modelLimits: ModelInputLimits;
 	context: Context;
 	grantedTools: readonly GrantedTool[];
+	includeWebSearch?: boolean;
 	host?: OmpHostBridgeV1;
 	signal?: AbortSignal;
 }
@@ -194,9 +196,13 @@ export async function prepareTurn(input: OpenRuntimeTurnInput): Promise<Prepared
 	const continuing = Boolean(existingLive && trailing.length > 0);
 
 	if (existingLive && continuing) {
-		if (slotIdentityMismatch(slot, cwd, nextCredential)) {
-			await finishTurnFailed(slot, "identity changed during parked tool calls");
-			throw new Error("Cannot continue parked Cursor SDK tool calls after cwd or credentials changed");
+		if (slotIdentityMismatch(slot, cwd, nextCredential) || Boolean(slot.includeWebSearch) !== Boolean(input.includeWebSearch)) {
+			await finishTurnFailed(slot, "webSearch grant or identity changed during parked tool calls");
+			throw new Error(
+				slotIdentityMismatch(slot, cwd, nextCredential)
+					? "Cannot continue parked Cursor SDK tool calls after cwd or credentials changed"
+					: "Cannot continue parked Cursor SDK tool calls after webSearch grant changed",
+			);
 		}
 		return { slot, live: existingLive, continuing: true, customTools: {}, incremental: true };
 	}
@@ -206,7 +212,8 @@ export async function prepareTurn(input: OpenRuntimeTurnInput): Promise<Prepared
 		throw new Error("Cannot open a Cursor SDK agent without a model selection");
 	}
 
-	const configMismatch = agentConfigMismatch(slot, cwd, nextCredential);
+	const configMismatch = agentConfigMismatch(slot, cwd, nextCredential)
+		|| Boolean(slot.agent) && Boolean(slot.includeWebSearch) !== Boolean(input.includeWebSearch);
 	const unsafeBinding = Boolean(slot.agent) && (slot.bindingState !== "committed" || configMismatch);
 	const resumeHandle = unsafeBinding ? undefined : getMatchingResumeHandle(input.agentInstanceId, nextCredential, cwd);
 	const sendState = unsafeBinding ? emptySendState() : slot.agent ? slot.sendState : resumeHandle?.sendState ?? emptySendState();
@@ -277,6 +284,7 @@ export async function prepareTurn(input: OpenRuntimeTurnInput): Promise<Prepared
 					model: modelSelection,
 					store,
 					customTools,
+					includeWebSearch: input.includeWebSearch,
 					savedAgentId,
 					...(!savedAgentId ? { bootstrapHistory: history } : {}),
 					signal,
@@ -289,12 +297,14 @@ export async function prepareTurn(input: OpenRuntimeTurnInput): Promise<Prepared
 			slot.agent = agent;
 			slot.createCwd = cwd;
 			slot.credentialScopeId = nextCredential;
+			slot.includeWebSearch = Boolean(input.includeWebSearch);
 		}
 		live.agent = slot.agent;
 		setLiveRun(slot.key, live);
 		slot.bindingState = "in-flight";
 		slot.cwd = cwd;
 		slot.credentialScopeId = nextCredential;
+		slot.includeWebSearch = Boolean(input.includeWebSearch);
 
 		return {
 			slot,

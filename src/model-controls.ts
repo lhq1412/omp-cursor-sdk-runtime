@@ -172,6 +172,7 @@ function formatFastStatus(resolution: FastResolution): string {
 
 
 
+
 export function registerModelControls(
 	pi: Pick<ExtensionAPI, "registerFlag" | "registerCommand" | "getFlag" | "appendEntry" | "on">,
 ): void {
@@ -195,12 +196,12 @@ export function registerModelControls(
 	});
 
 	pi.registerCommand("cursor-fast", {
-		description: "Set Cursor fast mode for the selected canonical cursor-sdk model: on, off, or status",
+		description: "Toggle Cursor fast mode for the selected cursor-sdk model",
 		handler: async (args, ctx) => withCursorSessionOwner(ownerForContext(ctx), async () => {
 			controlsState().controlsApi = controlsApi;
 			const normalized = args.trim().toLowerCase();
-			const action = normalized === "" || normalized === "status" ? "status" : normalized;
-			if (action !== "on" && action !== "off" && action !== "status") {
+			const action = !normalized || normalized === "toggle" ? "toggle" : normalized;
+			if (action !== "on" && action !== "off" && action !== "status" && action !== "toggle") {
 				ctx.ui.notify(`Invalid Cursor fast argument. ${FAST_USAGE}`, "error");
 				return;
 			}
@@ -234,7 +235,7 @@ export function registerModelControls(
 				ctx.ui.notify(formatFastStatus(resolution), "error");
 				return;
 			}
-			const next = action === "on";
+			const next = action === "toggle" ? !resolution.value : action === "on";
 			try {
 				persistFastPreference(target.metadata.baseModelId, next);
 			} catch (error) {

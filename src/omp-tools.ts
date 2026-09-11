@@ -5,7 +5,7 @@ import type { GrantedTool, HostToolResult } from "./contracts.js";
 export function grantedToolsFromContext(context: Context): GrantedTool[] {
 	const granted: GrantedTool[] = [];
 	for (const tool of context.tools ?? []) {
-		if (tool.native) continue;
+		if (tool.native || tool.name === "web_search") continue;
 		granted.push({
 			name: tool.name,
 			description: descriptionFromTool(tool),
