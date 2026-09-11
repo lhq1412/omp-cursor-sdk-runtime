@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Agent, type Run, type RunResult, type SDKAgent } from "@cursor/sdk";
+import { Agent, type InteractionUpdate, type Run, type RunResult, type SDKAgent } from "@cursor/sdk";
 import { DEFAULT_MODEL_ID, SDK_TOOL_CONTEXT, SYSTEM_PROMPT_REPLACEMENT } from "../src/constants.ts";
 import { requireCursorApiKey } from "../src/auth.ts";
 import { buildAgentOptions, openAgent, openJsonlStore, type OpenAgentInput } from "../src/sdk-session.ts";
@@ -27,16 +27,75 @@ function formatRun(result: RunResult, apiKey: string): string {
 	].filter(Boolean).join(" ");
 }
 
+function toolUpdateNote(update: InteractionUpdate): Record<string, unknown> | undefined {
+	if (
+		update.type !== "partial-tool-call" &&
+		update.type !== "tool-call-started" &&
+		update.type !== "tool-call-completed" &&
+		update.type !== "tool-call-delta"
+	) {
+		return undefined;
+	}
+	const note: Record<string, unknown> = { type: update.type };
+	if ("callId" in update) note.callId = update.callId;
+	if ("modelCallId" in update) note.modelCallId = update.modelCallId;
+	if (update.type === "tool-call-delta") {
+		note.taskUpdateType = update.taskUpdate.type;
+		return note;
+	}
+	note.toolType = update.toolCall.type;
+	if (update.toolCall.type === "mcp") {
+		note.toolName = update.toolCall.args.toolName;
+		note.providerIdentifier = update.toolCall.args.providerIdentifier;
+		const inner = update.toolCall.args.args;
+		note.innerArgs = inner === undefined ? "undefined" : Array.isArray(inner) ? "array" : typeof inner;
+		if (inner && typeof inner === "object" && !Array.isArray(inner)) {
+			const json = JSON.stringify(inner);
+			note.argsKeys = Object.keys(inner);
+			note.argsJsonLen = json.length;
+			note.argsJsonHead = json.slice(0, 96);
+		}
+	}
+	return note;
+}
+
+function summarizeArgEvents(
+	events: Array<Record<string, unknown>>,
+	executeIds: Array<string | undefined>,
+): string {
+	const types = events.map((event) => String(event.type));
+	const before = events.filter((event) => event.beforeExecute === true).length;
+	const callIds = [...new Set(events.map((event) => event.callId).filter((id): id is string => typeof id === "string"))];
+	const matched = executeIds.filter((id): id is string => Boolean(id)).filter((id) => callIds.includes(id));
+	const jsonLens = events.map((event) => event.argsJsonLen).filter((len): len is number => typeof len === "number");
+	const heads = events.map((event) => event.argsJsonHead).filter((head): head is string => typeof head === "string");
+	const prefixGrow = heads.length >= 2 && heads.every((head, index) => index === 0 || head.startsWith(heads[index - 1]!));
+	return [
+		`events=${events.length}`,
+		`beforeExecute=${before}`,
+		`types=${types.join(">") || "<none>"}`,
+		`callIds=${callIds.join(",") || "<none>"}`,
+		`executeIds=${executeIds.map((id) => id ?? "<missing>").join(",") || "<none>"}`,
+		`callIdMatchesExecute=${matched.length > 0}`,
+		`argsJsonLens=${jsonLens.join(">") || "<none>"}`,
+		`argsPrefixGrow=${prefixGrow}`,
+		`innerArgs=${[...new Set(events.map((event) => event.innerArgs).filter(Boolean))].join(",") || "<none>"}`,
+		`toolTypes=${[...new Set(events.map((event) => event.toolType).filter(Boolean))].join(",") || "<none>"}`,
+	].join(" ");
+}
+
 async function main(): Promise<void> {
 	const apiKey = requireCursorApiKey();
 	const cwd = await mkdtemp(join(tmpdir(), "omp-cursor-runtime-probe-"));
 	const store = openJsonlStore(join(cwd, "store"));
 	const calls: Array<{ toolCallId?: string }> = [];
+	const echoCalls: Array<{ toolCallId?: string }> = [];
+	const toolEvents: Array<Record<string, unknown>> = [];
 	const results: ProbeResult[] = [];
 	const historyToken = `native-history-${randomUUID()}`;
 	const abort = new AbortController();
 	const cancel = () => abort.abort(new Error("Probe cancelled"));
-	const timeout = setTimeout(() => abort.abort(new Error("Probe timed out after 180 seconds")), 180_000);
+	const timeout = setTimeout(() => abort.abort(new Error("Probe timed out after 240 seconds")), 240_000);
 	process.once("SIGINT", cancel);
 	process.once("SIGTERM", cancel);
 	let run: Run | undefined;
@@ -70,8 +129,18 @@ async function main(): Promise<void> {
 			console.log(`CHECKPOINT ${JSON.stringify({ phase, agentId, error: scrub(String(error), apiKey) })}`);
 		}
 	};
-	const send = async (owner: SDKAgent, prompt: string) => {
-		const pending = owner.send(prompt);
+	const send = async (owner: SDKAgent, prompt: string, phase: string) => {
+		const pending = owner.send(prompt, {
+			onDelta: ({ update }) => {
+				const note = toolUpdateNote(update);
+				if (!note) return;
+				toolEvents.push({
+					phase,
+					beforeExecute: phase === "echo" ? echoCalls.length === 0 : calls.length === 0,
+					...note,
+				});
+			},
+		});
 		// A send that returns after cancellation still belongs to this probe.
 		pendingCleanup.push(pending.then((late) => { if (abort.signal.aborted) return late.cancel(); }).catch(() => undefined));
 		run = await bounded(pending);
@@ -94,13 +163,21 @@ async function main(): Promise<void> {
 			apiKey, cwd, model: { id: DEFAULT_MODEL_ID }, store, signal: abort.signal,
 			customTools: {
 				ping: {
-					description: "Return the provided token. The only tool you may call.",
+					description: "Return the provided token.",
 					inputSchema: { type: "object", properties: { token: { type: "string" } }, required: ["token"] },
 					execute: async (args, context) => {
 						calls.push({ toolCallId: context.toolCallId });
 						paused();
 						await bounded(toolGate);
 						return { content: [{ type: "text", text: `pong:${String(args.token ?? "")}` }] };
+					},
+				},
+				echo_blob: {
+					description: "Return the length of the provided blob. Side-effect free.",
+					inputSchema: { type: "object", properties: { blob: { type: "string" } }, required: ["blob"] },
+					execute: async (args, context) => {
+						echoCalls.push({ toolCallId: context.toolCallId });
+						return { content: [{ type: "text", text: `echo:${String(args.blob ?? "").length}` }] };
 					},
 				},
 			},
@@ -116,11 +193,11 @@ async function main(): Promise<void> {
 		agent = await bounded(opening);
 		store.agents.update = updateAgent;
 		await observe("after-bootstrap", agent.agentId);
-		const plain = await send(agent, `${SDK_TOOL_CONTEXT}\n\nReply with the remembered history token. Do not call any tools.`);
+		const plain = await send(agent, `${SDK_TOOL_CONTEXT}\n\nReply with the remembered history token. Do not call any tools.`, "plain");
 		const plainResult = await bounded(plain.wait());
 		await observe("plain-settled", agent.agentId, plain);
 		results.push({ name: "nativeHistory", ok: plainResult.status === "finished" && Boolean(plainResult.result?.includes(historyToken)), detail: formatRun(plainResult, apiKey) });
-		const toolRun = await send(agent, "Call ping with token alpha exactly once, then reply with the remembered history token. Do not use any other tool.");
+		const toolRun = await send(agent, "Call ping with token alpha exactly once, then reply with the remembered history token. Do not use any other tool.", "ping");
 		const toolResult = toolRun.wait();
 		const first = await bounded(Promise.race([toolPaused.then(() => "paused" as const), toolResult.then(() => "finished" as const)]));
 		if (first === "paused") await observe("tool-paused", agent.agentId, toolRun);
@@ -131,6 +208,11 @@ async function main(): Promise<void> {
 			detail: `ids=${calls.map((call) => call.toolCallId ?? "<missing>").join(",")} ${formatRun(result, apiKey)}` });
 		results.push({ name: "toolRestriction", ok: first === "paused" && result.status === "finished" && calls.length === 1,
 			detail: `custom ping must pause and run exactly once; ${formatRun(result, apiKey)}` });
+		results.push({
+			name: "pingArgEvents",
+			ok: true,
+			detail: summarizeArgEvents(toolEvents.filter((event) => event.phase === "ping"), calls.map((call) => call.toolCallId)),
+		});
 		await agent[Symbol.asyncDispose]();
 		const agentId = agent.agentId;
 		agent = undefined;
@@ -138,11 +220,23 @@ async function main(): Promise<void> {
 		pendingCleanup.push(resuming.then((late) => { if (abort.signal.aborted) return late[Symbol.asyncDispose](); }).catch(() => undefined));
 		resumed = await bounded(resuming);
 		await observe("resumed-baseline", resumed.agentId);
-		const follow = await send(resumed, "Reply with the remembered history token. Do not call any tools.");
+		const follow = await send(resumed, "Reply with the remembered history token. Do not call any tools.", "resume");
 		const followResult = await bounded(follow.wait());
 		await observe("resume-settled", resumed.agentId, follow);
 		results.push({ name: "resume", ok: followResult.status === "finished" && Boolean(followResult.result?.includes(historyToken)) && calls.length === 1,
 			detail: `${formatRun(followResult, apiKey)} agentId=${resumed.agentId}` });
+		const blob = `probe-blob-${"z".repeat(256)}`;
+		const echoRun = await send(resumed, `Call echo_blob exactly once with blob set to this exact string, then stop. Do not call ping.\n${blob}`, "echo");
+		const echoResult = await bounded(echoRun.wait());
+		await observe("echo-settled", resumed.agentId, echoRun);
+		console.log(`ARG_EVENTS ${JSON.stringify(toolEvents)}`);
+		const pingEvents = toolEvents.filter((event) => event.phase === "ping");
+		const echoEvents = toolEvents.filter((event) => event.phase === "echo");
+		results.push({
+			name: "customToolArgEvents",
+			ok: echoResult.status === "finished" && echoCalls.length >= 1,
+			detail: `ping ${summarizeArgEvents(pingEvents, calls.map((call) => call.toolCallId))} echo ${summarizeArgEvents(echoEvents, echoCalls.map((call) => call.toolCallId))} ${formatRun(echoResult, apiKey)}`,
+		});
 	} finally {
 		store.agents.update = updateAgent;
 		releaseTool();

@@ -7,6 +7,8 @@ export interface RunProjection {
 	answerText: string;
 	stepId?: number;
 	reportedUsage?: TokenUsage;
+	sdkToOmp?: ReadonlyMap<string, string>;
+	previews?: Map<string, { contentIndex: number; ended: boolean }>;
 }
 
 export interface CursorAssistantMessage extends AssistantMessage {
@@ -84,6 +86,44 @@ export function applyThinkingDelta(stream: AssistantMessageEventStream, partial:
 	stream.push({ type: "thinking_delta", contentIndex, delta: text, partial });
 }
 
+function mcpCustomCall(update: InteractionUpdate): { callId: string; sdkName: string; args: Record<string, unknown> } | undefined {
+	if (update.type !== "partial-tool-call" && update.type !== "tool-call-started") return;
+	if (update.toolCall.type !== "mcp") return;
+	const sdkName = update.toolCall.args.toolName;
+	if (!sdkName) return;
+	const inner = update.toolCall.args.args;
+	const args = inner && typeof inner === "object" && !Array.isArray(inner) ? inner : {};
+	return { callId: update.callId, sdkName, args };
+}
+
+function previewMcpToolCall(
+	stream: AssistantMessageEventStream,
+	partial: AssistantMessage,
+	update: InteractionUpdate,
+	projection?: RunProjection,
+): void {
+	const call = mcpCustomCall(update);
+	if (!call || !projection?.sdkToOmp) return;
+	const name = projection.sdkToOmp.get(call.sdkName);
+	if (!name) return;
+	const previews = projection.previews ??= new Map();
+	const existing = previews.get(call.callId);
+	if (existing?.ended) return;
+	if (existing) {
+		const block = partial.content[existing.contentIndex];
+		if (block?.type === "toolCall") {
+			block.name = name;
+			block.arguments = call.args;
+		}
+		return;
+	}
+	endLastOpenBlock(stream, partial);
+	partial.content.push({ type: "toolCall", id: call.callId, name, arguments: call.args });
+	const contentIndex = partial.content.length - 1;
+	previews.set(call.callId, { contentIndex, ended: false });
+	stream.push({ type: "toolcall_start", contentIndex, partial });
+}
+
 export function applyInteractionUpdate(
 	stream: AssistantMessageEventStream,
 	partial: AssistantMessage,
@@ -95,7 +135,7 @@ export function applyInteractionUpdate(
 		if (update.type === "step-started" && update.stepId !== projection.stepId) {
 			projection.stepId = update.stepId;
 			projection.answerText = "";
-		} else if (update.type === "tool-call-started") {
+		} else if (update.type === "tool-call-started" || update.type === "partial-tool-call") {
 			projection.answerText = "";
 		} else if (update.type === "text-delta") {
 			projection.answerText += update.text;
@@ -107,14 +147,31 @@ export function applyInteractionUpdate(
 	}
 	if (update.type === "thinking-delta") {
 		applyThinkingDelta(stream, partial, update.text);
+		return;
 	}
+	previewMcpToolCall(stream, partial, update, projection);
 }
 
 export function applyToolCall(
 	stream: AssistantMessageEventStream,
 	partial: AssistantMessage,
 	toolCall: { id: string; name: string; arguments: Record<string, unknown> },
+	projection?: RunProjection,
 ): void {
+	const preview = projection?.previews?.get(toolCall.id);
+	if (preview?.ended) return;
+	if (preview) {
+		const block = partial.content[preview.contentIndex];
+		if (block?.type === "toolCall") {
+			block.id = toolCall.id;
+			block.name = toolCall.name;
+			block.arguments = toolCall.arguments;
+			stream.push({ type: "toolcall_delta", contentIndex: preview.contentIndex, delta: JSON.stringify(block.arguments), partial });
+			stream.push({ type: "toolcall_end", contentIndex: preview.contentIndex, toolCall: block, partial });
+			preview.ended = true;
+			return;
+		}
+	}
 	endLastOpenBlock(stream, partial);
 	partial.content.push({ type: "toolCall", id: toolCall.id, name: toolCall.name, arguments: toolCall.arguments });
 	const contentIndex = partial.content.length - 1;
@@ -123,6 +180,25 @@ export function applyToolCall(
 	stream.push({ type: "toolcall_start", contentIndex, partial });
 	stream.push({ type: "toolcall_delta", contentIndex, delta: JSON.stringify(block.arguments), partial });
 	stream.push({ type: "toolcall_end", contentIndex, toolCall: block, partial });
+	if (projection) {
+		(projection.previews ??= new Map()).set(toolCall.id, { contentIndex, ended: true });
+	}
+}
+
+export function dropUnendedPreviews(
+	partial: AssistantMessage,
+	projection: RunProjection,
+	keepIds: ReadonlySet<string>,
+): void {
+	if (!projection.previews) return;
+	for (let index = partial.content.length - 1; index >= 0; index -= 1) {
+		const block = partial.content[index];
+		if (block.type !== "toolCall" || keepIds.has(block.id)) continue;
+		const preview = projection.previews.get(block.id);
+		if (!preview || preview.ended) continue;
+		preview.ended = true;
+		partial.content.splice(index, 1);
+	}
 }
 
 export function endLastOpenBlock(stream: AssistantMessageEventStream, partial: AssistantMessage): void {

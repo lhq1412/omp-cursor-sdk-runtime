@@ -293,7 +293,9 @@ export async function prepareTurn(input: OpenRuntimeTurnInput): Promise<Prepared
 			throw new Error("tool executor is not attached");
 		}, newBridgeRunId()));
 		const toolExec = attachParkExecutor(live, input.grantedTools, input.host);
-		const customTools = buildCustomTools(input.grantedTools, toolExec.execute, toolExec.dedupe);
+		const sdkToOmp = new Map<string, string>();
+		const customTools = buildCustomTools(input.grantedTools, toolExec.execute, toolExec.dedupe, sdkToOmp);
+		live.projection.sdkToOmp = sdkToOmp;
 
 		if (!slot.agent) {
 			const agent = await withSdkExitSuppressed(() =>

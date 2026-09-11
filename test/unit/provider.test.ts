@@ -480,6 +480,41 @@ describe("streamCursorRuntime model selection", () => {
 		expect(sent).toHaveLength(1);
 	});
 
+	test("MCP tool-call-started preview is closed by the parked callback", async () => {
+		installCapturingAgent([], [], async (options) => {
+			const tool = options?.local?.customTools?.read;
+			if (!tool) return finishedRun();
+			await options?.onDelta?.({
+				update: {
+					type: "tool-call-started",
+					callId: "call-1",
+					modelCallId: "model-1",
+					toolCall: { type: "mcp", args: { toolName: "read", providerIdentifier: "custom-user-tools", args: { path: "a.ts" } } },
+				},
+			});
+			const pending = tool.execute({ path: "a.ts" }, { toolCallId: "call-1" });
+			return {
+				id: "run-preview",
+				supports: () => false,
+				wait: async () => {
+					await pending;
+					return { id: "run-preview", status: "finished", result: "done" } as RunResult;
+				},
+			} as unknown as Run;
+		});
+		const events = await drain(cursorModel("composer-2.5", 1_000_000), userContext("hi", [readTool()]), {
+			apiKey: "test-key",
+			cwd: "/tmp/project",
+		});
+		expect(events.filter((event) => event.type === "toolcall_start")).toHaveLength(1);
+		expect(events.at(-1)).toMatchObject({ type: "done", reason: "toolUse" });
+		const done = events.at(-1);
+		if (done?.type !== "done") throw new Error("expected toolUse");
+		expect(done.message.content.filter((block) => block.type === "toolCall")).toEqual([
+			expect.objectContaining({ type: "toolCall", id: "call-1", name: "read", arguments: { path: "a.ts" } }),
+		]);
+	});
+
 	test("parked continuation resumes the original run instead of sending a new selection", async () => {
 		const created: ModelSelection[] = [];
 		const sent: ModelSelection[] = [];

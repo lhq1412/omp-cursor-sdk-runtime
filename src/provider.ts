@@ -30,6 +30,7 @@ import {
 	closeOpenBlocks,
 	createEmptyAssistantMessage,
 	createProviderStream,
+	dropUnendedPreviews,
 	runResultToStopReason,
 	projectRunUsage,
 	reconcileRunResult,
@@ -235,8 +236,9 @@ export function streamCursorRuntime(
 					assertCurrent();
 					projectRunUsage(partial, live.projection, live.run?.usage);
 					for (const call of batch) {
-						applyToolCall(stream, partial, { id: call.toolCallId, name: call.name, arguments: call.args });
+						applyToolCall(stream, partial, { id: call.toolCallId, name: call.name, arguments: call.args }, live.projection);
 					}
+					dropUnendedPreviews(partial, live.projection, new Set(batch.map((call) => call.toolCallId)));
 					live.projection.answerText = "";
 					partial.stopReason = "toolUse";
 					stream.push({ type: "done", reason: "toolUse", message: partial });
