@@ -16,13 +16,21 @@ function setup(events: SDKMessage[] = [searchCall("completed")], result: Partial
 	let cancellations = 0;
 	let root = "";
 	const sendGate = Promise.withResolvers<void>();
+	const streamGate = Promise.withResolvers<void>();
 	const started = Promise.withResolvers<void>();
+	const streamStarted = Promise.withResolvers<void>();
 	const fixture = {
 		holdSend: false,
+		holdStream: false,
+		cancelFails: false,
+		holdDispose: false,
+		streamAbort: false,
 		beforeStream: () => {},
 		beforeSend: () => {},
 		started: started.promise,
+		streamStarted: streamStarted.promise,
 		releaseSend() { sendGate.resolve(); },
+		releaseStream() { streamGate.resolve(); },
 		get options() { return options; },
 		get prompt() { return prompt; },
 		get disposed() { return disposed; },
@@ -42,13 +50,22 @@ function setup(events: SDKMessage[] = [searchCall("completed")], result: Partial
 				return {
 					async *stream() {
 						fixture.beforeStream();
+						streamStarted.resolve();
+						if (fixture.holdStream) await streamGate.promise;
+						if (fixture.streamAbort) throw new DOMException("SDK stream aborted", "AbortError");
 						for (const event of events) yield event;
 					},
 					async wait() { return { id: "run-search", status: "finished", result: "Answer: https://example.com/news", ...result }; },
-					async cancel() { cancellations++; },
+					async cancel() {
+						cancellations++;
+						if (!fixture.cancelFails) streamGate.resolve();
+					},
 				};
 			},
-			async [Symbol.asyncDispose]() { disposed = true; },
+			async [Symbol.asyncDispose]() {
+				if (fixture.holdDispose) await Promise.withResolvers<void>().promise;
+				disposed = true;
+			},
 		} as SDKAgent;
 	});
 	return fixture;
@@ -106,9 +123,9 @@ describe("runCursorWebSearch", () => {
 		await expect(runCursorWebSearch(params)).rejects.toThrow("empty answer");
 	});
 
-	test("reports SDK cancellation as AbortError before checking search", async () => {
+	test("reports SDK cancellation without a user abort as a search failure", async () => {
 		setup([], { status: "cancelled" });
-		await expect(runCursorWebSearch(params)).rejects.toMatchObject({ name: "AbortError" });
+		await expect(runCursorWebSearch(params)).rejects.toThrow("Cursor web search failed");
 	});
 
 	test("aborts before create even with a non-Error signal reason", async () => {
@@ -156,5 +173,40 @@ describe("runCursorWebSearch", () => {
 		await expect(runCursorWebSearch({ ...params, signal: controller.signal })).rejects.toMatchObject({ name: "AbortError" });
 		expect(fixture.disposed).toBe(true);
 		expect(existsSync(fixture.root)).toBe(false);
+	});
+
+	test("times out a hanging stream even if cancel does not end it", async () => {
+		const fixture = setup();
+		fixture.holdStream = true;
+		fixture.cancelFails = true;
+		await expect(runCursorWebSearch({ ...params, timeoutMs: 30 })).rejects.toThrow("timed out");
+		expect(fixture.cancellations).toBe(1);
+	});
+
+	test("aborts a hanging stream without waiting for the iterator", async () => {
+		const fixture = setup();
+		fixture.holdStream = true;
+		fixture.cancelFails = true;
+		const controller = new AbortController();
+		const pending = runCursorWebSearch({ ...params, signal: controller.signal });
+		await fixture.streamStarted;
+		controller.abort();
+		await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+	});
+
+	test("SDK AbortError after timeout is a search failure, not user cancel", async () => {
+		const fixture = setup();
+		fixture.holdStream = true;
+		fixture.streamAbort = true;
+		await expect(runCursorWebSearch({ ...params, timeoutMs: 30 })).rejects.toThrow("timed out");
+		expect(fixture.cancellations).toBe(1);
+	});
+
+	test("hanging dispose does not prevent timeout from returning", async () => {
+		const fixture = setup();
+		fixture.holdStream = true;
+		fixture.cancelFails = true;
+		fixture.holdDispose = true;
+		await expect(runCursorWebSearch({ ...params, timeoutMs: 30 })).rejects.toThrow("timed out");
 	});
 });

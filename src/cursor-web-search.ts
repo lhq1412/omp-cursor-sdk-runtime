@@ -1,5 +1,5 @@
 import "./sdk-exit-guard.js";
-import { Agent, JsonlLocalAgentStore, type AgentOptions, type Run, type SDKAgent } from "@cursor/sdk";
+import { Agent, JsonlLocalAgentStore, type AgentOptions, type Run, type SDKAgent, type SDKMessage } from "@cursor/sdk";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -7,6 +7,7 @@ import { DEFAULT_MODEL_ID } from "./constants.js";
 import { withSdkExitSuppressed } from "./sdk-exit-guard.js";
 
 export const CURSOR_WEB_SEARCH_TIMEOUT_MS = 60_000;
+const CLEANUP_MS = 1_000;
 
 export class CursorSearchNotPerformedError extends Error {
 	constructor() {
@@ -38,23 +39,27 @@ function abortError(): DOMException {
 	return new DOMException("Cursor web search was aborted", "AbortError");
 }
 
-function searchFailed(stop: AbortSignal, timedOut: boolean): never {
-	if (stop.aborted && !timedOut) throw abortError();
-	if (timedOut) throw new Error("Cursor web search timed out");
-	throw abortError();
+function isAbortError(error: unknown): boolean {
+	return Boolean(error && typeof error === "object" && "name" in error && error.name === "AbortError");
 }
 
-async function raceStop<T>(work: Promise<T>, stop: AbortSignal, timedOut: () => boolean): Promise<T> {
+function stopError(userAborted: boolean, timedOut: boolean): Error {
+	if (userAborted) return abortError();
+	if (timedOut) return new Error("Cursor web search timed out");
+	return new Error("Cursor web search failed");
+}
+
+async function raceStop<T>(work: Promise<T>, stop: AbortSignal, fail: () => Error): Promise<T> {
 	if (stop.aborted) {
 		void work.catch(() => undefined);
-		searchFailed(stop, timedOut());
+		throw fail();
 	}
 	let onAbort: (() => void) | undefined;
 	try {
 		return await Promise.race([
 			work,
 			new Promise<never>((_, reject) => {
-				onAbort = () => reject(timedOut() ? new Error("Cursor web search timed out") : abortError());
+				onAbort = () => reject(fail());
 				stop.addEventListener("abort", onAbort, { once: true });
 			}),
 		]);
@@ -63,13 +68,22 @@ async function raceStop<T>(work: Promise<T>, stop: AbortSignal, timedOut: () => 
 	}
 }
 
+function later(task: () => Promise<unknown>): void {
+	void withSdkExitSuppressed(task).catch(() => undefined);
+}
+
+async function bounded(task: Promise<unknown>, ms = CLEANUP_MS): Promise<void> {
+	await Promise.race([task.catch(() => undefined), new Promise<void>((resolve) => setTimeout(resolve, ms))]);
+}
+
 export async function runCursorWebSearch(params: CursorWebSearchParams): Promise<{ content: Array<{ type: "text"; text: string }> }> {
+	let timedOut = false;
 	try {
 		params.signal?.throwIfAborted();
 		return await withSdkExitSuppressed(async () => {
 			const root = await mkdtemp(join(tmpdir(), "omp-cursor-web-search-"));
 			const stop = new AbortController();
-			let timedOut = false;
+			const fail = () => stopError(Boolean(params.signal?.aborted), timedOut);
 			const timeoutMs = params.timeoutMs ?? CURSOR_WEB_SEARCH_TIMEOUT_MS;
 			const timer = timeoutMs > 0 ? setTimeout(() => {
 				timedOut = true;
@@ -97,9 +111,9 @@ export async function runCursorWebSearch(params: CursorWebSearchParams): Promise
 					},
 				});
 				try {
-					agent = await raceStop(creating, stop.signal, () => timedOut);
+					agent = await raceStop(creating, stop.signal, fail);
 				} catch (error) {
-					void creating.then((late) => late[Symbol.asyncDispose]()).catch(() => undefined);
+					if (!agent) later(async () => { await (await creating)?.[Symbol.asyncDispose](); });
 					throw error;
 				}
 				const prompt = ["Use the webSearch tool to search the web for the query below. Return an answer with source URLs.", `Query: ${params.query}`];
@@ -108,27 +122,41 @@ export async function runCursorWebSearch(params: CursorWebSearchParams): Promise
 				}
 				sending = agent.send(prompt.join("\n"));
 				try {
-					run = await raceStop(sending, stop.signal, () => timedOut);
+					run = await raceStop(sending, stop.signal, fail);
 				} catch (error) {
-					void sending.then((late) => late.cancel()).catch(() => undefined);
+					later(async () => { await (await sending)?.cancel(); });
 					throw error;
 				}
 				const cancelRun = () => { void run?.cancel().catch(() => undefined); };
 				stop.signal.addEventListener("abort", cancelRun, { once: true });
 				if (stop.signal.aborted) cancelRun();
 				const searches = new Map<string, "running" | "completed" | "error">();
-				for await (const event of run.stream()) {
-					if (stop.signal.aborted) searchFailed(stop.signal, timedOut);
-					if (event.type !== "tool_call" || !isWebSearchToolName(event.name)) continue;
-					const id = event.call_id;
-					if (typeof id !== "string" || !id) continue;
-					if (event.status === "completed" || event.status === "error" || event.status === "running") {
-						searches.set(id, event.status);
+				const iterator = run.stream()[Symbol.asyncIterator]();
+				try {
+					while (true) {
+						let step: IteratorResult<SDKMessage>;
+						try {
+							step = await raceStop(iterator.next(), stop.signal, fail);
+						} catch (error) {
+							void iterator.return?.().catch(() => undefined);
+							if (params.signal?.aborted || timedOut) throw fail();
+							if (isAbortError(error)) throw fail();
+							throw error;
+						}
+						if (step.done) break;
+						const event = step.value;
+						if (event.type !== "tool_call" || !isWebSearchToolName(event.name)) continue;
+						const id = event.call_id;
+						if (typeof id !== "string" || !id) continue;
+						if (event.status === "completed" || event.status === "error" || event.status === "running") {
+							searches.set(id, event.status);
+						}
 					}
+				} finally {
+					void iterator.return?.().catch(() => undefined);
 				}
-				const result = await raceStop(run.wait(), stop.signal, () => timedOut);
-				if (stop.signal.aborted) searchFailed(stop.signal, timedOut);
-				if (result.status === "cancelled") throw abortError();
+				const result = await raceStop(run.wait(), stop.signal, fail);
+				if (result.status === "cancelled") throw fail();
 				if (result.status === "error") throw new Error(result.error?.message ?? "Cursor web search failed");
 				if (![...searches.values()].some((status) => status === "completed")) throw new CursorSearchNotPerformedError();
 				let text = result.result?.trim();
@@ -138,18 +166,20 @@ export async function runCursorWebSearch(params: CursorWebSearchParams): Promise
 					if (urls.length) text += `\n\n## Sources\n${urls.map((url) => `- ${url}`).join("\n")}`;
 				}
 				return { content: [{ type: "text" as const, text }] };
+			} catch (error) {
+				if (params.signal?.aborted || timedOut || isAbortError(error)) throw fail();
+				throw error;
 			} finally {
 				clearTimeout(timer);
 				params.signal?.removeEventListener("abort", onUserAbort);
-				try {
-					await agent?.[Symbol.asyncDispose]();
-				} finally {
-					await rm(root, { recursive: true, force: true });
-				}
+				await bounded(Promise.resolve(agent?.[Symbol.asyncDispose]()));
+				await bounded(rm(root, { recursive: true, force: true }));
 			}
 		});
 	} catch (error) {
 		if (params.signal?.aborted) throw abortError();
+		if (timedOut) throw new Error("Cursor web search timed out");
+		if (isAbortError(error)) throw new Error("Cursor web search failed");
 		throw error;
 	}
 }

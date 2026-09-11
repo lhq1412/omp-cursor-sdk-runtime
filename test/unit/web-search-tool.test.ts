@@ -108,12 +108,12 @@ describe("web_search shadow routing", () => {
 		expect(ctx.invokeTool).toHaveBeenCalledTimes(1);
 	});
 
-	test("AbortError is rethrown without native fallback", async () => {
+	test("sidecar AbortError without a user abort falls back to native search", async () => {
 		const error = new DOMException("Cancelled", "AbortError");
 		__testUtils.setCreateAgent(async () => { throw error; });
 		const ctx = context("key");
-		await expect(executeCursorWebSearchTool(params, ctx)).rejects.toBe(error);
-		expect(ctx.invokeTool).not.toHaveBeenCalled();
+		expect(await executeCursorWebSearchTool(params, ctx)).toEqual(nativeResult);
+		expect(ctx.invokeTool).toHaveBeenCalledTimes(1);
 	});
 
 	test("an aborted signal never falls back even for a different error", async () => {
