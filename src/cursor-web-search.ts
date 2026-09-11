@@ -127,7 +127,10 @@ export async function runCursorWebSearch(params: CursorWebSearchParams): Promise
 					later(async () => { await (await sending)?.cancel(); });
 					throw error;
 				}
-				const cancelRun = () => { void run?.cancel().catch(() => undefined); };
+				const cancelRun = () => {
+					const current = run;
+					if (current) later(() => current.cancel());
+				};
 				stop.signal.addEventListener("abort", cancelRun, { once: true });
 				if (stop.signal.aborted) cancelRun();
 				const searches = new Map<string, "running" | "completed" | "error">();
@@ -172,7 +175,12 @@ export async function runCursorWebSearch(params: CursorWebSearchParams): Promise
 			} finally {
 				clearTimeout(timer);
 				params.signal?.removeEventListener("abort", onUserAbort);
-				await bounded(Promise.resolve(agent?.[Symbol.asyncDispose]()));
+				const current = agent;
+				if (current) {
+					await bounded(withSdkExitSuppressed(async () => {
+						await current[Symbol.asyncDispose]();
+					}));
+				}
 				await bounded(rm(root, { recursive: true, force: true }));
 			}
 		});

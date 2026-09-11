@@ -19,18 +19,29 @@ function setup(events: SDKMessage[] = [searchCall("completed")], result: Partial
 	const streamGate = Promise.withResolvers<void>();
 	const started = Promise.withResolvers<void>();
 	const streamStarted = Promise.withResolvers<void>();
+	const disposeGate = Promise.withResolvers<void>();
+	const cancelGate = Promise.withResolvers<void>();
+	const disposedAt = Promise.withResolvers<void>();
+	const cancelledAt = Promise.withResolvers<void>();
 	const fixture = {
 		holdSend: false,
 		holdStream: false,
 		cancelFails: false,
 		holdDispose: false,
+		holdCancel: false,
+		exitOnDispose: false,
+		exitOnCancel: false,
 		streamAbort: false,
 		beforeStream: () => {},
 		beforeSend: () => {},
 		started: started.promise,
 		streamStarted: streamStarted.promise,
+		whenDisposed: disposedAt.promise,
+		whenCancelled: cancelledAt.promise,
 		releaseSend() { sendGate.resolve(); },
 		releaseStream() { streamGate.resolve(); },
+		releaseDispose() { disposeGate.resolve(); },
+		releaseCancel() { cancelGate.resolve(); },
 		get options() { return options; },
 		get prompt() { return prompt; },
 		get disposed() { return disposed; },
@@ -58,13 +69,18 @@ function setup(events: SDKMessage[] = [searchCall("completed")], result: Partial
 					async wait() { return { id: "run-search", status: "finished", result: "Answer: https://example.com/news", ...result }; },
 					async cancel() {
 						cancellations++;
+						if (fixture.holdCancel) await cancelGate.promise;
 						if (!fixture.cancelFails) streamGate.resolve();
+						if (fixture.exitOnCancel) process.exit(1);
+						cancelledAt.resolve();
 					},
 				};
 			},
 			async [Symbol.asyncDispose]() {
-				if (fixture.holdDispose) await Promise.withResolvers<void>().promise;
+				if (fixture.holdDispose) await disposeGate.promise;
 				disposed = true;
+				if (fixture.exitOnDispose) process.exit(1);
+				disposedAt.resolve();
 			},
 		} as SDKAgent;
 	});
@@ -208,5 +224,52 @@ describe("runCursorWebSearch", () => {
 		fixture.cancelFails = true;
 		fixture.holdDispose = true;
 		await expect(runCursorWebSearch({ ...params, timeoutMs: 30 })).rejects.toThrow("timed out");
+		fixture.releaseDispose();
+		await fixture.whenDisposed;
+	});
+
+	test("late dispose still swallows process.exit after the search returns", async () => {
+		const fixture = setup();
+		fixture.holdDispose = true;
+		fixture.exitOnDispose = true;
+		const original = process.exit;
+		const seen: number[] = [];
+		process.exit = ((code?: number) => {
+			seen.push(code ?? -1);
+			return undefined as never;
+		}) as typeof process.exit;
+		try {
+			await runCursorWebSearch(params);
+			expect(seen).toEqual([]);
+			fixture.releaseDispose();
+			await fixture.whenDisposed;
+			expect(seen).toEqual([]);
+			expect(fixture.disposed).toBe(true);
+		} finally {
+			process.exit = original;
+		}
+	});
+
+	test("late cancel still swallows process.exit after timeout returns", async () => {
+		const fixture = setup();
+		fixture.holdStream = true;
+		fixture.holdCancel = true;
+		fixture.exitOnCancel = true;
+		const original = process.exit;
+		const seen: number[] = [];
+		process.exit = ((code?: number) => {
+			seen.push(code ?? -1);
+			return undefined as never;
+		}) as typeof process.exit;
+		try {
+			await expect(runCursorWebSearch({ ...params, timeoutMs: 30 })).rejects.toThrow("timed out");
+			expect(fixture.cancellations).toBe(1);
+			expect(seen).toEqual([]);
+			fixture.releaseCancel();
+			await fixture.whenCancelled;
+			expect(seen).toEqual([]);
+		} finally {
+			process.exit = original;
+		}
 	});
 });
