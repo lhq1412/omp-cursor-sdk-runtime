@@ -19,6 +19,7 @@ export interface OpenAgentInput {
 	model: ModelSelection;
 	store: LocalAgentStore;
 	customTools: Record<string, SDKCustomTool>;
+	includeWebSearch?: boolean;
 	savedAgentId?: string;
 	bootstrapHistory?: Context["messages"];
 	signal?: AbortSignal;
@@ -32,12 +33,14 @@ export function assertLocalAgentId(agentId: string | undefined): void {
 
 export function buildAgentOptions(input: OpenAgentInput): AgentOptions {
 	assertLocalAgentId(input.savedAgentId);
-	const hasTools = Object.keys(input.customTools).length > 0;
+	const tools: NonNullable<AgentOptions["tools"]> = [];
+	if (Object.keys(input.customTools).length > 0) tools.push("mcp");
+	if (input.includeWebSearch) tools.push("webSearch");
 	// Capability gap: omit systemPrompt. The live CLI rejects `--system-prompt`.
 	return {
 		apiKey: input.apiKey,
 		model: input.model,
-		tools: hasTools ? ["mcp"] : [],
+		tools,
 		disallowedTools: [...SDK_NATIVE_DISALLOWED_TOOLS],
 		mcpServers: {},
 		local: {

@@ -30,6 +30,7 @@ interface HostOptions {
 function createHost(options: HostOptions = {}) {
 	const flags: Record<string, boolean | string | undefined> = { ...options.flags };
 	const commands = new Map<string, (args: string, ctx: ExtensionCommandContext) => Promise<void>>();
+	const registered = new Map<string, { description?: string }>();
 	const handlers = new Map<string, Array<(event: unknown, ctx: ExtensionContextLike) => unknown>>();
 	const notifications: Array<{ message: string; type?: string }> = [];
 	const appended: Array<{ type: string; data: unknown }> = [];
@@ -86,7 +87,8 @@ function createHost(options: HostOptions = {}) {
 			if (this !== pi) throw new Error("getFlag lost this");
 			return flags[name];
 		},
-		registerCommand(name: string, command: { handler: (args: string, ctx: ExtensionCommandContext) => Promise<void> }) {
+		registerCommand(name: string, command: { description?: string; handler: (args: string, ctx: ExtensionCommandContext) => Promise<void> }) {
+			registered.set(name, command);
 			commands.set(name, command.handler);
 		},
 		appendEntry(this: unknown, customType: string, data?: unknown) {
@@ -109,7 +111,7 @@ function createHost(options: HostOptions = {}) {
 		pi: pi as Pick<ExtensionAPI, "registerFlag" | "registerCommand" | "getFlag" | "appendEntry" | "on">,
 		ctx: ctx as unknown as ExtensionCommandContext,
 		commands,
-		handlers,
+		registered,
 		notifications,
 		appended,
 		refreshCalls,
@@ -264,14 +266,17 @@ describe("model controls", () => {
 		]);
 	});
 
-	test("/cursor-fast off and empty status round-trip session state", async () => {
+	test("/cursor-fast with no args toggles and description shows status", async () => {
 		const host = createHost();
 		registerModelControls(host.pi);
-		await host.run("cursor-fast", "on");
-		await host.run("cursor-fast", "off");
-		expect(getFastMode("composer-2.5")).toBe(false);
+		expect(host.registered.get("cursor-fast")?.description).toBe("Cursor fast: off");
+		await host.emit("session_start");
 		await host.run("cursor-fast", "");
-		expect(host.notifications.at(-1)?.type).toBe("info");
+		expect(getFastMode("composer-2.5")).toBe(true);
+		expect(host.registered.get("cursor-fast")?.description).toBe("Cursor fast: on");
+		await host.run("cursor-fast", "toggle");
+		expect(getFastMode("composer-2.5")).toBe(false);
+		expect(host.registered.get("cursor-fast")?.description).toBe("Cursor fast: off");
 		expect(host.appended.map((entry) => entry.data)).toEqual([
 			{ modelId: "composer-2.5", fast: true },
 			{ modelId: "composer-2.5", fast: false },

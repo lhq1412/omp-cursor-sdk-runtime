@@ -114,9 +114,11 @@ export function streamCursorRuntime(
 				const cwd = snapshot?.cwd ?? (typeof options?.cwd === "string" && options.cwd ? options.cwd : getCursorSessionCwd());
 				const agentInstanceId = snapshot?.agentInstanceId ?? options?.sessionId ?? DEFAULT_AGENT_INSTANCE_ID;
 				apiKey = requireCursorApiKey(typeof options?.apiKey === "string" ? options.apiKey : undefined);
-				const grantedTools = snapshot
-					? [...snapshot.grantedTools]
+				const rawGranted = snapshot
+					? snapshot.grantedTools
 					: mergeGrantedTools(grantedToolsFromContext(context));
+				const includeWebSearch = (snapshot ? rawGranted : context.tools)?.some((tool) => tool.name === "web_search") ?? false;
+				const grantedTools = rawGranted.filter((tool) => tool.name !== "web_search");
 				if (auxiliary && grantedTools.length > 0) {
 					throw new Error("Cursor SDK tool calls require an OMP request context or an explicit host bridge");
 				}
@@ -153,6 +155,7 @@ export function streamCursorRuntime(
 					modelLimits: { contextWindow: model.contextWindow, maxTokens: model.maxTokens },
 					context,
 					grantedTools,
+					includeWebSearch,
 					host,
 					signal: abortSignal,
 				});

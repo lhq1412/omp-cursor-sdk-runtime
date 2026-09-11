@@ -10,6 +10,8 @@ import { disposeRuntimeForScope, __testUtils as runtimeTestUtils } from "../../s
 import { __testUtils as liveRunTestUtils } from "../../src/live-run.ts";
 import { __testUtils as scopeTestUtils } from "../../src/session-scope.ts";
 import { __testUtils as resumeTestUtils } from "../../src/session-resume.ts";
+import { HOST_BRIDGE_OPTION_KEY } from "../../src/host-option.ts";
+import { createFakeHost } from "../helpers/fake-host.ts";
 
 const COMPOSER: ModelListItem = {
 	id: "composer-2.5",
@@ -179,6 +181,48 @@ describe("streamCursorRuntime model selection", () => {
 		expect(param(sent[0], "effort") ?? param(sent[0], "reasoning")).toBe("high");
 		expect(param(sent[0], "context")).toBe("1m");
 		expect(param(sent[0], "fast")).toBe("false");
+	});
+
+	test("stock context web_search enables native webSearch", async () => {
+		const flags: boolean[] = [];
+		runtimeTestUtils.setOpenAgent(async (input) => {
+			flags.push(Boolean(input.includeWebSearch));
+			return {
+				agentId: "agent-1",
+				close() {},
+				async [Symbol.asyncDispose]() {},
+				async send() { return finishedRun(); },
+			} as unknown as SDKAgent;
+		});
+		await drain(cursorModel("composer-2.5", 1_000_000), userContext("hi", [{
+			name: "web_search",
+			description: "search",
+			parameters: { type: "object", properties: { query: { type: "string" } } },
+		} as Tool]), { apiKey: "test-key", cwd: "/tmp/project" });
+		expect(flags).toEqual([true]);
+	});
+
+	test("host snapshot without web_search ignores context.tools", async () => {
+		const flags: boolean[] = [];
+		runtimeTestUtils.setOpenAgent(async (input) => {
+			flags.push(Boolean(input.includeWebSearch));
+			return {
+				agentId: "agent-1",
+				close() {},
+				async [Symbol.asyncDispose]() {},
+				async send() { return finishedRun(); },
+			} as unknown as SDKAgent;
+		});
+		await drain(cursorModel("composer-2.5", 1_000_000), userContext("hi", [{
+			name: "web_search",
+			description: "search",
+			parameters: { type: "object", properties: { query: { type: "string" } } },
+		} as Tool]), {
+			apiKey: "test-key",
+			cwd: "/tmp/project",
+			[HOST_BRIDGE_OPTION_KEY]: createFakeHost({ tools: [] }),
+		} as SimpleStreamOptions);
+		expect(flags).toEqual([false]);
 	});
 
 	test("disableReasoning wins over reasoning and still uses catalog context threshold", async () => {

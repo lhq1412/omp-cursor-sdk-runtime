@@ -11,11 +11,13 @@ import { registerHostToolCatalog } from "./tool-catalog.js";
 import { recordDynamicModelFetch, registerModelControls } from "./model-controls.js";
 import { sanitizeCursorProviderError } from "./errors.js";
 import { registerCursorToolCallIds } from "./context.js";
+import { registerCursorWebSearchTool } from "./web-search-tool.js";
 
 export default async function (pi: ExtensionAPI): Promise<void> {
 	registerCursorSessionResume(pi);
 	registerCursorSessionLifecycle(pi);
 	registerHostToolCatalog(pi);
+	registerCursorWebSearchTool(pi);
 	registerModelControls(pi);
 	registerCursorToolCallIds(pi);
 	registerCursorSessionScope(pi);

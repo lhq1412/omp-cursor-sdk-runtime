@@ -47,6 +47,29 @@ describe("buildAgentOptions", () => {
 		expect(options.tools).toEqual([]);
 	});
 
+	test("enables only webSearch without custom tools and adds it after mcp otherwise", () => {
+		const input = {
+			apiKey: "test-key",
+			cwd: "/tmp",
+			model: { id: "composer-2.5" },
+			store,
+			customTools: {},
+			includeWebSearch: true,
+		};
+		expect(buildAgentOptions(input).tools).toEqual(["webSearch"]);
+		const options = buildAgentOptions({
+			...input,
+			customTools: {
+				read: {
+					description: "read",
+					execute: async () => ({ content: [{ type: "text", text: "ok" }] }),
+				},
+			},
+		});
+		expect(options.tools).toEqual(["mcp", "webSearch"]);
+		expect(options.disallowedTools).not.toContain("webSearch");
+	});
+
 	test("rejects cloud agent ids", () => {
 		expect(() =>
 			buildAgentOptions({

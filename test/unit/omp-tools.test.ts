@@ -21,6 +21,14 @@ describe("OMP tools from context", () => {
 		expect(granted[0]?.inputSchema.type).toBe("object");
 	});
 
+	test("does not bridge web_search as a custom tool", () => {
+		const granted = grantedToolsFromContext({
+			messages: [],
+			tools: [tool("read"), tool("web_search")],
+		});
+		expect(granted.map((item) => item.name)).toEqual(["read"]);
+	});
+
 	test("appends OMP tool examples to the custom-tool description", () => {
 		const granted = grantedToolsFromContext({
 			messages: [],

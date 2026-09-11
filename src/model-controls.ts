@@ -21,6 +21,7 @@ interface ControlsState {
 	sessionFastPreferences: Map<string, boolean>;
 	controlsApi?: ControlsApi;
 	lastDynamicFetch?: { ok: boolean; error?: string };
+	lastModelId?: string;
 }
 const states = new WeakMap<CursorSessionOwner, ControlsState>();
 function controlsState(): ControlsState {
@@ -170,6 +171,19 @@ function formatFastStatus(resolution: FastResolution): string {
 	return `Cursor fast is ${label}.`;
 }
 
+function rememberFastModel(model: { id: string; provider?: string } | undefined): void {
+	if (!model || model.provider !== CURSOR_SDK_PROVIDER_ID) {
+		controlsState().lastModelId = undefined;
+		return;
+	}
+	controlsState().lastModelId = lookupMetadata(model.id)?.baseModelId ?? model.id;
+}
+
+function cursorFastDescription(): string {
+	const modelId = controlsState().lastModelId;
+	return `Cursor fast: ${modelId && getFastMode(modelId) ? "on" : "off"}`;
+}
+
 
 
 export function registerModelControls(
@@ -195,12 +209,15 @@ export function registerModelControls(
 	});
 
 	pi.registerCommand("cursor-fast", {
-		description: "Set Cursor fast mode for the selected canonical cursor-sdk model: on, off, or status",
+		get description() {
+			return cursorFastDescription();
+		},
 		handler: async (args, ctx) => withCursorSessionOwner(ownerForContext(ctx), async () => {
 			controlsState().controlsApi = controlsApi;
+			rememberFastModel(ctx.model);
 			const normalized = args.trim().toLowerCase();
-			const action = normalized === "" || normalized === "status" ? "status" : normalized;
-			if (action !== "on" && action !== "off" && action !== "status") {
+			const action = !normalized || normalized === "toggle" ? "toggle" : normalized;
+			if (action !== "on" && action !== "off" && action !== "status" && action !== "toggle") {
 				ctx.ui.notify(`Invalid Cursor fast argument. ${FAST_USAGE}`, "error");
 				return;
 			}
@@ -225,6 +242,7 @@ export function registerModelControls(
 				ctx.ui.notify(sanitizeCursorProviderError(target.message, apiKey), "error");
 				return;
 			}
+			controlsState().lastModelId = target.metadata.baseModelId;
 			const resolution = resolveFast(target.metadata.baseModelId);
 			if (action === "status") {
 				ctx.ui.notify(formatFastStatus(resolution), "info");
@@ -234,7 +252,7 @@ export function registerModelControls(
 				ctx.ui.notify(formatFastStatus(resolution), "error");
 				return;
 			}
-			const next = action === "on";
+			const next = action === "toggle" ? !resolution.value : action === "on";
 			try {
 				persistFastPreference(target.metadata.baseModelId, next);
 			} catch (error) {
@@ -280,6 +298,7 @@ export function registerModelControls(
 		preferenceGeneration++;
 		controlsState().controlsApi = controlsApi;
 		foldSessionPreferences(ctx);
+		rememberFastModel(ctx.model);
 	};
 	on("session_start", fold);
 	on("session_switch", fold);

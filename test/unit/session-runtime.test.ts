@@ -440,6 +440,42 @@ describe("session runtime", () => {
 		expect(appended.some((entry) => (entry.data as { state?: string }).state === "in-flight")).toBe(true);
 	});
 
+	test("reopens the agent when the native webSearch grant changes", async () => {
+		runtimeTestUtils.clear();
+		liveRunTestUtils.clear();
+		scopeTestUtils.reset();
+		resumeTestUtils.reset();
+		registerResume();
+		const opens: boolean[] = [];
+		runtimeTestUtils.setOpenAgent(async (input) => {
+			opens.push(Boolean(input.includeWebSearch));
+			return fakeAgent(`agent-${opens.length}`);
+		});
+		const firstContext = userContext("first");
+		const first = await prepareTurn({
+			modelLimits, cwd: "/tmp/project", agentInstanceId: "main", apiKey: "test-key",
+			modelSelection: { id: "composer-2.5" }, context: firstContext, grantedTools: [], includeWebSearch: true,
+		});
+		first.slot.bindingState = "committed";
+		first.slot.sendState = {
+			bootstrapped: true,
+			contextFingerprint: computeContextFingerprint(firstContext),
+			incrementalSendCount: 0,
+		};
+		liveRunTestUtils.clear();
+		const secondContext = {
+			messages: [
+				{ role: "user", content: "first", timestamp: 1 } as Context["messages"][number],
+				{ role: "user", content: "second", timestamp: 2 } as Context["messages"][number],
+			],
+		} as Context;
+		await prepareTurn({
+			modelLimits, cwd: "/tmp/project", agentInstanceId: "main", apiKey: "test-key",
+			modelSelection: { id: "composer-2.5" }, context: secondContext, grantedTools: [], includeWebSearch: false,
+		});
+		expect(opens).toEqual([true, false]);
+	});
+
 	test("creates a new agent and bootstraps history when cwd or credentials change", async () => {
 		runtimeTestUtils.clear();
 		liveRunTestUtils.clear();

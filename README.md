@@ -101,7 +101,7 @@ When switching from `cursor-sdk` to OMP's built-in Codex provider, the extension
 
 In-session:
 
-- `/cursor-fast [on|off|status]` — per canonical model; `--cursor-no-fast` wins `--cursor-fast`; otherwise session custom entries. Takes effect on the next new send, not an in-flight parked run. Captures the selected model and actual session identity when invoked; pending commands are discarded without saving or notifying if navigation starts or the identity changes while capabilities load, including before navigation-completed events. If navigation is cancelled, rerun the command.
+- `/cursor-fast [on|off|status]` — empty/`toggle` flips the selected canonical model (default off); `--cursor-no-fast` wins `--cursor-fast`; otherwise session custom entries. Slash-command description shows `Cursor fast: on|off`. Takes effect on the next new send, not an in-flight parked run. Captures the selected model and actual session identity when invoked; pending commands are discarded without saving or notifying if navigation starts or the identity changes while capabilities load, including before navigation-completed events. If navigation is cancelled, rerun the command.
 - `/cursor-refresh-models` — requires a Cursor SDK key and calls native `modelRegistry.refreshProvider("cursor-sdk", "online")`. Success requires a successful live discovery callback, not a silently reused cache; failures retain the previous catalog. `omp models refresh` also goes through `fetchDynamicModels`.
 
 Validated SDK parameter/variant metadata is persisted per credential hash under the SDK workspace state root at `omp-cursor-runtime/model-cache/<credential-hash>.json`. Files are private, bounded, validated on read, and atomically replaced; no API key is stored. When live discovery fails, `ensureCursorModels()` may use that credential's cached configuration for known models only. Metadata `source` distinguishes `sdk`, `cache`, and the existing `fallback`; cached configuration never grants account access. Explicit refresh still reports live discovery failures. `/cursor-fast` also works offline for the known `composer-2.5` fallback. Empty live catalogs are errors, not successful refreshes. Cloud `bc-*` agent IDs remain rejected.
@@ -111,6 +111,8 @@ SDK preset variants are valid selections independently of advertised parameter d
 ## Tools
 
 On stock brew OMP, `context.tools` plus xd://-mounted tools (including enabled `mcp__*` MCP tools) are mapped to Cursor SDK custom tools. Native Cursor executors (`shell`, `edit`, `read`, `grep`, `glob`, `ls`, `delete`, `task`) stay disallowed. SDK `settingSources` is always `[]`; `mcpServers` is always `{}`.
+
+The extension shadows OMP `web_search`. Non-`cursor-sdk` models try an isolated Cursor SDK agent with only `webSearch` (no shell/edit/MCP/session resume), using `/login cursor-sdk` or `CURSOR_API_KEY`. If Cursor is missing, fails, or finishes without calling `webSearch`, it falls back to OMP's native search chain via `ctx.invokeTool`. `cursor-sdk/*` does not bridge that wrapper as a custom tool; when OMP granted `web_search`, the session agent may use native `webSearch` only.
 
 Native `readMcpResource` and `listMcpResources` are disallowed because `mcpServers` is always `{}`; memoria and `memory://` use granted `mcp__memoria_*` custom tools or the OMP `read` tool, not the SDK MCP resource API.
 
