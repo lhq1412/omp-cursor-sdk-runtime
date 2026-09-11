@@ -296,6 +296,7 @@ export async function prepareTurn(input: OpenRuntimeTurnInput): Promise<Prepared
 		const sdkToOmp = new Map<string, string>();
 		const customTools = buildCustomTools(input.grantedTools, toolExec.execute, toolExec.dedupe, sdkToOmp);
 		live.projection.sdkToOmp = sdkToOmp;
+		live.projection.allowToolPreview = !input.host;
 
 		if (!slot.agent) {
 			const agent = await withSdkExitSuppressed(() =>

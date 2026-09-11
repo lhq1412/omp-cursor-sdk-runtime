@@ -8,6 +8,7 @@ export interface RunProjection {
 	stepId?: number;
 	reportedUsage?: TokenUsage;
 	sdkToOmp?: ReadonlyMap<string, string>;
+	allowToolPreview?: boolean;
 	previews?: Map<string, { contentIndex: number; ended: boolean }>;
 }
 
@@ -103,7 +104,7 @@ function previewMcpToolCall(
 	projection?: RunProjection,
 ): void {
 	const call = mcpCustomCall(update);
-	if (!call || !projection?.sdkToOmp) return;
+	if (!call || projection?.allowToolPreview !== true || !projection.sdkToOmp) return;
 	const name = projection.sdkToOmp.get(call.sdkName);
 	if (!name) return;
 	const previews = projection.previews ??= new Map();
@@ -196,7 +197,7 @@ export function dropUnendedPreviews(
 		if (block.type !== "toolCall" || keepIds.has(block.id)) continue;
 		const preview = projection.previews.get(block.id);
 		if (!preview || preview.ended) continue;
-		preview.ended = true;
+		projection.previews.delete(block.id);
 		partial.content.splice(index, 1);
 	}
 }

@@ -166,6 +166,11 @@ export function streamCursorRuntime(
 				slot = preparedSlot;
 				assertCurrent();
 				live.sink = { stream, partial };
+				if (live.projection.previews) {
+					for (const [id, preview] of live.projection.previews) {
+						if (!preview.ended) live.projection.previews.delete(id);
+					}
+				}
 
 				bindLiveAbort(live, abortSignal, () => {
 					if (!slot) return;
@@ -224,6 +229,7 @@ export function streamCursorRuntime(
 				const first = await Promise.race([parked.then(() => ({ kind: "parked" as const })), finished, cancelled]);
 				if (first.kind === "cancelled" || live.cancelled) {
 					projectRunUsage(partial, live.projection, live.run?.usage);
+					dropUnendedPreviews(partial, live.projection, new Set());
 					partial.stopReason = "aborted";
 					partial.errorMessage = "Cancelled";
 					stream.push({ type: "error", reason: "aborted", error: partial });
@@ -250,6 +256,7 @@ export function streamCursorRuntime(
 				reconcileRunResult(stream, partial, live.projection, first.result);
 				if (host) await host.flushToolResults();
 				assertCurrent();
+				dropUnendedPreviews(partial, live.projection, new Set());
 				closeOpenBlocks(stream, partial);
 				partial.stopReason = runResultToStopReason(first.result);
 				if (first.result.status === "error") {

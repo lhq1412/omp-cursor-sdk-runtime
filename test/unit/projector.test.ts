@@ -73,7 +73,7 @@ describe("projector", () => {
 		} as Model<Api>;
 		const stream = createAssistantMessageEventStream();
 		const partial = createEmptyAssistantMessage(model);
-		const projection: RunProjection = { answerText: "", sdkToOmp: new Map([["read", "read"]]) };
+		const projection: RunProjection = { answerText: "", allowToolPreview: true, sdkToOmp: new Map([["read", "read"]]) };
 		applyInteractionUpdate(stream, partial, mcpUpdate("tool-call-started", "call-1", "read", { path: "a" }), projection);
 		applyInteractionUpdate(stream, partial, mcpUpdate("partial-tool-call", "call-1", "read", { path: "a.ts" }), projection);
 		expect(partial.content.filter((block) => block.type === "toolCall")).toHaveLength(1);
@@ -103,13 +103,30 @@ describe("projector", () => {
 		} as Model<Api>;
 		const stream = createAssistantMessageEventStream();
 		const partial = createEmptyAssistantMessage(model);
-		const projection: RunProjection = { answerText: "", sdkToOmp: new Map([["read", "read"]]) };
+		const projection: RunProjection = { answerText: "", allowToolPreview: true, sdkToOmp: new Map([["read", "read"]]) };
 		applyInteractionUpdate(stream, partial, mcpUpdate("tool-call-started", "other", "shellish", { command: "ls" }), projection);
 		expect(partial.content.some((block) => block.type === "toolCall")).toBe(false);
 		applyInteractionUpdate(stream, partial, mcpUpdate("tool-call-started", "orphan", "read", { path: "x.ts" }), projection);
 		applyToolCall(stream, partial, { id: "call-1", name: "read", arguments: { path: "a.ts" } }, projection);
 		dropUnendedPreviews(partial, projection, new Set(["call-1"]));
 		expect(partial.content.filter((block) => block.type === "toolCall").map((block) => block.type === "toolCall" ? block.id : "")).toEqual(["call-1"]);
+		applyToolCall(stream, partial, { id: "orphan", name: "read", arguments: { path: "x.ts" } }, projection);
+		expect(partial.content.filter((block) => block.type === "toolCall").map((block) => block.type === "toolCall" ? block.id : "")).toEqual(["call-1", "orphan"]);
+	});
+
+	test("does not open executable previews without an explicit park-path allow", () => {
+		const model = {
+			id: "composer-2.5",
+			provider: CURSOR_SDK_PROVIDER_ID,
+			api: CURSOR_SDK_API,
+		} as Model<Api>;
+		const stream = createAssistantMessageEventStream();
+		const partial = createEmptyAssistantMessage(model);
+		applyInteractionUpdate(stream, partial, mcpUpdate("tool-call-started", "call-1", "read", { path: "a.ts" }), {
+			answerText: "",
+			sdkToOmp: new Map([["read", "read"]]),
+		});
+		expect(partial.content).toEqual([]);
 	});
 
 	test("projected JSON arguments drive the host streaming edit to change a file", async () => {
