@@ -31,7 +31,7 @@ function sidecar(performed = true) {
 	const create = mock(async () => ({
 		send: async () => ({
 			async *stream() {
-				if (performed) yield { type: "tool_call", name: "webSearch" };
+				if (performed) yield { type: "tool_call", name: "webSearch", call_id: "search-1", status: "completed" };
 			},
 			wait: async () => ({ status: "completed", result: "Cursor answer" }),
 			cancel: async () => {},

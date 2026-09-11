@@ -196,9 +196,13 @@ export async function prepareTurn(input: OpenRuntimeTurnInput): Promise<Prepared
 	const continuing = Boolean(existingLive && trailing.length > 0);
 
 	if (existingLive && continuing) {
-		if (slotIdentityMismatch(slot, cwd, nextCredential)) {
-			await finishTurnFailed(slot, "identity changed during parked tool calls");
-			throw new Error("Cannot continue parked Cursor SDK tool calls after cwd or credentials changed");
+		if (slotIdentityMismatch(slot, cwd, nextCredential) || Boolean(slot.includeWebSearch) !== Boolean(input.includeWebSearch)) {
+			await finishTurnFailed(slot, "webSearch grant or identity changed during parked tool calls");
+			throw new Error(
+				slotIdentityMismatch(slot, cwd, nextCredential)
+					? "Cannot continue parked Cursor SDK tool calls after cwd or credentials changed"
+					: "Cannot continue parked Cursor SDK tool calls after webSearch grant changed",
+			);
 		}
 		return { slot, live: existingLive, continuing: true, customTools: {}, incremental: true };
 	}

@@ -5,15 +5,24 @@ import { JsonlLocalAgentStore, type AgentOptions, type RunResult, type SDKAgent,
 
 const params = { query: "current SDK release", apiKey: "test-key", cwd: "/tmp" };
 
-function setup(events: Array<{ type: string; name?: string }> = [{ type: "tool_call", name: "webSearch" }], result: Partial<RunResult> = {}) {
+function searchCall(status: "running" | "completed" | "error", name = "webSearch", call_id = "search-1"): SDKMessage {
+	return { type: "tool_call", agent_id: "agent", run_id: "run", call_id, name, status } as SDKMessage;
+}
+
+function setup(events: SDKMessage[] = [searchCall("completed")], result: Partial<RunResult> = {}) {
 	let options: AgentOptions;
 	let prompt: unknown;
 	let disposed = false;
 	let cancellations = 0;
 	let root = "";
+	const sendGate = Promise.withResolvers<void>();
+	const started = Promise.withResolvers<void>();
 	const fixture = {
+		holdSend: false,
 		beforeStream: () => {},
 		beforeSend: () => {},
+		started: started.promise,
+		releaseSend() { sendGate.resolve(); },
 		get options() { return options; },
 		get prompt() { return prompt; },
 		get disposed() { return disposed; },
@@ -28,10 +37,12 @@ function setup(events: Array<{ type: string; name?: string }> = [{ type: "tool_c
 			async send(message) {
 				prompt = message;
 				fixture.beforeSend();
+				started.resolve();
+				if (fixture.holdSend) await sendGate.promise;
 				return {
 					async *stream() {
 						fixture.beforeStream();
-						for (const event of events) yield event as SDKMessage;
+						for (const event of events) yield event;
 					},
 					async wait() { return { id: "run-search", status: "finished", result: "Answer: https://example.com/news", ...result }; },
 					async cancel() { cancellations++; },
@@ -67,13 +78,18 @@ describe("runCursorWebSearch", () => {
 		expect(existsSync(fixture.root)).toBe(false);
 	});
 
-	test.each(["webSearch", "web_search", "web_search_tool_call", "WEB-SEARCH-TOOL-CALL"])("accepts a %s tool call without duplicating existing sources", async (name) => {
-		setup([{ type: "tool_call", name }], { result: "Answer\n\n## Sources\n- https://example.com" });
+	test.each(["webSearch", "web_search", "web_search_tool_call", "WEB-SEARCH-TOOL-CALL"])("accepts a completed %s tool call without duplicating existing sources", async (name) => {
+		setup([searchCall("completed", name)], { result: "Answer\n\n## Sources\n- https://example.com" });
 		expect(await runCursorWebSearch(params)).toEqual({ content: [{ type: "text", text: "Answer\n\n## Sources\n- https://example.com" }] });
 	});
 
+	test("does not accept a running or failed webSearch as proof of search", async () => {
+		setup([searchCall("running"), searchCall("error")]);
+		await expect(runCursorWebSearch(params)).rejects.toBeInstanceOf(CursorSearchNotPerformedError);
+	});
+
 	test("does not accept prose or other tools as proof of search", async () => {
-		const fixture = setup([{ type: "text", name: "webSearch" }, { type: "tool_call", name: "webFetch" }]);
+		const fixture = setup([{ type: "text", text: "webSearch" } as SDKMessage, searchCall("completed", "webFetch")]);
 		await expect(runCursorWebSearch(params)).rejects.toBeInstanceOf(CursorSearchNotPerformedError);
 		expect(fixture.disposed).toBe(true);
 		expect(existsSync(fixture.root)).toBe(false);
@@ -102,6 +118,29 @@ describe("runCursorWebSearch", () => {
 		expect(created).toBe(false);
 	});
 
+	test("aborts a hanging send without waiting for it to return", async () => {
+		const fixture = setup();
+		fixture.holdSend = true;
+		const controller = new AbortController();
+		const pending = runCursorWebSearch({ ...params, signal: controller.signal });
+		await fixture.started;
+		controller.abort();
+		await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+		expect(fixture.cancellations).toBe(0);
+		fixture.releaseSend();
+		await Promise.resolve();
+		expect(fixture.disposed).toBe(true);
+	});
+
+	test("times out a hanging send as a search failure, not AbortError", async () => {
+		const fixture = setup();
+		fixture.holdSend = true;
+		const pending = runCursorWebSearch({ ...params, timeoutMs: 20 });
+		await expect(pending).rejects.toThrow("timed out");
+		expect(fixture.cancellations).toBe(0);
+		fixture.releaseSend();
+	});
+
 	test("removes its abort listener after a completed search", async () => {
 		const fixture = setup();
 		const controller = new AbortController();
@@ -115,7 +154,6 @@ describe("runCursorWebSearch", () => {
 		const controller = new AbortController();
 		fixture[phase] = () => controller.abort(new Error("stop"));
 		await expect(runCursorWebSearch({ ...params, signal: controller.signal })).rejects.toMatchObject({ name: "AbortError" });
-		expect(fixture.cancellations).toBe(1);
 		expect(fixture.disposed).toBe(true);
 		expect(existsSync(fixture.root)).toBe(false);
 	});

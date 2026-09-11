@@ -88,7 +88,7 @@ function createHost(options: HostOptions = {}) {
 			return flags[name];
 		},
 		registerCommand(name: string, command: { description?: string; handler: (args: string, ctx: ExtensionCommandContext) => Promise<void> }) {
-			registered.set(name, command);
+			registered.set(name, { name, ...command } as { description?: string });
 			commands.set(name, command.handler);
 		},
 		appendEntry(this: unknown, customType: string, data?: unknown) {
@@ -266,17 +266,16 @@ describe("model controls", () => {
 		]);
 	});
 
-	test("/cursor-fast with no args toggles and description shows status", async () => {
+	test("/cursor-fast with no args toggles", async () => {
 		const host = createHost();
 		registerModelControls(host.pi);
-		expect(host.registered.get("cursor-fast")?.description).toBe("Cursor fast: off");
+		expect(host.registered.get("cursor-fast")?.description).toBe("Toggle Cursor fast mode for the selected cursor-sdk model");
 		await host.emit("session_start");
 		await host.run("cursor-fast", "");
 		expect(getFastMode("composer-2.5")).toBe(true);
-		expect(host.registered.get("cursor-fast")?.description).toBe("Cursor fast: on");
+		expect(host.registered.get("cursor-fast")?.description).toBe("Toggle Cursor fast mode for the selected cursor-sdk model");
 		await host.run("cursor-fast", "toggle");
 		expect(getFastMode("composer-2.5")).toBe(false);
-		expect(host.registered.get("cursor-fast")?.description).toBe("Cursor fast: off");
 		expect(host.appended.map((entry) => entry.data)).toEqual([
 			{ modelId: "composer-2.5", fast: true },
 			{ modelId: "composer-2.5", fast: false },

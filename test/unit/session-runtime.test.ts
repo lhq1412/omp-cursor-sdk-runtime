@@ -610,6 +610,31 @@ describe("session runtime", () => {
 		expect(opens).toEqual(["agent-1"]);
 	});
 
+	test("refuses parked continuation after webSearch grant is revoked", async () => {
+		runtimeTestUtils.clear();
+		liveRunTestUtils.clear();
+		scopeTestUtils.reset();
+		resumeTestUtils.reset();
+		registerResume();
+		const opens: string[] = [];
+		runtimeTestUtils.setOpenAgent(async () => {
+			const id = `agent-${opens.length + 1}`;
+			opens.push(id);
+			return fakeAgent(id);
+		});
+		await prepareTurn({
+			modelLimits, cwd: "/tmp/project", agentInstanceId: "main", apiKey: "key-a",
+			modelSelection: { id: "composer-2.5" }, context: userContext("first"), grantedTools: [], includeWebSearch: true,
+		});
+		await expect(
+			prepareTurn({
+				modelLimits, cwd: "/tmp/project", agentInstanceId: "main", apiKey: "key-a",
+				modelSelection: { id: "composer-2.5" }, context: toolResultContext(), grantedTools: [], includeWebSearch: false,
+			}),
+		).rejects.toThrow(/webSearch grant changed/);
+		expect(opens).toEqual(["agent-1"]);
+	});
+
 	test("does not start send when in-flight invalidation is swallowed by storage", async () => {
 		runtimeTestUtils.clear();
 		liveRunTestUtils.clear();
