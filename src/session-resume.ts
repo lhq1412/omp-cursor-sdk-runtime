@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { resolve as resolvePath } from "node:path";
-import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import { CURSOR_SESSION_AGENT_RESUME_ENTRY_TYPE } from "./constants.js";
 import type { BindingState } from "./contracts.js";
 import type { SendState } from "./context.js";
@@ -449,7 +449,7 @@ function restoreFromSessionManager(sessionManager: {
 
 export function registerCursorSessionResume(pi: Pick<ExtensionAPI, "on" | "appendEntry">): void {
 	const on = sessionEvents(pi);
-	on("session_start", (_event, ctx) => {
+	const bindOwner = (_event: unknown, ctx: ExtensionContext) => {
 		const state = getResumeState();
 		// Capture the extension writer and its session identity together.
 		const sessionId = ctx.sessionManager.getSessionId?.();
@@ -461,16 +461,20 @@ export function registerCursorSessionResume(pi: Pick<ExtensionAPI, "on" | "appen
 			pi.appendEntry(customType, data);
 		};
 		state.scopeKey = getCursorSessionScopeKey();
-		state.sessionFile = ctx.sessionManager.getSessionFile?.() ?? undefined;
-		state.sessionId = ctx.sessionManager.getSessionId?.() ?? undefined;
+		state.sessionFile = sessionFile ?? undefined;
+		state.sessionId = sessionId ?? undefined;
 		state.cwd = ctx.cwd;
 		state.unownedUserEntryIds = new Set(
 			ctx.sessionManager.getBranch().flatMap((entry) =>
-				entry.type === "message" && "message" in entry && entry.message.role === "user" ? [entry.id] : [],
+				entry.type === "message" && "message" in entry && entry.message?.role === "user" ? [entry.id] : [],
 			),
 		);
 		restoreFromSessionManager(ctx.sessionManager);
-	});
+	};
+	// OMP in-process /new, resume, and fork emit session_switch without a fresh session_start.
+	on("session_start", bindOwner);
+	on("session_switch", bindOwner);
+	on("session_branch", bindOwner);
 	on("before_agent_start", (_event, ctx) => {
 		restoreFromSessionManager(ctx.sessionManager);
 	});
