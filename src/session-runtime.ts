@@ -51,6 +51,15 @@ export function getRuntimeSlot(key: string): RuntimeSlot | undefined {
 	return slots.get(key);
 }
 
+export function listRuntimeSlots(): RuntimeSlot[] {
+	const owner = getCursorSessionOwner();
+	const result: RuntimeSlot[] = [];
+	for (const slot of slots.values()) {
+		if (slot.owner === owner) result.push(slot);
+	}
+	return result;
+}
+
 export function normalizeRuntimeCwd(cwd: string): string {
 	return resolvePath(cwd);
 }

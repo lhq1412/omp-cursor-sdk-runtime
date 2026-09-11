@@ -12,6 +12,7 @@ import { recordDynamicModelFetch, registerModelControls } from "./model-controls
 import { sanitizeCursorProviderError } from "./errors.js";
 import { registerCursorToolCallIds } from "./context.js";
 import { registerCursorWebSearchTool } from "./web-search-tool.js";
+import { registerCursorUsage } from "./usage-command.js";
 
 export default async function (pi: ExtensionAPI): Promise<void> {
 	registerCursorSessionResume(pi);
@@ -19,6 +20,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	registerHostToolCatalog(pi);
 	registerCursorWebSearchTool(pi);
 	registerModelControls(pi);
+	registerCursorUsage(pi);
 	registerCursorToolCallIds(pi);
 	registerCursorSessionScope(pi);
 	pi.registerProvider(CURSOR_SDK_PROVIDER_ID, {
