@@ -193,13 +193,11 @@ export function streamCursorRuntime(
 					if (live.checkpointStore) {
 						try {
 							const baseline = await live.checkpointStore.agents.get({ agentId: agent.agentId });
-							live.checkpointBaseline = {
-								rootBlobId: baseline?.agentId === agent.agentId
-									? baseline.latestCheckpoint?.rootBlobId ?? null
-									: null,
-							};
+							if (baseline?.agentId === agent.agentId) {
+								live.checkpointBaseline = { rootBlobId: baseline.latestCheckpoint?.rootBlobId ?? null };
+							}
 						} catch {
-							live.checkpointBaseline = { rootBlobId: null };
+							// Unknown previous root: occupancy stays unavailable.
 						}
 						assertCurrent();
 					}
@@ -269,10 +267,10 @@ export function streamCursorRuntime(
 					return;
 				}
 				const settledAgent = live.agent;
+				let occupancy;
 				if (settledAgent && live.checkpointBaseline &&
 					(!live.run || live.run.agentId === settledAgent.agentId)) {
 					const occupancyStore = live.checkpointStore ?? openJsonlStore(preparedSlot.storeIdentity.stateRoot);
-					let occupancy;
 					for (let attempt = 0; attempt < 10 && !live.cancelled; attempt++) {
 						occupancy = await Promise.race([
 							readSettledCheckpointOccupancy(
@@ -288,11 +286,6 @@ export function streamCursorRuntime(
 						await Promise.race([delay.promise, waitForCancelled(live)]);
 					}
 					assertCurrent();
-					if (occupancy && !live.cancelled && getLiveRun(preparedSlot.key) === live &&
-						preparedSlot.agent === settledAgent && live.agent === settledAgent) {
-						partial.usage.contextTokens = occupancy.usedTokens;
-						partial.cursorSdk.contextOccupancy = occupancy;
-					}
 				}
 				commitTurn(preparedSlot, context, incremental);
 				if (host) {
@@ -311,6 +304,11 @@ export function streamCursorRuntime(
 					});
 				}
 				assertCurrent();
+				if (occupancy && !live.cancelled && getLiveRun(preparedSlot.key) === live &&
+					preparedSlot.agent === settledAgent && live.agent === settledAgent) {
+					partial.usage.contextTokens = occupancy.usedTokens;
+					partial.cursorSdk.contextOccupancy = occupancy;
+				}
 				stream.push({ type: "done", reason: "stop", message: partial });
 				stream.end(partial);
 				await finishLiveKeepAgent(preparedSlot, "run finished");
@@ -319,6 +317,8 @@ export function streamCursorRuntime(
 			const aborted = abortSignal?.aborted || slot?.preparation?.signal.aborted ||
 				(owner && ownerGeneration !== undefined && owner.generation !== ownerGeneration);
 			if (slot) await finishTurnFailed(slot, "send failed");
+			delete partial.usage.contextTokens;
+			partial.cursorSdk.contextOccupancy = { status: "unavailable" };
 			partial.stopReason = aborted ? "aborted" : "error";
 			partial.errorMessage = aborted ? "Cancelled" : sanitizeCursorProviderError(error, apiKey);
 			stream.push({ type: "error", reason: aborted ? "aborted" : "error", error: partial });

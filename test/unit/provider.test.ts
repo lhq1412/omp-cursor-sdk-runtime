@@ -271,6 +271,69 @@ describe("streamCursorRuntime model selection", () => {
 		expect(last.message.usage.contextTokens).toBeUndefined();
 	});
 
+	test("a failed baseline read cannot publish the previous checkpoint as current occupancy", async () => {
+		let gets = 0;
+		runtimeTestUtils.setOpenAgent(async (input) => {
+			input.store.agents.get = async () => {
+				gets += 1;
+				if (gets === 1) throw new Error("baseline unavailable");
+				return {
+					agentId: "agent-occupancy", cwd: input.cwd, status: "idle" as const, createdAt: 1, updatedAt: 2,
+					latestCheckpoint: { schemaVersion: 1 as const, rootBlobId: "previous" },
+				};
+			};
+			input.store.checkpoints.get = async () => new Uint8Array([42, 5, 8, 150, 1, 16, 100]);
+			return {
+				agentId: "agent-occupancy", close() {}, async [Symbol.asyncDispose]() {},
+				async send() {
+					return { id: "run-occupancy", agentId: "agent-occupancy", supports: () => false,
+						wait: async () => ({ id: "run-occupancy", status: "finished", result: "answer" }) } as Run;
+				},
+			} as SDKAgent;
+		});
+		const last = (await drain(cursorModel("composer-2.5", 200_000), userContext("hi"), { apiKey: "test-key" })).at(-1);
+		expect(last).toMatchObject({ type: "done", message: { cursorSdk: { contextOccupancy: { status: "unavailable" } } } });
+		if (last?.type !== "done") throw new Error("Expected successful answer");
+		expect(last.message.usage.contextTokens).toBeUndefined();
+	});
+
+	test("abort during commitBinding does not leave authoritative occupancy on the aborted message", async () => {
+		const host = createFakeHost({ tools: [] });
+		const started = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		host.commitBinding = async () => { started.resolve(); await release.promise; };
+		let root = "baseline";
+		runtimeTestUtils.setOpenAgent(async (input) => {
+			input.store.agents.get = async () => ({
+				agentId: "agent-occupancy", cwd: input.cwd, status: "idle" as const, createdAt: 1, updatedAt: 2,
+				latestCheckpoint: { schemaVersion: 1 as const, rootBlobId: root },
+			});
+			input.store.checkpoints.get = async () => new Uint8Array([42, 5, 8, 150, 1, 16, 100]);
+			return {
+				agentId: "agent-occupancy", close() {}, async [Symbol.asyncDispose]() {},
+				async send() {
+					root = "fresh";
+					return { id: "run-occupancy", agentId: "agent-occupancy", supports: () => false,
+						wait: async () => ({ id: "run-occupancy", status: "finished", result: "answer" }) } as Run;
+				},
+			} as SDKAgent;
+		});
+		const controller = new AbortController();
+		const pending = drain(cursorModel("composer-2.5", 200_000), userContext("hi"), {
+			apiKey: "test-key",
+			signal: controller.signal,
+			[HOST_BRIDGE_OPTION_KEY]: host,
+		} as SimpleStreamOptions);
+		await started.promise;
+		controller.abort();
+		release.resolve();
+		const last = (await pending).at(-1);
+		expect(last?.type).toBe("error");
+		if (last?.type !== "error") throw new Error("Expected aborted turn");
+		expect(last.error.usage.contextTokens).toBeUndefined();
+		expect(last.error.cursorSdk.contextOccupancy).toEqual({ status: "unavailable" });
+	});
+
 	test("passes one built ModelSelection to Agent.create and send", async () => {
 		const created: ModelSelection[] = [];
 		const sent: ModelSelection[] = [];
