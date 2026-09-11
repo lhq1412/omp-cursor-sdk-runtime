@@ -468,4 +468,28 @@ describe("Cursor tool call context projection", () => {
 		expect(projected[1]).toMatchObject({ toolCallId: first.content[0].id });
 		expect(projected.slice(2)).toEqual(messages.slice(2));
 	});
+
+	test("does not mutate messages when OMP only shallow-copied the array", async () => {
+		const handlers = new Map<string, (event: unknown, ctx: unknown) => unknown>();
+		registerCursorToolCallIds({
+			on(event: string, handler: (event: unknown, ctx: unknown) => unknown) {
+				handlers.set(event, handler);
+			},
+		} as never);
+		const messages = [assistant(ids), result(ids[1]!), result(ids[0]!)];
+		const original = structuredClone(messages);
+		// Mirror OMP's structuredClone failure path: array copy only, shared message objects.
+		const event = { type: "context", messages: [...messages] };
+		const projected = await handlers.get("context")!(event, { model: { api: "openai-codex-responses" } }) as { messages: Context["messages"] };
+		expect(messages).toEqual(original);
+		expect(event.messages).toEqual(original);
+		const calls = projected.messages[0]!;
+		if (calls.role !== "assistant" || calls.content[0]?.type !== "toolCall" || calls.content[1]?.type !== "toolCall") {
+			throw new Error("Missing projected call");
+		}
+		expect(calls.content[0].id).not.toBe(ids[0]);
+		expect(calls.content[0].id.length).toBeLessThanOrEqual(64);
+		expect(projected.messages[1]).toMatchObject({ toolCallId: calls.content[1].id });
+		expect(projected.messages[2]).toMatchObject({ toolCallId: calls.content[0].id });
+	});
 });

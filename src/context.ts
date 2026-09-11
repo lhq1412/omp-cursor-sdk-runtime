@@ -45,28 +45,40 @@ export function registerCursorToolCallIds(pi: Pick<ExtensionAPI, "on">): void {
 		if (ctx.model?.api !== "openai-codex-responses") return;
 
 		const callIds = new Map<string, string>();
-		// Context messages are deep copies; leave persisted history and live SDK callback IDs untouched.
-		for (const message of event.messages) {
+		// OMP may only shallow-copy messages when structuredClone fails on details.
+		// Never mutate event.messages in place; return a new array of new objects.
+		let changed = false;
+		const messages = event.messages.map((message) => {
 			if (message.role === "assistant") {
 				const cursorOrigin = message.provider === CURSOR_SDK_PROVIDER_ID && message.api === CURSOR_SDK_API;
-				for (const block of message.content) {
-					if (block.type !== "toolCall") continue;
+				let contentChanged = false;
+				const content = message.content.map((block) => {
+					if (block.type !== "toolCall") return block;
 					const id = block.id;
 					if (cursorOrigin && id.length > 64) {
 						const mappedId = nativeToolCallId(id);
 						callIds.set(id, mappedId);
-						block.id = mappedId;
-					} else {
-						// A later call with the same raw ID owns subsequent results.
-						callIds.delete(id);
+						contentChanged = true;
+						return { ...block, id: mappedId };
 					}
-				}
-			} else if (message.role === "toolResult") {
-				const mappedId = callIds.get(message.toolCallId);
-				if (mappedId) message.toolCallId = mappedId;
+					// A later call with the same raw ID owns subsequent results.
+					callIds.delete(id);
+					return block;
+				});
+				if (!contentChanged) return message;
+				changed = true;
+				return { ...message, content };
 			}
-		}
-		return { messages: event.messages };
+			if (message.role === "toolResult") {
+				const mappedId = callIds.get(message.toolCallId);
+				if (!mappedId) return message;
+				changed = true;
+				return { ...message, toolCallId: mappedId };
+			}
+			return message;
+		});
+		if (!changed) return;
+		return { messages };
 	});
 }
 
