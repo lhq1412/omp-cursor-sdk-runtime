@@ -164,6 +164,113 @@ describe("streamCursorRuntime model selection", () => {
 		catalogTestUtils.resetCatalog();
 	});
 
+	test("checkpoint occupancy stays unavailable while parked and settles separately from billing", async () => {
+		let root = "previous-turn";
+		let status: "idle" | "running" = "idle";
+		const usage: TokenUsage = { inputTokens: 100, outputTokens: 10, cacheReadTokens: 20, cacheWriteTokens: 5, totalTokens: 135 };
+		runtimeTestUtils.setOpenAgent(async (input) => {
+			input.store.agents.get = async () => ({
+				agentId: "agent-occupancy", cwd: input.cwd, status, createdAt: 1, updatedAt: 2,
+				activeRunId: status === "running" ? "run-occupancy" : null,
+				latestCheckpoint: { schemaVersion: 1, rootBlobId: root },
+			});
+			// Field 5 contains usedTokens=150, maxTokens=100; overflow is not hidden.
+			input.store.checkpoints.get = async () => new Uint8Array([42, 5, 8, 150, 1, 16, 100]);
+			return {
+				agentId: "agent-occupancy", close() {}, async [Symbol.asyncDispose]() {},
+				async send(_message, options) {
+					status = "running";
+					root = "parked";
+					const tool = options?.local?.customTools?.read;
+					if (!tool) throw new Error("read tool missing");
+					const pending = tool.execute({ path: "a.ts" }, { toolCallId: "call-occupancy" });
+					return {
+						id: "run-occupancy", agentId: "agent-occupancy", supports: () => false,
+						wait: async () => {
+							await pending;
+							root = "settled";
+							status = "idle";
+							return { id: "run-occupancy", status: "finished", usage } as RunResult;
+						},
+					} as unknown as Run;
+				},
+			} as SDKAgent;
+		});
+		const context = userContext("inspect", [readTool()]);
+		const parked = (await drain(cursorModel("composer-2.5", 200_000), context, { apiKey: "test-key" })).at(-1);
+		expect(parked).toMatchObject({ type: "done", reason: "toolUse", message: { cursorSdk: { contextOccupancy: { status: "unavailable" } } } });
+		if (parked?.type !== "done") throw new Error("Expected parked turn");
+		expect(parked.message.usage.contextTokens).toBeUndefined();
+		const settled = (await drain(cursorModel("composer-2.5", 200_000), {
+			...context, messages: [...context.messages, parked.message,
+				{ role: "toolResult", toolCallId: "call-occupancy", toolName: "read", content: [{ type: "text", text: "ok" }], isError: false, timestamp: 2 }],
+		}, { apiKey: "test-key" })).at(-1);
+		expect(settled).toMatchObject({ type: "done", message: {
+			usage: { contextTokens: 150, input: 0, output: 0, totalTokens: 135,
+				orchestration: { input: 105, output: 10, cacheRead: 20 }, cost: { total: 0 } },
+			cursorSdk: { cost: "unavailable", contextOccupancy: { status: "actual", source: "checkpoint", rootBlobId: "settled", maxTokens: 100 } },
+		} });
+	});
+
+	test.each(["abort", "navigation"] as const)("%s during optional checkpoint read cannot publish stale occupancy", async (change) => {
+		const reading = Promise.withResolvers<void>();
+		const blob = Promise.withResolvers<Uint8Array>();
+		const controller = new AbortController();
+		let root = "baseline";
+		runtimeTestUtils.setOpenAgent(async (input) => {
+			input.store.agents.get = async () => ({
+				agentId: "agent-occupancy", cwd: input.cwd, status: "idle", createdAt: 1, updatedAt: 2,
+				latestCheckpoint: { schemaVersion: 1, rootBlobId: root },
+			});
+			input.store.checkpoints.get = async () => { reading.resolve(); return blob.promise; };
+			return {
+				agentId: "agent-occupancy", close() {}, async [Symbol.asyncDispose]() {},
+				async send() {
+					root = "fresh";
+					return { id: "run-occupancy", agentId: "agent-occupancy", supports: () => false,
+						wait: async () => ({ id: "run-occupancy", status: "finished", result: "answer" }) } as Run;
+				},
+			} as SDKAgent;
+		});
+		const pending = drain(cursorModel("composer-2.5", 200_000), userContext("hi"), { apiKey: "test-key", signal: controller.signal });
+		await reading.promise;
+		if (change === "abort") controller.abort();
+		else await disposeRuntimeForScope();
+		blob.resolve(new Uint8Array([42, 5, 8, 150, 1, 16, 100]));
+		const last = (await pending).at(-1);
+		expect(last?.type).toBe("error");
+		if (last?.type !== "error") throw new Error("Expected cancelled or superseded request");
+		expect(last.error.usage.contextTokens).toBeUndefined();
+	});
+
+	test("optional checkpoint read failure preserves the successful answer and run billing", async () => {
+		let root = "baseline";
+		runtimeTestUtils.setOpenAgent(async (input) => {
+			input.store.agents.get = async () => ({
+				agentId: "agent-occupancy", cwd: input.cwd, status: "idle", createdAt: 1, updatedAt: 2,
+				latestCheckpoint: { schemaVersion: 1, rootBlobId: root },
+			});
+			input.store.checkpoints.get = async () => { throw new Error("disk read failed"); };
+			return {
+				agentId: "agent-occupancy", close() {}, async [Symbol.asyncDispose]() {},
+				async send() {
+					root = "fresh";
+					return { id: "run-occupancy", agentId: "agent-occupancy", supports: () => false,
+						wait: async () => ({ id: "run-occupancy", status: "finished", result: "answer",
+							usage: { inputTokens: 20, outputTokens: 3, cacheReadTokens: 0, cacheWriteTokens: 0, totalTokens: 23 } }),
+					} as Run;
+				},
+			} as SDKAgent;
+		});
+		const last = (await drain(cursorModel("composer-2.5", 200_000), userContext("hi"), { apiKey: "test-key" })).at(-1);
+		expect(last).toMatchObject({ type: "done", message: {
+			content: [{ type: "text", text: "answer" }], usage: { totalTokens: 23, orchestration: { input: 20, output: 3 } },
+			cursorSdk: { contextOccupancy: { status: "unavailable" } },
+		} });
+		if (last?.type !== "done") throw new Error("Expected successful answer");
+		expect(last.message.usage.contextTokens).toBeUndefined();
+	});
+
 	test("passes one built ModelSelection to Agent.create and send", async () => {
 		const created: ModelSelection[] = [];
 		const sent: ModelSelection[] = [];

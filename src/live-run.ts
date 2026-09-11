@@ -1,4 +1,4 @@
-import type { SDKAgent, Run, RunResult } from "@cursor/sdk";
+import type { LocalAgentStore, SDKAgent, Run, RunResult } from "@cursor/sdk";
 import type { AssistantMessage, AssistantMessageEventStream, Context } from "@oh-my-pi/pi-ai";
 import type { HostToolResult } from "./contracts.js";
 import { toolResultToHost, trailingToolResults } from "./omp-tools.js";
@@ -17,6 +17,8 @@ export interface ParkedToolCall {
 export interface LiveRun {
 	agent?: SDKAgent;
 	run?: Run;
+	checkpointStore?: LocalAgentStore;
+	checkpointBaseline?: { rootBlobId: string | null };
 	wait: Promise<RunResult>;
 	starting?: Promise<RunResult>;
 	parked: ParkedToolCall[];

@@ -13,6 +13,7 @@ import { sanitizeCursorProviderError } from "./errors.js";
 import { registerCursorToolCallIds } from "./context.js";
 import { registerCursorWebSearchTool } from "./web-search-tool.js";
 import { registerCursorUsage } from "./usage-command.js";
+import { cursorSdkUsageProvider } from "./usage-provider.js";
 
 export default async function (pi: ExtensionAPI): Promise<void> {
 	registerCursorSessionResume(pi);
@@ -27,6 +28,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		baseUrl: "https://cursor.com",
 		api: CURSOR_SDK_API,
 		apiKey: CURSOR_API_KEY_ENV_VAR,
+		usage: cursorSdkUsageProvider,
 		oauth: {
 			name: "Cursor SDK API key",
 			login: async (callbacks) => {

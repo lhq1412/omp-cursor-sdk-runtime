@@ -13,8 +13,15 @@ export interface CursorAssistantMessage extends AssistantMessage {
 	cursorSdk: {
 		tokenUsage: "actual" | "unavailable";
 		cost: "unavailable";
-		// Public SDK usage is cumulative billing, not an authoritative context snapshot.
-		contextOccupancy: { status: "unavailable" };
+		// Run billing and the settled checkpoint's context occupancy are separate measurements.
+		contextOccupancy: { status: "unavailable" } | {
+			status: "actual";
+			source: "checkpoint";
+			agentId: string;
+			rootBlobId: string;
+			usedTokens: number;
+			maxTokens: number;
+		};
 	};
 }
 
