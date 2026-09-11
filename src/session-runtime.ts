@@ -60,6 +60,16 @@ export function listRuntimeSlots(): RuntimeSlot[] {
 	return result;
 }
 
+/** Snapshot process-known live agents for one credential, independent of session ownership. */
+export function listCredentialUsageAgents(scopeId: string): Array<{ agent: SDKAgent; agentInstanceId: string }> {
+	const agents = new Map<string, { agent: SDKAgent; agentInstanceId: string }>();
+	for (const slot of slots.values()) {
+		if (slot.credentialScopeId !== scopeId || !slot.agent || agents.has(slot.agent.agentId)) continue;
+		agents.set(slot.agent.agentId, { agent: slot.agent, agentInstanceId: slot.agentInstanceId });
+	}
+	return [...agents.values()];
+}
+
 export function normalizeRuntimeCwd(cwd: string): string {
 	return resolvePath(cwd);
 }
@@ -309,6 +319,7 @@ export async function prepareTurn(input: OpenRuntimeTurnInput): Promise<Prepared
 			slot.includeWebSearch = Boolean(input.includeWebSearch);
 		}
 		live.agent = slot.agent;
+		live.checkpointStore = store;
 		setLiveRun(slot.key, live);
 		slot.bindingState = "in-flight";
 		slot.cwd = cwd;

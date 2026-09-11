@@ -35,6 +35,8 @@ import {
 	reconcileRunResult,
 } from "./projector.js";
 
+import { readSettledCheckpointOccupancy } from "./native-history.js";
+import { openJsonlStore } from "./sdk-session.js";
 const bridgeOwners = new Map<string, { owner: CursorSessionOwner; signal: AbortSignal; onAbort: () => void }>();
 
 function selectionForTurn(model: Model<Api>, apiKey: string, options?: SimpleStreamOptions): ModelSelection {
@@ -188,6 +190,17 @@ export function streamCursorRuntime(
 					if (!modelSelection) {
 						throw new Error("Cannot send a Cursor SDK turn without a model selection");
 					}
+					if (live.checkpointStore) {
+						try {
+							const baseline = await live.checkpointStore.agents.get({ agentId: agent.agentId });
+							if (baseline?.agentId === agent.agentId) {
+								live.checkpointBaseline = { rootBlobId: baseline.latestCheckpoint?.rootBlobId ?? null };
+							}
+						} catch {
+							// Unknown previous root: occupancy stays unavailable.
+						}
+						assertCurrent();
+					}
 					const starting = startSend(live, () =>
 						withSdkExitSuppressed(() =>
 							agent.send(userPrompt, {
@@ -253,6 +266,27 @@ export function streamCursorRuntime(
 					await finishTurnFailed(preparedSlot, "cancelled");
 					return;
 				}
+				const settledAgent = live.agent;
+				let occupancy;
+				if (settledAgent && live.checkpointBaseline &&
+					(!live.run || live.run.agentId === settledAgent.agentId)) {
+					const occupancyStore = live.checkpointStore ?? openJsonlStore(preparedSlot.storeIdentity.stateRoot);
+					for (let attempt = 0; attempt < 10 && !live.cancelled; attempt++) {
+						occupancy = await Promise.race([
+							readSettledCheckpointOccupancy(
+								attempt === 0 ? occupancyStore : openJsonlStore(preparedSlot.storeIdentity.stateRoot),
+								settledAgent.agentId,
+								live.checkpointBaseline.rootBlobId,
+							),
+							waitForCancelled(live).then(() => undefined),
+						]);
+						if (occupancy || live.cancelled) break;
+						const delay = Promise.withResolvers<void>();
+						setTimeout(delay.resolve, 25);
+						await Promise.race([delay.promise, waitForCancelled(live)]);
+					}
+					assertCurrent();
+				}
 				commitTurn(preparedSlot, context, incremental);
 				if (host) {
 					await host.commitBinding({
@@ -270,6 +304,11 @@ export function streamCursorRuntime(
 					});
 				}
 				assertCurrent();
+				if (occupancy && !live.cancelled && getLiveRun(preparedSlot.key) === live &&
+					preparedSlot.agent === settledAgent && live.agent === settledAgent) {
+					partial.usage.contextTokens = occupancy.usedTokens;
+					partial.cursorSdk.contextOccupancy = occupancy;
+				}
 				stream.push({ type: "done", reason: "stop", message: partial });
 				stream.end(partial);
 				await finishLiveKeepAgent(preparedSlot, "run finished");
@@ -278,6 +317,8 @@ export function streamCursorRuntime(
 			const aborted = abortSignal?.aborted || slot?.preparation?.signal.aborted ||
 				(owner && ownerGeneration !== undefined && owner.generation !== ownerGeneration);
 			if (slot) await finishTurnFailed(slot, "send failed");
+			delete partial.usage.contextTokens;
+			partial.cursorSdk.contextOccupancy = { status: "unavailable" };
 			partial.stopReason = aborted ? "aborted" : "error";
 			partial.errorMessage = aborted ? "Cancelled" : sanitizeCursorProviderError(error, apiKey);
 			stream.push({ type: "error", reason: aborted ? "aborted" : "error", error: partial });
