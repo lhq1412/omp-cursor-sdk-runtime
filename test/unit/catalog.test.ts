@@ -120,6 +120,95 @@ describe("identity mapping", () => {
 	});
 });
 
+describe("reference pricing", () => {
+	test("exact IDs and explicit Claude price aliases preserve SDK context and wire selection", async () => {
+		__testUtils.setListModels(async () => [
+			item({
+				id: "gpt-5.5",
+				parameters: [param("context", ["128k", "272k", "1m"])],
+				variants: defaultVariant([{ id: "context", value: "272k" }]),
+			}),
+			item({
+				id: "claude-4.5-sonnet",
+				parameters: [param("thinking", ["false", "true"]), param("effort", ["low", "high"])],
+				variants: defaultVariant([{ id: "thinking", value: "true" }, { id: "effort", value: "low" }]),
+			}),
+		]);
+		const models = await fetchCursorModels("reference-key");
+		expect(models.map((model) => model.id)).toEqual([
+			"claude-4.5-sonnet", "gpt-5.5", "gpt-5.5@128k", "gpt-5.5@1m",
+		]);
+		for (const id of ["gpt-5.5", "gpt-5.5@128k", "gpt-5.5@1m"]) {
+			expect(models.find((model) => model.id === id)?.cost).toEqual({
+				input: 5, output: 30, cacheRead: 0.5, cacheWrite: 0,
+			});
+		}
+		expect(models.find((model) => model.id === "gpt-5.5@128k")?.contextWindow).toBe(128_000);
+		expect(buildModelSelection("gpt-5.5@128k", "off", { apiKey: "reference-key" })).toEqual({
+			id: "gpt-5.5", params: [{ id: "context", value: "128k" }],
+		});
+		expect(models.find((model) => model.id === "claude-4.5-sonnet")?.cost).toEqual({
+			input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75,
+		});
+		expect(buildModelSelection("claude-4.5-sonnet", "high", { apiKey: "reference-key" })).toEqual({
+			id: "claude-4.5-sonnet",
+			params: [{ id: "thinking", value: "true" }, { id: "effort", value: "high" }],
+		});
+	});
+
+	test("unknown SKUs cannot borrow prices from display names, SDK aliases or nearby model IDs", async () => {
+		const ids = [
+			"gpt-5.5-future", "claude-4.5-sonnet-pro", "gpt-5.5-fast", "gpt-5.5-search",
+			"claude-4.5-sonnet-fast", "gemini-3-pro",
+		];
+		__testUtils.setListModels(async () => ids.map((id) => item({
+			id,
+			displayName: "gpt-5.5",
+			aliases: ["gpt-5.5", "claude-sonnet-4-5"],
+		})));
+		const models = await fetchCursorModels("unknown-key");
+		expect(models.map((model) => model.id).sort()).toEqual([...ids].sort());
+		for (const model of models) {
+			expect(model.cost).toEqual({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0 });
+		}
+	});
+
+	test("native long-context pricing cannot replace SDK thresholds or create context capabilities", async () => {
+		__testUtils.setListModels(async () => [
+			item({
+				id: "gpt-5.6",
+				parameters: [param("context", ["128k", "1m"])],
+				variants: defaultVariant([{ id: "context", value: "1m" }]),
+			}),
+			item({
+				id: "gpt-5.6-luna",
+				parameters: [param("context", ["128k"])],
+				variants: defaultVariant([{ id: "context", value: "128k" }]),
+			}),
+		]);
+		const models = await fetchCursorModels("threshold-key");
+		expect(models.find((model) => model.id === "gpt-5.6")?.cost).toEqual({
+			input: 4, output: 20, cacheRead: 0.4, cacheWrite: 5,
+			longContext: {
+				inputThreshold: 128_000,
+				input: 4, output: 20, cacheRead: 0.4, cacheWrite: 5,
+			},
+		});
+		expect(buildModelSelection("gpt-5.6", "off", { apiKey: "threshold-key", extendedContextEnabled: false })).toEqual({
+			id: "gpt-5.6", params: [{ id: "context", value: "128k" }],
+		});
+		expect(buildModelSelection("gpt-5.6", "off", { apiKey: "threshold-key", extendedContextEnabled: true })).toEqual({
+			id: "gpt-5.6", params: [{ id: "context", value: "1m" }],
+		});
+		const standardOnly = models.find((model) => model.id === "gpt-5.6-luna");
+		expect(standardOnly?.cost).toEqual({ input: 0.2, output: 1.2, cacheRead: 0.02, cacheWrite: 0.25 });
+		expect(standardOnly?.contextWindow).toBe(128_000);
+		expect(buildModelSelection("gpt-5.6-luna", "off", { apiKey: "threshold-key", extendedContextEnabled: true })).toEqual({
+			id: "gpt-5.6-luna", params: [{ id: "context", value: "128k" }],
+		});
+	});
+});
+
 describe("thinking selection", () => {
 	test("thinking+effort off writes thinking=false and drops effort", () => {
 		__testUtils.registerModelItems([

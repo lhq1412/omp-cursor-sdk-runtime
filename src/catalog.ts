@@ -6,6 +6,7 @@ import {
 	type ModelSelection,
 } from "@cursor/sdk";
 import { Effort, type ModelCost } from "@oh-my-pi/pi-ai";
+import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import type { ProviderModelConfig } from "@oh-my-pi/pi-coding-agent";
 import { credentialScopeId } from "./auth.js";
 import { CURSOR_SDK_PROVIDER_ID, DEFAULT_MODEL_ID } from "./constants.js";
@@ -52,6 +53,19 @@ type ListModels = (apiKey: string) => Promise<readonly ModelListItem[]>;
 const FALLBACK_CONTEXT_WINDOW = 200_000;
 const FALLBACK_MAX_TOKENS = 64_000;
 const ZERO_COST = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } as const;
+const PRICE_PROVIDERS = ["cursor", "openai", "anthropic", "google", "xai"] as const;
+const BASE_PRICE_FIELDS = ["input", "output", "cacheRead", "cacheWrite"] as const;
+const CLAUDE_PRICE_IDS: Readonly<Record<string, string>> = {
+	"claude-4-sonnet": "claude-sonnet-4-0",
+	"claude-4.5-sonnet": "claude-sonnet-4-5",
+	"claude-4.5-opus": "claude-opus-4-5",
+	"claude-4.5-opus-high": "claude-opus-4-5",
+	"claude-4.6-opus": "claude-opus-4-6",
+	"claude-4.6-opus-high": "claude-opus-4-6",
+	"claude-4.6-opus-max": "claude-opus-4-6",
+	"claude-4.6-sonnet": "claude-sonnet-4-6",
+	"claude-4.6-sonnet-medium": "claude-sonnet-4-6",
+};
 const TEXT_AND_IMAGE_INPUT: ProviderModelConfig["input"] = ["text", "image"];
 const OMP_THINKING_EFFORTS = [
 	Effort.Minimal,
@@ -339,19 +353,39 @@ function toMetadata(identity: SelectionIdentity, defaultParams: ModelParameterVa
 	};
 }
 
-function toModelConfig(metadata: CursorModelMetadata, name: string): ProviderModelConfig {
-	const cost: ModelCost = metadata.extendedContext
-		? {
-				...ZERO_COST,
-				longContext: {
-					...ZERO_COST,
-					inputThreshold: metadata.extendedContext.standardContextWindow,
-				},
+function getReferencePriceModel(modelId: string) {
+	for (const provider of PRICE_PROVIDERS) {
+		const id = provider === "anthropic" && Object.hasOwn(CLAUDE_PRICE_IDS, modelId)
+			? CLAUDE_PRICE_IDS[modelId]!
+			: modelId;
+		const model = getBundledModel(provider, id);
+		if (!model) continue;
+		let valid = true;
+		let nonzero = false;
+		for (const field of BASE_PRICE_FIELDS) {
+			const rate = model.cost[field];
+			if (!Number.isFinite(rate) || rate < 0) {
+				valid = false;
+				break;
 			}
-		: { ...ZERO_COST };
+			if (rate > 0) nonzero = true;
+		}
+		if (valid && nonzero) return model;
+	}
+	return undefined;
+}
+
+function toModelConfig(metadata: CursorModelMetadata, name: string): ProviderModelConfig {
+	const reference = getReferencePriceModel(metadata.baseModelId);
+	const { input, output, cacheRead, cacheWrite } = reference?.cost ?? ZERO_COST;
+	const cost: ModelCost = { input, output, cacheRead, cacheWrite };
+	if (metadata.extendedContext) {
+		// Base-mode reference only: preserve the SDK threshold, not the vendor's tier pricing.
+		cost.longContext = { ...cost, inputThreshold: metadata.extendedContext.standardContextWindow };
+	}
 	return {
 		id: metadata.piModelId,
-		name,
+		name: `${name} ${reference ? `[base ref: ${reference.provider}/${reference.id}]` : "[price unknown; not free]"}`,
 		reasoning: metadata.supportsReasoning,
 		...(metadata.supportsReasoning && metadata.thinkingLevelMap
 			? {
