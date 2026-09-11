@@ -90,6 +90,12 @@ omp models refresh
 
 Models are **canonical IDs only** (`cursor-sdk/composer-2.5`). Fast is a per-send flag, not a catalog alias: there are no `@fast` / slow suffix rows.
 
+The native model browser's input/output prices are **base-mode reference USD per million tokens, not Cursor SDK charges**. The adapter first checks an exact, nonzero OMP bundled Cursor price, then exact IDs in the bundled OpenAI, Anthropic, Google and xAI catalogs. A small explicit map covers Cursor's alternate Claude names; display names, SDK aliases, arbitrary suffixes and Gemini preview variants are not guessed. The selected model's detail name identifies the source, for example `[base ref: openai/gpt-5.5]`. Prices follow the pinned OMP catalog, not a live price feed; SDK model IDs, capabilities and selection parameters remain authoritative.
+
+All bundled Cursor prices in OMP 18.1.14 are zero, so matched first-party models supply the current comparisons. Models without a reliable price, including Composer, show `[price unknown; not free]` in their detail name. **OMP 18.1.14 still renders structural zero prices as `free` in its native price column; this host label does not mean these models are free.** The plain `omp models` table has no price columns; use the interactive model browser for comparisons.
+
+Reference rates do not account for Cursor fast mode, long-context premiums, discounts or plan coverage. Extended-context rows retain the SDK threshold but repeat the base reference rates; they do not import the vendor's pricing tiers. These catalog rates are not used to calculate assistant-message costs: message `usage.cost` remains unavailable, and token/context accounting is unchanged. Restart OMP after updating the extension, then run `/cursor-refresh-models` to refresh the model list.
+
 ```bash
 omp --model cursor-sdk/composer-2.5
 omp --model cursor-sdk/gpt-5.5:xhigh  # when this model/effort is in your live catalog
