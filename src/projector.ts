@@ -186,20 +186,23 @@ export function applyToolCall(
 	}
 }
 
-export function dropUnendedPreviews(
+export function deliverWithoutUnendedPreviews(
 	partial: AssistantMessage,
 	projection: RunProjection,
 	keepIds: ReadonlySet<string>,
-): void {
-	if (!projection.previews) return;
-	for (let index = partial.content.length - 1; index >= 0; index -= 1) {
-		const block = partial.content[index];
-		if (block.type !== "toolCall" || keepIds.has(block.id)) continue;
-		const preview = projection.previews.get(block.id);
-		if (!preview || preview.ended) continue;
-		projection.previews.delete(block.id);
-		partial.content.splice(index, 1);
-	}
+): AssistantMessage {
+	const previews = projection.previews;
+	if (!previews) return partial;
+	let changed = false;
+	const content = partial.content.filter((block) => {
+		if (block.type !== "toolCall" || keepIds.has(block.id)) return true;
+		const preview = previews.get(block.id);
+		if (!preview || preview.ended) return true;
+		previews.delete(block.id);
+		changed = true;
+		return false;
+	});
+	return changed ? { ...partial, content } : partial;
 }
 
 export function endLastOpenBlock(stream: AssistantMessageEventStream, partial: AssistantMessage): void {
