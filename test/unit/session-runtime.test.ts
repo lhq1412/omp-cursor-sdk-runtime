@@ -11,11 +11,15 @@ import {
 	prepareTurn,
 	commitTurn,
 	finishTurnFailed,
+	finishLiveKeepAgent,
+	disposeRuntimeForScope,
+	invalidateRuntime,
 	agentConfigMismatch,
 	__testUtils as runtimeTestUtils,
+	type PreparedTurn,
 } from "../../src/session-runtime.ts";
 import { __testUtils as liveRunTestUtils } from "../../src/live-run.ts";
-import { __testUtils as scopeTestUtils } from "../../src/session-scope.ts";
+import { __testUtils as scopeTestUtils, getCursorSessionOwner, ownerForRequest, withCursorSessionOwner } from "../../src/session-scope.ts";
 import { parseResumeEntryData, registerCursorSessionResume, __testUtils as resumeTestUtils } from "../../src/session-resume.ts";
 
 const modelLimits = { contextWindow: 200_000, maxTokens: 20_000 };
@@ -61,7 +65,7 @@ function toolResultContext(): Context {
 	} as Context;
 }
 
-function registerResume(mode: "write" | "swallow" = "write"): {
+function registerResume(mode: "write" | "swallow" = "write", sessionId = "sess-1"): {
 	appended: Array<{ type: string; data: unknown }>;
 	sessionFile: string;
 	handlers: Map<string, Array<(event: unknown, ctx: unknown) => unknown>>;
@@ -72,13 +76,13 @@ function registerResume(mode: "write" | "swallow" = "write"): {
 	const handlers = new Map<string, Array<(event: unknown, ctx: unknown) => unknown>>();
 	const sessionFile = join(mkdtempSync(join(tmpdir(), "omp-csr-")), "session.jsonl");
 	writeFileSync(sessionFile, "");
-	scopeTestUtils.set("/tmp/project", sessionFile, "sess-1");
+	scopeTestUtils.set("/tmp/project", sessionFile, sessionId);
 	const branch: Array<{ type: string; id: string; parentId: string | null; customType?: string; data?: unknown; message?: { role: string } }> = [];
 	const ctx = {
 		cwd: "/tmp/project",
 		sessionManager: {
 			getSessionFile: () => sessionFile,
-			getSessionId: () => "sess-1",
+			getSessionId: () => sessionId,
 			getBranch: () => branch,
 			getEntries: () => branch,
 		},
@@ -126,6 +130,149 @@ function seedCommittedHandle(sessionFile: string, context: Context, agentId = "a
 }
 
 describe("session runtime", () => {
+	test("child invalidation cannot abort a parent preparation or redirect its committed writer", async () => {
+		runtimeTestUtils.clear();
+		liveRunTestUtils.clear();
+		scopeTestUtils.reset();
+		const parent = registerResume("write", "parent");
+		const parentOwner = getCursorSessionOwner();
+		let opened!: () => void;
+		let finishOpen!: () => void;
+		const opening = new Promise<void>((resolve) => { opened = resolve; });
+		const gate = new Promise<void>((resolve) => { finishOpen = resolve; });
+		runtimeTestUtils.setOpenAgent(async () => {
+			if (getCursorSessionOwner() === parentOwner) {
+				opened();
+				await gate;
+				return fakeAgent("agent-parent");
+			}
+			return fakeAgent("agent-child");
+		});
+		const input = {
+			cwd: "/tmp/project", agentInstanceId: "main", apiKey: "test-key",
+			modelSelection: { id: "composer-2.5" }, modelLimits,
+			context: userContext("parent request"), grantedTools: [],
+		};
+		const parentTurn = withCursorSessionOwner(parentOwner, () => prepareTurn(input));
+		await opening;
+		const child = registerResume("write", "child");
+		const childTurn = await prepareTurn({ ...input, context: userContext("child request") });
+		invalidateRuntime("child compacted");
+		finishOpen();
+		const prepared = await parentTurn;
+		expect(prepared.slot.preparation?.signal.aborted).toBe(false);
+		expect(childTurn.slot.preparation?.signal.aborted).toBe(true);
+		// Commit deliberately runs while the caller owns the child.
+		commitTurn(prepared.slot, input.context, false);
+		await parent.handlers.get("turn_end")?.[0]?.({}, parent.ctx);
+		const parentCommit = parent.appended.find((entry) => parseResumeEntryData(entry.data)?.state === "committed");
+		expect(parentCommit?.data).toMatchObject({
+			agentId: "agent-parent", scopeKey: parent.sessionFile, sessionId: "parent",
+		});
+		expect(child.appended.some((entry) => parseResumeEntryData(entry.data)?.agentId === "agent-parent")).toBe(false);
+		await disposeRuntimeForScope(parentOwner.scopeKey);
+		await disposeRuntimeForScope(childTurn.slot.scopeKey);
+	});
+
+	test("a one-shot title owner never reuses or persists the parent agent", async () => {
+		runtimeTestUtils.clear();
+		liveRunTestUtils.clear();
+		scopeTestUtils.reset();
+		const parent = registerResume("write", "parent");
+		const parentOwner = getCursorSessionOwner();
+		let opens = 0;
+		runtimeTestUtils.setOpenAgent(async () => fakeAgent(`agent-${++opens}`));
+		const input = {
+			cwd: "/tmp/project", agentInstanceId: "main", apiKey: "test-key",
+			modelSelection: { id: "composer-2.5" }, modelLimits,
+			context: userContext("parent request"), grantedTools: [],
+		};
+		const parentTurn = await prepareTurn(input);
+		const titleOwner = ownerForRequest();
+		const titleTurn = await withCursorSessionOwner(titleOwner, () => prepareTurn({
+			...input, context: userContext("generate title"),
+		}));
+		commitTurn(titleTurn.slot, input.context, false);
+		await withCursorSessionOwner(titleOwner, () => disposeRuntimeForScope());
+		expect(parentTurn.slot.preparation?.signal.aborted).toBe(false);
+		expect(opens).toBe(2);
+		commitTurn(parentTurn.slot, input.context, false);
+		await parent.handlers.get("turn_end")?.[0]?.({}, parent.ctx);
+		expect(parent.appended.map((entry) => parseResumeEntryData(entry.data)?.agentId)).toEqual(["agent-1"]);
+		await disposeRuntimeForScope(parentOwner.scopeKey);
+	});
+
+	for (const interruption of ["abort", "scope", "invalidate", "newer"] as const) {
+		test(`late initialization cannot attach after ${interruption}`, async () => {
+			runtimeTestUtils.clear();
+			liveRunTestUtils.clear();
+			scopeTestUtils.reset();
+			resumeTestUtils.reset();
+			registerResume();
+			let resolveOpen!: (agent: SDKAgent) => void;
+			let entered!: () => void;
+			const opening = new Promise<SDKAgent>((resolve) => { resolveOpen = resolve; });
+			const started = new Promise<void>((resolve) => { entered = resolve; });
+			let signal: AbortSignal | undefined;
+			runtimeTestUtils.setOpenAgent((input) => {
+				signal = input.signal;
+				entered();
+				return opening;
+			});
+			const controller = new AbortController();
+			const input = {
+				modelLimits, cwd: "/tmp/project", agentInstanceId: "main", apiKey: "test-key",
+				modelSelection: { id: "composer-2.5" }, context: userContext("old"), grantedTools: [],
+			};
+			const old = prepareTurn({ ...input, signal: controller.signal });
+			await Promise.race([
+				started,
+				old.then(() => { throw new Error("prepareTurn finished before opening the agent"); }),
+			]);
+			let newer: PreparedTurn | undefined;
+			if (interruption === "abort") controller.abort();
+			else if (interruption === "scope") await disposeRuntimeForScope();
+			else if (interruption === "invalidate") invalidateRuntime("compaction");
+			else {
+				runtimeTestUtils.setOpenAgent(async () => fakeAgent("new"));
+				newer = await prepareTurn({ ...input, context: userContext("new") });
+			}
+			expect(signal?.aborted).toBe(true);
+			let disposed = 0;
+			resolveOpen({ ...fakeAgent("old"), async [Symbol.asyncDispose]() { disposed++; } } as SDKAgent);
+			await expect(old).rejects.toThrow();
+			expect(disposed).toBe(1);
+			expect([...runtimeTestUtils.slots.values()].some((slot) => slot.agent?.agentId === "old")).toBe(false);
+			if (newer) expect(runtimeTestUtils.slots.get(newer.slot.key)?.agent?.agentId).toBe("new");
+		});
+	}
+
+	test("late old completion and cleanup leave the newer route committed", async () => {
+		runtimeTestUtils.clear();
+		liveRunTestUtils.clear();
+		scopeTestUtils.reset();
+		resumeTestUtils.reset();
+		registerResume();
+		let opens = 0;
+		runtimeTestUtils.setOpenAgent(async () => fakeAgent(`agent-${++opens}`));
+		const input = {
+			modelLimits, cwd: "/tmp/project", agentInstanceId: "main", apiKey: "test-key",
+			modelSelection: { id: "composer-2.5" }, context: userContext("old"), grantedTools: [],
+		};
+		const old = await prepareTurn(input);
+		const context = userContext("new");
+		const newer = await prepareTurn({ ...input, context });
+		commitTurn(newer.slot, context, false);
+		const pending = structuredClone(resumeTestUtils.state.pendingHandle);
+		commitTurn(old.slot, input.context, false);
+		await finishTurnFailed(old.slot, "late error");
+		await finishLiveKeepAgent(old.slot, "late completion");
+		expect(newer.live.cancelled).toBe(false);
+		expect(newer.slot.agent?.agentId).toBe("agent-2");
+		expect(newer.slot.bindingState).toBe("committed");
+		expect(resumeTestUtils.state.pendingHandle).toEqual(pending);
+	});
+
 	test("rejects oversized bootstrap before opening an SDK agent", async () => {
 		runtimeTestUtils.clear();
 		liveRunTestUtils.clear();
@@ -212,8 +359,10 @@ describe("session runtime", () => {
 		} as Context;
 		seedCommittedHandle(sessionFile, context);
 		const resumedIds: Array<string | undefined> = [];
+		let history: Context["messages"] | undefined;
 		runtimeTestUtils.setOpenAgent(async (input) => {
 			resumedIds.push(input.savedAgentId);
+			history = input.bootstrapHistory;
 			return fakeAgent("agent-new");
 		});
 		const prepared = await prepareTurn({
@@ -223,9 +372,8 @@ describe("session runtime", () => {
 		expect(resumedIds).toEqual([undefined]);
 		expect(prepared.continuing).toBe(false);
 		expect(prepared.incremental).toBe(false);
-		expect(prepared.prompt?.text).toContain("Read a.ts and summarize it");
-		expect(prepared.prompt?.text).toContain("toolResult read (call-1): ok");
-		expect(prepared.prompt?.text).toContain("Current continuation request:");
+		expect(history).toEqual(context.messages);
+		expect(prepared.prompt?.text).not.toContain("Read a.ts and summarize it");
 	});
 
 	test("bootstraps reconstructed history on a new agent", async () => {
@@ -234,15 +382,18 @@ describe("session runtime", () => {
 		scopeTestUtils.reset();
 		resumeTestUtils.reset();
 		scopeTestUtils.set("/tmp/project", "/tmp/session.jsonl", "sess-1");
-		runtimeTestUtils.setOpenAgent(async () => fakeAgent("agent-new"));
+		let history: Context["messages"] | undefined;
+		runtimeTestUtils.setOpenAgent(async (input) => {
+			history = input.bootstrapHistory;
+			return fakeAgent("agent-new");
+		});
 		const prepared = await prepareTurn({ modelLimits, cwd: "/tmp/project",
 			agentInstanceId: "main",
 			apiKey: "test-key",
 			modelSelection: { id: "composer-2.5" },
 			context: historyThenContinue(),
 			grantedTools: [], });
-		expect(prepared.prompt?.text).toContain("target is important.ts");
-		expect(prepared.prompt?.text).toContain("continue that edit");
+		expect(history).toEqual(historyThenContinue().messages.slice(0, -1));
 		expect(prepared.incremental).toBe(false);
 	});
 
@@ -326,7 +477,6 @@ describe("session runtime", () => {
 		expect(opens[1]?.savedAgentId).toBeUndefined();
 		expect(opens[1]?.cwd).toContain("/tmp/other");
 		expect(second.incremental).toBe(false);
-		expect(second.prompt?.text).toContain("target is important.ts");
 		expect(second.prompt?.text).toContain("continue that edit");
 		const dirty = appended.find((entry) => (entry.data as { state?: string }).state === "dirty");
 		expect(parseResumeEntryData(dirty?.data)?.cwd).toBe(resolve("/tmp/project"));
@@ -342,8 +492,10 @@ describe("session runtime", () => {
 		const firstContext = userContext("first");
 		seedCommittedHandle(sessionFile, firstContext);
 		const opens: Array<{ savedAgentId?: string }> = [];
+		const histories: Array<Context["messages"] | undefined> = [];
 		runtimeTestUtils.setOpenAgent(async (input) => {
 			opens.push({ savedAgentId: input.savedAgentId });
+			histories.push(input.bootstrapHistory);
 			return fakeAgent(input.savedAgentId ?? "agent-new");
 		});
 		const secondContext = {
@@ -359,9 +511,9 @@ describe("session runtime", () => {
 			context: secondContext,
 			grantedTools: [], });
 		expect(opens).toEqual([{ savedAgentId: "agent-old" }]);
+		expect(histories).toEqual([undefined]);
 		expect(prepared.incremental).toBe(true);
 		expect(prepared.prompt?.text).toBe("second");
-		expect(prepared.prompt?.text).not.toContain("Previous OMP conversation");
 	});
 
 	test("does not resume a committed handle whose cwd differs from this turn", async () => {
@@ -391,8 +543,6 @@ describe("session runtime", () => {
 			grantedTools: [], });
 		expect(opens).toEqual([{ savedAgentId: undefined, cwd: expect.stringContaining("/tmp/other") }]);
 		expect(prepared.incremental).toBe(false);
-		expect(prepared.prompt?.text).toContain("first");
-		expect(prepared.prompt?.text).toContain("second");
 	});
 
 	test("refuses parked continuation after cwd or credentials change", async () => {
@@ -510,7 +660,6 @@ describe("session runtime", () => {
 			grantedTools: [], });
 		expect(opens.at(-1)?.savedAgentId).toBeUndefined();
 		expect(recovered.incremental).toBe(false);
-		expect(recovered.prompt?.text).toContain("target is important.ts");
 		expect(recovered.prompt?.text).toContain("Continue without repeating completed work");
 	});
 

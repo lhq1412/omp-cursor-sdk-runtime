@@ -3,12 +3,25 @@ import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import type { Tool } from "@oh-my-pi/pi-ai";
 import { toolWireSchema } from "@oh-my-pi/pi-ai/utils/schema/wire";
 import type { GrantedTool } from "./contracts.js";
+import { getCursorSessionOwner, sessionEvents, type CursorSessionOwner } from "./session-scope.js";
 
 const OPEN_SCHEMA: Record<string, unknown> = { type: "object", additionalProperties: true };
 
-const extras = new Map<string, GrantedTool>();
-let liveCatalog: (() => readonly (string | CatalogToolInfo)[]) | undefined;
-let liveEnabled: (() => readonly string[]) | undefined;
+interface ToolCatalogState {
+	extras: Map<string, GrantedTool>;
+	liveCatalog?: () => readonly (string | CatalogToolInfo)[];
+	liveEnabled?: () => readonly string[];
+}
+const catalogs = new WeakMap<CursorSessionOwner, ToolCatalogState>();
+function catalogState(): ToolCatalogState {
+	const owner = getCursorSessionOwner();
+	let state = catalogs.get(owner);
+	if (!state) {
+		state = { extras: new Map() };
+		catalogs.set(owner, state);
+	}
+	return state;
+}
 
 export function isMcpToolName(name: string): boolean {
 	return name.startsWith("mcp__");
@@ -58,6 +71,7 @@ export interface MergeGrantedToolsOptions {
  * grant list.
  */
 export function snapshotHostToolCatalog(allTools: readonly (string | CatalogToolInfo)[]): void {
+	const { extras } = catalogState();
 	extras.clear();
 	for (const item of allTools) {
 		const name = typeof item === "string" ? item : item.name;
@@ -73,10 +87,12 @@ export function snapshotHostToolCatalog(allTools: readonly (string | CatalogTool
 }
 
 export function extraGrantedTools(): GrantedTool[] {
+	const { extras } = catalogState();
 	return [...extras.values()];
 }
 
 function refreshCatalog(): void {
+	const { liveCatalog } = catalogState();
 	if (!liveCatalog) return;
 	try {
 		snapshotHostToolCatalog(liveCatalog());
@@ -86,6 +102,7 @@ function refreshCatalog(): void {
 }
 
 function enabledToolNames(): Set<string> | undefined {
+	const { liveEnabled } = catalogState();
 	if (!liveEnabled) return undefined;
 	try {
 		return new Set(liveEnabled());
@@ -101,6 +118,7 @@ function enabledToolNames(): Set<string> | undefined {
  * catalog for schema. Disabled or unknown-authorization MCP is not added.
  */
 export function mergeGrantedTools(fromContext: readonly GrantedTool[], options?: MergeGrantedToolsOptions): GrantedTool[] {
+	const { extras } = catalogState();
 	refreshCatalog();
 	if (fromContext.length === 0) return [];
 	if (options?.catalogExtras === false) return [...fromContext];
@@ -118,15 +136,17 @@ export function mergeGrantedTools(fromContext: readonly GrantedTool[], options?:
 }
 
 export function registerHostToolCatalog(pi: Pick<ExtensionAPI, "on" | "getAllTools" | "getActiveTools">): void {
-	liveCatalog = () => pi.getAllTools();
-	liveEnabled = () => pi.getActiveTools();
 	const snapshot = () => {
+		const state = catalogState();
+		state.liveCatalog = () => pi.getAllTools();
+		state.liveEnabled = () => pi.getActiveTools();
 		snapshotHostToolCatalog(pi.getAllTools());
 	};
-	pi.on("session_start", snapshot);
-	pi.on("before_agent_start", snapshot);
-	pi.on("turn_start", snapshot);
-	pi.on("session_tree", snapshot);
+	const on = sessionEvents(pi);
+	on("session_start", snapshot);
+	on("before_agent_start", snapshot);
+	on("turn_start", snapshot);
+	on("session_tree", snapshot);
 }
 
 export function toolNameHash(name: string): string {
@@ -135,15 +155,13 @@ export function toolNameHash(name: string): string {
 
 export const __testUtils = {
 	clear() {
-		extras.clear();
-		liveCatalog = undefined;
-		liveEnabled = undefined;
+		catalogs.delete(getCursorSessionOwner());
 	},
 	setLiveCatalog(loader: (() => readonly (string | CatalogToolInfo)[]) | undefined) {
-		liveCatalog = loader;
+		catalogState().liveCatalog = loader;
 	},
 	setLiveEnabled(loader: (() => readonly string[]) | undefined) {
-		liveEnabled = loader;
+		catalogState().liveEnabled = loader;
 	},
-	extras,
+	get extras() { return catalogState().extras; },
 };

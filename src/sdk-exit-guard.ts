@@ -1,5 +1,7 @@
 type ProcessWithReallyExit = NodeJS.Process & { reallyExit?: (code?: number) => void };
 
+const NATIVE_PROCESS_EXIT = Symbol.for("omp.postmortem.nativeProcessExit");
+
 /**
  * Cursor SDK teardown can call `process.exit` / `process.reallyExit`.
  * `@cursor/sdk` loads `signal-exit`, which captures the current `reallyExit` at
@@ -8,7 +10,9 @@ type ProcessWithReallyExit = NodeJS.Process & { reallyExit?: (code?: number) => 
  * becomes an unhandled rejection even after the guard is restored.
  *
  * Import this module before `@cursor/sdk` so signal-exit captures a swallow
- * instead of OMP's throwing guard. Scoped `withSdkExitSuppressed` still covers
+ * instead of OMP's throwing guard. Copy OMP's native-exit stamp onto that
+ * swallow so host SIGINT (`reallyExit(130)`) during the guard window still
+ * unwraps to native exit. Scoped `withSdkExitSuppressed` still covers
  * direct `process.exit` during create/send/dispose.
  *
  * Nested/overlapping calls share one installed swallow and restore the host
@@ -21,11 +25,18 @@ export function isSdkHostExitCode(code?: number | string): boolean {
 	return false;
 }
 
+function stampNativeExit(from: object, to: object): void {
+	const native = Reflect.get(from, NATIVE_PROCESS_EXIT);
+	if (typeof native === "function") Reflect.set(to, NATIVE_PROCESS_EXIT, native);
+}
+
 export function wrapReallyExitForSdk(inner: (code?: number) => void): (code?: number) => void {
-	return (code?: number) => {
+	const wrapped = (code?: number) => {
 		if (isSdkHostExitCode(code)) return;
 		inner.call(process, code);
 	};
+	stampNativeExit(inner, wrapped);
+	return wrapped;
 }
 
 function isNativeFunction(fn: Function): boolean {
@@ -41,20 +52,22 @@ export function installSdkExitGuard(): void {
 	if (installed) return;
 	installed = true;
 	const proc = process as ProcessWithReallyExit;
-	if (typeof proc.reallyExit !== "function") return;
-	if (isNativeFunction(proc.reallyExit)) return;
-	proc.reallyExit = wrapReallyExitForSdk(proc.reallyExit.bind(process)) as typeof proc.reallyExit;
+	const original = proc.reallyExit;
+	if (typeof original !== "function") return;
+	if (isNativeFunction(original)) return;
+	proc.reallyExit = wrapReallyExitForSdk(original) as typeof proc.reallyExit;
 }
 
 function installScopedSwallow(): void {
 	const proc = process as ProcessWithReallyExit;
-	hostExit = process.exit.bind(process);
-	hostReallyExit = proc.reallyExit?.bind(process);
+	hostExit = process.exit;
+	hostReallyExit = proc.reallyExit;
 	const swallow = ((code?: number) => {
 		if (isSdkHostExitCode(code)) return undefined as never;
 		if (!hostExit) throw new Error(`Cursor SDK attempted process.exit(${code})`);
-		return hostExit(code);
+		return hostExit.call(process, code);
 	}) as typeof process.exit;
+	stampNativeExit(hostExit, swallow);
 	process.exit = swallow;
 	if (typeof hostReallyExit === "function") {
 		proc.reallyExit = wrapReallyExitForSdk(hostReallyExit) as typeof proc.reallyExit;

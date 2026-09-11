@@ -71,4 +71,20 @@ describe("custom tools", () => {
 		expect(composed).toEqual({ content: [{ type: "text", text: "ok" }], isError: false });
 		expect(calls).toEqual([{ name: "grep", args: { pattern: "foo", path: "src/*.ts" } }]);
 	});
+
+	test("projects combinators out of advertised custom-tool schemas", () => {
+		const tools = buildCustomTools(
+			[{
+				name: "eval",
+				description: "eval",
+				inputSchema: {
+					type: "object",
+					properties: { language: { anyOf: [{ type: "string" }, { type: "null" }] } },
+				},
+			}],
+			async () => ({ content: [], isError: false }),
+			createToolCallDedupe("run-1"),
+		);
+		expect(JSON.stringify(tools.eval.inputSchema)).not.toContain("anyOf");
+	});
 });

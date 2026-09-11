@@ -114,6 +114,7 @@ export function applyToolCall(
 	const block = partial.content[contentIndex];
 	if (block.type !== "toolCall") return;
 	stream.push({ type: "toolcall_start", contentIndex, partial });
+	stream.push({ type: "toolcall_delta", contentIndex, delta: JSON.stringify(block.arguments), partial });
 	stream.push({ type: "toolcall_end", contentIndex, toolCall: block, partial });
 }
 
@@ -178,14 +179,16 @@ export function projectRunUsage(
 	if (!usage) return;
 	partial.cursorSdk.tokenUsage = "actual";
 	const previous = projection.reportedUsage;
+	// SDK Run billing is orchestration, not one conversation prompt.
+	const orchestration = partial.usage.orchestration ??= {};
 	const fields = [
 		["input", "inputTokens"], ["output", "outputTokens"],
-		["cacheRead", "cacheReadTokens"], ["cacheWrite", "cacheWriteTokens"],
+		["cacheRead", "cacheReadTokens"], ["input", "cacheWriteTokens"],
 	] as const;
 	for (const [host, sdk] of fields) {
-		partial.usage[host] += Math.max(0, usage[sdk] - (previous?.[sdk] ?? 0));
+		orchestration[host] = (orchestration[host] ?? 0) + Math.max(0, usage[sdk] - (previous?.[sdk] ?? 0));
 	}
-	partial.usage.totalTokens = partial.usage.input + partial.usage.output + partial.usage.cacheRead + partial.usage.cacheWrite;
+	partial.usage.totalTokens = (orchestration.input ?? 0) + (orchestration.output ?? 0) + (orchestration.cacheRead ?? 0);
 	if (usage.reasoningTokens !== undefined) {
 		partial.usage.reasoningTokens = (partial.usage.reasoningTokens ?? 0)
 			+ Math.max(0, usage.reasoningTokens - (previous?.reasoningTokens ?? 0));

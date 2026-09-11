@@ -1,10 +1,12 @@
+import "../src/sdk-exit-guard.ts";
+import { randomUUID } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Agent, type RunResult } from "@cursor/sdk";
-import { DEFAULT_MODEL_ID, SYSTEM_PROMPT_REPLACEMENT } from "../src/constants.ts";
+import { DEFAULT_MODEL_ID, SDK_TOOL_CONTEXT, SYSTEM_PROMPT_REPLACEMENT } from "../src/constants.ts";
 import { requireCursorApiKey } from "../src/auth.ts";
-import { buildAgentOptions, openJsonlStore } from "../src/sdk-session.ts";
+import { buildAgentOptions, openAgent, openJsonlStore, type OpenAgentInput } from "../src/sdk-session.ts";
 
 interface ProbeResult {
 	name: string;
@@ -33,9 +35,10 @@ async function main(): Promise<void> {
 	const store = openJsonlStore(join(cwd, "store"));
 	const calls: Array<{ toolCallId?: string; args: Record<string, unknown> }> = [];
 	const results: ProbeResult[] = [];
+	const historyToken = `native-history-${randomUUID()}`;
 
 	try {
-		const options = buildAgentOptions({
+		const input: OpenAgentInput = {
 			apiKey,
 			cwd,
 			model: { id: DEFAULT_MODEL_ID },
@@ -54,7 +57,8 @@ async function main(): Promise<void> {
 					},
 				},
 			},
-		});
+		};
+		const options = buildAgentOptions(input);
 		if (options.systemPrompt !== undefined) {
 			throw new Error("v1 must not set AgentOptions.systemPrompt");
 		}
@@ -64,10 +68,18 @@ async function main(): Promise<void> {
 			detail: "GAP AgentOptions.systemPrompt is omitted; live CLI rejected --system-prompt; the adapter includes sanitized OMP instructions only in bootstrap text, not as native system-role input",
 		});
 
-		const agent = await Agent.create(options);
+		const agent = await openAgent({
+			...input,
+			bootstrapHistory: [{ role: "user", content: `Remember this history token: ${historyToken}.`, timestamp: 1 }],
+		});
 		try {
-			const run = await agent.send("Call ping with token alpha. Do not use any other tool.");
+			const run = await agent.send(`${SDK_TOOL_CONTEXT}\n\nCall ping with token alpha exactly once, then reply with the remembered history token. Do not use any other tool.`);
 			const result = await run.wait();
+			results.push({
+				name: "nativeHistory",
+				ok: result.status === "finished" && Boolean(result.result?.includes(historyToken)),
+				detail: formatRun(result, apiKey),
+			});
 			results.push({
 				name: "toolCallId",
 				ok: result.status === "finished" && calls.some((call) => typeof call.toolCallId === "string" && call.toolCallId.length > 0),
@@ -78,17 +90,17 @@ async function main(): Promise<void> {
 			});
 			results.push({
 				name: "toolRestriction",
-				ok: result.status === "finished" && calls.length > 0,
-				detail: `custom ping must run; ${formatRun(result, apiKey)}`,
+				ok: result.status === "finished" && calls.length === 1,
+				detail: `custom ping must run exactly once; ${formatRun(result, apiKey)}`,
 			});
 
 			const resumed = await Agent.resume(agent.agentId, options);
 			try {
-				const follow = await resumed.send("Reply with the single word OK.");
+				const follow = await resumed.send("Reply with the remembered history token. Do not call any tools.");
 				const followResult = await follow.wait();
 				results.push({
 					name: "resume",
-					ok: followResult.status === "finished",
+					ok: followResult.status === "finished" && Boolean(followResult.result?.includes(historyToken)) && calls.length === 1,
 					detail: `${formatRun(followResult, apiKey)} agentId=${resumed.agentId}`,
 				});
 			} finally {

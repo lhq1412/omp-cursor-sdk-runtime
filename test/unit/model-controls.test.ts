@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import type { ExtensionAPI, ExtensionCommandContext } from "@oh-my-pi/pi-coding-agent";
 import { CURSOR_API_KEY_ENV_VAR, CURSOR_SDK_PROVIDER_ID } from "../../src/constants.ts";
 import { __testUtils as catalogTestUtils } from "../../src/catalog.ts";
+import { __testUtils as scopeTestUtils, getCursorSessionOwner, withCursorSessionOwner } from "../../src/session-scope.ts";
 import {
 	__testUtils as controlsTestUtils,
 	getFastMode,
@@ -37,6 +38,7 @@ function createHost(options: HostOptions = {}) {
 	let sessionId = "session-a";
 	let sessionFile: string | undefined = "/sessions/a.jsonl";
 	let model = options.model ?? { id: "composer-2.5", provider: CURSOR_SDK_PROVIDER_ID };
+	scopeTestUtils.set("/tmp/project", sessionFile, sessionId);
 
 	const modelRegistry = {
 		async refreshProvider(this: unknown, providerId: string, strategy?: string): Promise<void> {
@@ -124,6 +126,7 @@ function createHost(options: HostOptions = {}) {
 		setSessionIdentity(id: string, file: string | undefined) {
 			sessionId = id;
 			sessionFile = file;
+			scopeTestUtils.set("/tmp/project", sessionFile, sessionId);
 		},
 		async emit(event: string) {
 			for (const handler of handlers.get(event) ?? []) await handler({ type: event }, ctx);
@@ -176,6 +179,27 @@ function fastBranch(modelId: string, fast: boolean): SessionEntry[] {
 }
 
 describe("model controls", () => {
+	test("child flags and session preferences cannot replace the parent's fast setting", async () => {
+		const parent = createHost();
+		const parentOwner = getCursorSessionOwner();
+		registerModelControls(parent.pi);
+		await parent.emit("session_start");
+		await parent.run("cursor-fast", "on");
+		const child = createHost({ flags: { "cursor-no-fast": true } });
+		child.setSessionIdentity("child", "/sessions/child.jsonl");
+		const childOwner = getCursorSessionOwner();
+		withCursorSessionOwner(parentOwner, () => registerModelControls(child.pi));
+		await child.emit("session_start");
+		withCursorSessionOwner(childOwner, () => {
+			expect(getFastMode("composer-2.5")).toBe(false);
+		});
+		withCursorSessionOwner(parentOwner, () => {
+			expect(getFastMode("composer-2.5")).toBe(true);
+		});
+		expect(parent.appended).toEqual([{ type: controlsTestUtils.FAST_ENTRY_TYPE, data: { modelId: "composer-2.5", fast: true } }]);
+		expect(child.appended).toEqual([]);
+	});
+
 	let originalApiKey: string | undefined;
 
 	beforeEach(() => {
@@ -201,9 +225,10 @@ describe("model controls", () => {
 		catalogTestUtils.resetCatalog();
 	});
 
-	test("getFastMode defaults false and honors --cursor-no-fast over --cursor-fast", () => {
+	test("getFastMode defaults false and honors --cursor-no-fast over --cursor-fast", async () => {
 		const host = createHost({ flags: { "cursor-fast": true, "cursor-no-fast": true } });
 		registerModelControls(host.pi);
+		await host.emit("session_start");
 		expect(getFastMode("composer-2.5")).toBe(false);
 		host.setFlags({ "cursor-no-fast": false, "cursor-fast": true });
 		expect(getFastMode("composer-2.5")).toBe(true);

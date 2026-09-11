@@ -16,7 +16,7 @@ import {
 	type ResumeEntryData,
 	type ResumeSessionEntry,
 } from "../../src/session-resume.ts";
-import { __testUtils as scopeTestUtils } from "../../src/session-scope.ts";
+import { ownerForContext, withCursorSessionOwner, __testUtils as scopeTestUtils } from "../../src/session-scope.ts";
 
 function message(id: string, parentId: string | null, role: "user" | "assistant"): ResumeSessionEntry {
 	return { type: "message", id, parentId, message: { role } };
@@ -62,6 +62,23 @@ const scope = {
 };
 
 describe("session resume fold", () => {
+	test("a captured writer refuses to append after its host switches sessions", () => {
+		scopeTestUtils.reset();
+		const { appended, ctx } = registerResume();
+		ctx.sessionManager.getSessionId = () => "different-session";
+		expect(() => flushResumeHandleNow({
+			agentId: "agent-local-1",
+			poolKey: "main",
+			sendState: { bootstrapped: true, contextFingerprint: "fp", incrementalSendCount: 0 },
+			storeIdentity: { version: 1, stateRoot: "/tmp/store" },
+			state: "in-flight",
+			agentInstanceId: "main",
+			cwd: "/tmp/project",
+			credentialScopeId: "cred-1",
+		})).toThrow(/session changed/);
+		expect(appended).toEqual([]);
+	});
+
 	test("parses a v2 local resume entry", () => {
 		expect(parseResumeEntryData(validData())?.agentId).toBe("agent-local-1");
 		expect(parseResumeEntryData({ ...validData(), runtime: "cloud" })).toBeUndefined();
@@ -113,7 +130,8 @@ describe("session resume fold", () => {
 			appendEntry(customType: string, data?: unknown) {
 				appended.push({ type: customType, data });
 				if (mode === "write") {
-					appendFileSync(sessionFile, `${JSON.stringify({ type: "custom", customType, data })}\n`);
+					const file = ctx.sessionManager.getSessionFile?.() as string | undefined;
+					if (file) appendFileSync(file, `${JSON.stringify({ type: "custom", customType, data })}\n`);
 				}
 			},
 			on(event: string, handler: (event: unknown, ctx: unknown) => unknown) {
@@ -149,6 +167,50 @@ describe("session resume fold", () => {
 		expect(parseResumeEntryData(appended[0]?.data)?.cwd).toBe(resolve("/tmp/project"));
 	});
 
+	test("session_switch rebinds resume writer for a new owner without session_start", async () => {
+		scopeTestUtils.reset();
+		resumeTestUtils.reset();
+		const { appended, handlers, ctx } = registerResume();
+		const pending = {
+			poolKey: "main",
+			sendState: { bootstrapped: true, contextFingerprint: "fp", incrementalSendCount: 0 },
+			storeIdentity: { version: 1 as const, stateRoot: "/tmp/store" },
+			agentInstanceId: "main",
+			cwd: "/tmp/project",
+			credentialScopeId: "cred-1",
+		};
+		persistResumeHandle({ ...pending, agentId: "agent-a", state: "committed" });
+		await handlers.get("turn_end")?.[0]?.({ type: "turn_end" }, ctx);
+		expect(appended).toHaveLength(1);
+		expect(parseResumeEntryData(appended[0]?.data)?.sessionId).toBe("sess-1");
+
+		const fileB = join(mkdtempSync(join(tmpdir(), "omp-csr-resume-b-")), "session-b.jsonl");
+		writeFileSync(fileB, "");
+		const branchB = [message("u1", null, "user")];
+		ctx.sessionManager.getSessionFile = () => fileB;
+		ctx.sessionManager.getSessionId = () => "sess-b";
+		ctx.sessionManager.getBranch = () => branchB;
+		ctx.sessionManager.getEntries = () => branchB;
+		// In-process /new emits session_switch without another session_start.
+		await handlers.get("session_switch")?.[0]?.({ type: "session_switch", reason: "new" }, ctx);
+
+		const ownerB = ownerForContext(ctx as never);
+		withCursorSessionOwner(ownerB, () => {
+			persistResumeHandle({ ...pending, agentId: "agent-b", state: "committed" });
+		});
+		await handlers.get("turn_end")?.[0]?.({ type: "turn_end" }, ctx);
+		expect(appended).toHaveLength(2);
+		expect(parseResumeEntryData(appended[1]?.data)).toMatchObject({ sessionId: "sess-b", agentId: "agent-b", state: "committed" });
+
+		withCursorSessionOwner(ownerB, () => {
+			flushResumeHandleNow({ ...pending, agentId: "agent-b", state: "in-flight" });
+		});
+		expect(appended).toHaveLength(3);
+		expect(parseResumeEntryData(appended[2]?.data)).toMatchObject({ sessionId: "sess-b", agentId: "agent-b", state: "in-flight" });
+		expect(parseResumeEntryData(appended[0]?.data)?.sessionId).toBe("sess-1");
+		expect(appended.slice(1).every((entry) => parseResumeEntryData(entry.data)?.sessionId === "sess-b")).toBe(true);
+	});
+
 	test("writes the agent's execution cwd instead of the session cwd", () => {
 		scopeTestUtils.reset();
 		resumeTestUtils.reset();
@@ -180,6 +242,7 @@ describe("session resume fold", () => {
 
 	test("flushResumeHandleNow appends in-flight before send and fails closed without appendEntry", () => {
 		scopeTestUtils.reset();
+		scopeTestUtils.set("/tmp/project", "/tmp/session.jsonl", "sess-without-writer");
 		resumeTestUtils.reset();
 		expect(() =>
 			flushResumeHandleNow({

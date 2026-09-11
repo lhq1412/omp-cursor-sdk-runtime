@@ -1,4 +1,12 @@
 import { describe, expect, test } from "bun:test";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import type { AgentToolArgStream } from "@oh-my-pi/pi-agent-core";
+import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { EditTool } from "@oh-my-pi/pi-coding-agent/edit";
+import { getEditStore } from "@oh-my-pi/pi-coding-agent/edit/store";
+import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { createAssistantMessageEventStream } from "@oh-my-pi/pi-ai";
 import { applyInteractionUpdate, applyToolCall, createEmptyAssistantMessage, projectRunUsage, reconcileRunResult, type RunProjection } from "../../src/projector.ts";
 import type { RunResult, TokenUsage } from "@cursor/sdk";
@@ -20,7 +28,7 @@ describe("projector", () => {
 		expect(partial.content).toEqual([{ type: "text", text: "Hello" }]);
 	});
 
-	test("emits a closed toolCall block for OMP toolUse", () => {
+	test("streams JSON arguments matching the completed tool call", async () => {
 		const model = {
 			id: "composer-2.5",
 			provider: CURSOR_SDK_PROVIDER_ID,
@@ -31,6 +39,65 @@ describe("projector", () => {
 		applyInteractionUpdate(stream, partial, { type: "text-delta", text: "Using read" });
 		applyToolCall(stream, partial, { id: "call-1", name: "read", arguments: { path: "a.ts" } });
 		expect(partial.content[1]).toMatchObject({ type: "toolCall", id: "call-1", name: "read", arguments: { path: "a.ts" } });
+		stream.end(partial);
+		let argumentsJson = "";
+		for await (const event of stream) {
+			if (event.type === "toolcall_delta") {
+				expect(event.partial.content[event.contentIndex]).toEqual(partial.content[1]);
+				argumentsJson += event.delta;
+			} else if (event.type === "toolcall_end") {
+				expect(JSON.parse(argumentsJson)).toEqual(event.toolCall.arguments);
+			}
+		}
+	});
+
+	test("projected JSON arguments drive the host streaming edit to change a file", async () => {
+		const cwd = await mkdtemp(join(tmpdir(), "cursor-projector-edit-"));
+		let argStream: AgentToolArgStream | undefined;
+		try {
+			const path = join(cwd, "example.txt");
+			await writeFile(path, "before\n");
+			const session: ToolSession = {
+				cwd,
+				hasUI: false,
+				enableLsp: false,
+				getSessionFile: () => null,
+				getSessionSpawns: () => null,
+				settings: Settings.isolated({ "edit.blackbox.enabled": false }),
+			};
+			const tag = getEditStore(session).recordSnapshot(path, "before\n", [1]);
+			const tool = new EditTool(session, "hashline");
+			const args = { input: `*** Begin Patch\n[example.txt#${tag}]\nPUT 1.=1:\n+after "quoted" 中文\n*** End Patch\n` };
+			const stream = createAssistantMessageEventStream();
+			const partial = createEmptyAssistantMessage({ id: "composer-2.5" } as Model<Api>);
+			applyInteractionUpdate(stream, partial, { type: "text-delta", text: "Editing." });
+			applyToolCall(stream, partial, { id: "edit-1", name: "edit", arguments: args });
+			stream.end(partial);
+
+			// The host opens on start, feeds only deltas, then supplies final args to end.
+			for await (const event of stream) {
+				if (event.type === "toolcall_start") {
+					const block = event.partial.content[event.contentIndex];
+					if (block.type !== "toolCall") throw new Error("Missing tool call");
+					argStream = tool.openArgStream({
+						toolCallId: block.id,
+						toolName: block.name,
+						customWireName: block.customWireName,
+						emit: () => {},
+					});
+				} else if (event.type === "toolcall_delta") {
+					argStream!.push(event.delta);
+				} else if (event.type === "toolcall_end") {
+					argStream!.end(event.toolCall.arguments);
+				}
+			}
+			const result = await tool.execute("edit-1", args);
+			expect(result.isError).not.toBe(true);
+			expect(await readFile(path, "utf8")).toBe('after "quoted" 中文\n');
+		} finally {
+			argStream?.cancel();
+			await rm(cwd, { recursive: true, force: true });
+		}
 	});
 
 	test("reconciles the final answer step rather than earlier commentary", () => {
@@ -105,9 +172,21 @@ describe("projector", () => {
 		projectRunUsage(first, projection, usage);
 		const second = createEmptyAssistantMessage(model);
 		projectRunUsage(second, projection, usage);
+		expect(second.usage).toMatchObject({
+			input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, reasoningTokens: 0,
+			orchestration: { input: 0, output: 0, cacheRead: 0 },
+		});
 		projectRunUsage(second, projection, { ...usage, inputTokens: 140, outputTokens: 30, totalTokens: 220, reasoningTokens: 8 });
-		expect(first.usage).toMatchObject({ input: 100, output: 20, cacheRead: 40, cacheWrite: 10, totalTokens: 170 });
-		expect(second.usage).toMatchObject({ input: 40, output: 10, cacheRead: 0, cacheWrite: 0, totalTokens: 50, reasoningTokens: 3 });
+		expect(first.usage).toMatchObject({
+			input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 170, reasoningTokens: 5,
+			orchestration: { input: 110, output: 20, cacheRead: 40 },
+		});
+		expect(first.usage.contextTokens).toBeUndefined();
+		expect(first.cursorSdk.contextOccupancy).toEqual({ status: "unavailable" });
+		expect(second.usage).toMatchObject({
+			input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 50, reasoningTokens: 3,
+			orchestration: { input: 40, output: 10, cacheRead: 0 },
+		});
 		expect(second.usage.contextTokens).toBeUndefined();
 		expect(second.cursorSdk).toEqual({ tokenUsage: "actual", cost: "unavailable", contextOccupancy: { status: "unavailable" } });
 		const nextRun = createEmptyAssistantMessage(model);
@@ -133,7 +212,8 @@ describe("projector", () => {
 		const result: RunResult = { id: "run", status: "finished", usage };
 		projectRunUsage(partial, projection, result.usage);
 		expect(partial.usage).toMatchObject({
-			input: 1_180_000, output: 20_000, cacheRead: 5_040_000, cacheWrite: 1_560_000,
+			input: 0, output: 0, cacheRead: 0, cacheWrite: 0,
+			orchestration: { input: 2_740_000, output: 20_000, cacheRead: 5_040_000 },
 			totalTokens: 7_800_000, reasoningTokens: 5_000,
 		});
 		expect(partial.cursorSdk.tokenUsage).toBe("actual");
@@ -148,6 +228,7 @@ describe("projector", () => {
 		projectRunUsage(resumed, projection, result.usage);
 		expect(resumed.usage).toMatchObject({
 			input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, reasoningTokens: 0,
+			orchestration: { input: 0, output: 0, cacheRead: 0 },
 		});
 		expect(resumed.cursorSdk.tokenUsage).toBe("actual");
 		expect(resumed.cursorSdk.contextOccupancy).toEqual({ status: "unavailable" });

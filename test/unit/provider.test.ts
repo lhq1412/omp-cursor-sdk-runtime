@@ -108,7 +108,7 @@ function param(selection: ModelSelection | undefined, id: string): string | unde
 
 async function drain(model: Model<Api>, context: Context, options?: SimpleStreamOptions) {
 	const events = [];
-	for await (const event of streamCursorRuntime(model, context, options)) {
+	for await (const event of streamCursorRuntime(model, context, { ...options, onPayload: options?.onPayload ?? scopeTestUtils.bindRequest })) {
 		events.push(event);
 	}
 	return events;
@@ -294,7 +294,7 @@ describe("streamCursorRuntime model selection", () => {
 			cwd: "/tmp/project",
 		});
 		expect(first.at(-1)).toMatchObject({ type: "done", reason: "toolUse" });
-		expect(first.at(-1)).toMatchObject({ message: { usage: { input: 100, output: 10, cacheRead: 20, cacheWrite: 5, totalTokens: 135 } } });
+		expect(first.at(-1)).toMatchObject({ message: { usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 135, orchestration: { input: 105, output: 10, cacheRead: 20 } } } });
 		expect(created).toHaveLength(1);
 		expect(sent).toHaveLength(1);
 		catalogTestUtils.resetCatalog();
@@ -326,7 +326,7 @@ describe("streamCursorRuntime model selection", () => {
 			type: "done",
 			message: {
 				content: [{ type: "text", text: "All done." }],
-				usage: { input: 40, output: 6, cacheRead: 10, cacheWrite: 0, totalTokens: 56 },
+				usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 56, orchestration: { input: 40, output: 6, cacheRead: 10 } },
 				cursorSdk: { tokenUsage: "actual", cost: "unavailable" },
 			},
 		});
@@ -385,17 +385,19 @@ describe("streamCursorRuntime model selection", () => {
 		expect(events.at(-1)).toMatchObject({
 			type: "error",
 			reason: "aborted",
-			error: { stopReason: "aborted", usage: { input: 60, output: 8, cacheRead: 0, cacheWrite: 0, totalTokens: 68 } },
+			error: { stopReason: "aborted", usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 68, orchestration: { input: 60, output: 8, cacheRead: 0 } } },
 		});
 	});
 
 	test("reconstructs a lost parked run on a fresh agent without replaying completed tools", async () => {
 		const opened: Array<string | undefined> = [];
+		const histories: Array<Context["messages"] | undefined> = [];
 		const sent: Array<{ agentId: string; message: unknown; model: ModelSelection | undefined }> = [];
 		let toolExecutions = 0;
 		let oldCallbackResolved = false;
 		runtimeTestUtils.setOpenAgent(async (input) => {
 			opened.push(input.savedAgentId);
+			histories.push(input.bootstrapHistory);
 			const agentId = `agent-${opened.length}`;
 			return {
 				agentId,
@@ -445,20 +447,9 @@ describe("streamCursorRuntime model selection", () => {
 		expect(opened).toEqual([undefined, undefined]);
 		expect(sent.map(({ agentId }) => agentId)).toEqual(["agent-1", "agent-2"]);
 		expect(param(sent[1]?.model, "fast")).toBe("true");
-		const message = sent[1]?.message;
-		if (!message || typeof message !== "object" || !("text" in message) || typeof message.text !== "string") {
-			throw new Error("Expected a text bootstrap prompt");
-		}
-		const prompt = message.text;
-		expect(prompt).toContain("Completed read: export const answer = 42;");
-		expect(prompt).toContain("Inspect a.ts, then summarize.");
-		expect(prompt).toContain("call-1");
-		expect(prompt).toContain("a.ts");
-		expect(prompt).toContain("toolResult read (capture): Previously captured screen [attached image 1]");
-		expect(message).toMatchObject({ images: [{ data: "screen-payload", mimeType: "image/png" }] });
-		expect(prompt).toContain("Current continuation request:");
-		expect(prompt).not.toContain("Current user request:");
-		expect(prompt).toMatch(/do not (?:repeat|re-?run|re-?execute)/i);
+		expect(histories[1]).toEqual(recoveredContext.messages);
+		expect(sent[1]?.message).toMatchObject({ images: [{ data: "screen-payload", mimeType: "image/png" }] });
+		expect(sent[1]?.message).toMatchObject({ text: expect.not.stringContaining("Inspect a.ts, then summarize.") });
 		expect(toolExecutions).toBe(1);
 		expect(oldCallbackResolved).toBe(false);
 		expect(recovered.some((event) => event.type === "toolcall_start")).toBe(false);

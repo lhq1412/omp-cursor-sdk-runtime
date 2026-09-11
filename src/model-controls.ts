@@ -3,6 +3,7 @@ import { resolveCursorApiKey } from "./auth.js";
 import { ensureCursorModels, fallbackModels, getModelMetadata } from "./catalog.js";
 import { CURSOR_API_KEY_ENV_VAR, CURSOR_SDK_PROVIDER_ID } from "./constants.js";
 import { sanitizeCursorProviderError } from "./errors.js";
+import { getCursorSessionOwner, ownerForContext, sessionEvents, withCursorSessionOwner, type CursorSessionOwner } from "./session-scope.js";
 
 const FAST_ENTRY_TYPE = "cursor-fast-state";
 const FAST_USAGE = "Usage: /cursor-fast [on|off|status]";
@@ -16,14 +17,26 @@ type FastMetadata = {
 type ControlsApi = Pick<ExtensionAPI, "getFlag" | "appendEntry">;
 
 
-const sessionFastPreferences = new Map<string, boolean>();
-let controlsApi: ControlsApi | undefined;
+interface ControlsState {
+	sessionFastPreferences: Map<string, boolean>;
+	controlsApi?: ControlsApi;
+	lastDynamicFetch?: { ok: boolean; error?: string };
+}
+const states = new WeakMap<CursorSessionOwner, ControlsState>();
+function controlsState(): ControlsState {
+	const owner = getCursorSessionOwner();
+	let state = states.get(owner);
+	if (!state) {
+		state = { sessionFastPreferences: new Map() };
+		states.set(owner, state);
+	}
+	return state;
+}
 let metadataLookup: (id: string, apiKey?: string) => FastMetadata | undefined = lookupCatalogMetadata;
-let lastDynamicFetch: { ok: boolean; error?: string } | undefined;
 
 /** OMP can swallow discovery failures and return cached rows from refreshProvider. */
 export function recordDynamicModelFetch(ok: boolean, error?: string): void {
-	lastDynamicFetch = { ok, error: error === undefined ? undefined : sanitizeCursorProviderError(error) };
+	controlsState().lastDynamicFetch = { ok, error: error === undefined ? undefined : sanitizeCursorProviderError(error) };
 }
 
 function lookupCatalogMetadata(id: string, apiKey?: string): FastMetadata | undefined {
@@ -42,6 +55,7 @@ interface FastResolution {
 }
 
 function resolveFast(baseModelId: string): FastResolution {
+	const { controlsApi, sessionFastPreferences } = controlsState();
 	if (controlsApi?.getFlag("cursor-no-fast") === true) return { value: false, source: "no-fast" };
 	if (controlsApi?.getFlag("cursor-fast") === true) return { value: true, source: "fast" };
 	if (sessionFastPreferences.has(baseModelId)) {
@@ -73,6 +87,7 @@ function readFastEntry(data: unknown): { modelId: string; fast: boolean } | unde
 }
 
 function foldSessionPreferences(ctx: Pick<ExtensionContext, "sessionManager">): void {
+	const { sessionFastPreferences } = controlsState();
 	sessionFastPreferences.clear();
 	const branch = ctx.sessionManager?.getBranch?.() ?? [];
 	for (const entry of branch) {
@@ -83,6 +98,7 @@ function foldSessionPreferences(ctx: Pick<ExtensionContext, "sessionManager">): 
 }
 
 function persistFastPreference(modelId: string, fast: boolean): void {
+	const { controlsApi, sessionFastPreferences } = controlsState();
 	if (!controlsApi) throw new Error("Cursor model controls are not registered");
 	const previous = sessionFastPreferences.has(modelId) ? sessionFastPreferences.get(modelId) : undefined;
 	sessionFastPreferences.set(modelId, fast);
@@ -160,10 +176,11 @@ export function registerModelControls(
 	pi: Pick<ExtensionAPI, "registerFlag" | "registerCommand" | "getFlag" | "appendEntry" | "on">,
 ): void {
 	let preferenceGeneration = 0;
-	controlsApi = {
+	const controlsApi: ControlsApi = {
 		getFlag: (name) => pi.getFlag(name),
 		appendEntry: (customType, data) => pi.appendEntry(customType, data),
 	};
+	const on = sessionEvents(pi);
 	fallbackModels();
 
 	pi.registerFlag("cursor-fast", {
@@ -179,7 +196,8 @@ export function registerModelControls(
 
 	pi.registerCommand("cursor-fast", {
 		description: "Set Cursor fast mode for the selected canonical cursor-sdk model: on, off, or status",
-		handler: async (args, ctx) => {
+		handler: async (args, ctx) => withCursorSessionOwner(ownerForContext(ctx), async () => {
+			controlsState().controlsApi = controlsApi;
 			const normalized = args.trim().toLowerCase();
 			const action = normalized === "" || normalized === "status" ? "status" : normalized;
 			if (action !== "on" && action !== "off" && action !== "status") {
@@ -224,13 +242,14 @@ export function registerModelControls(
 				return;
 			}
 			ctx.ui.notify(`Cursor fast ${next ? "enabled" : "disabled"}.`, "info");
-		},
+		}),
 	});
 
 	pi.registerCommand("cursor-refresh-models", {
 		description: "Refresh the live Cursor SDK model catalog through OMP",
-		handler: async (_args, ctx) => {
-			lastDynamicFetch = undefined;
+		handler: async (_args, ctx) => withCursorSessionOwner(ownerForContext(ctx), async () => {
+			const state = controlsState();
+			state.lastDynamicFetch = undefined;
 			let apiKey: string | undefined;
 			try {
 				apiKey = await resolveRegistryApiKey(ctx);
@@ -239,7 +258,7 @@ export function registerModelControls(
 					return;
 				}
 				await ctx.modelRegistry.refreshProvider(CURSOR_SDK_PROVIDER_ID, "online");
-				const outcome = lastDynamicFetch as { ok: boolean; error?: string } | undefined;
+				const outcome = state.lastDynamicFetch as { ok: boolean; error?: string } | undefined;
 				if (!outcome?.ok) {
 					ctx.ui.notify(`Failed to refresh Cursor SDK models: ${sanitizeCursorProviderError(outcome?.error ?? FAILED_LIVE_REFRESH, apiKey)}`, "error");
 					return;
@@ -248,35 +267,35 @@ export function registerModelControls(
 			} catch (error) {
 				ctx.ui.notify(`Failed to refresh Cursor SDK models: ${sanitizeCursorProviderError(error, apiKey)}`, "error");
 			}
-		},
+		}),
 	});
 
 	const invalidate = () => {
 		preferenceGeneration++;
 	};
-	pi.on("session_before_switch", invalidate);
-	pi.on("session_before_branch", invalidate);
-	pi.on("session_before_tree", invalidate);
+	on("session_before_switch", invalidate);
+	on("session_before_branch", invalidate);
+	on("session_before_tree", invalidate);
 	const fold = (_event: unknown, ctx: ExtensionContext) => {
 		preferenceGeneration++;
+		controlsState().controlsApi = controlsApi;
 		foldSessionPreferences(ctx);
 	};
-	pi.on("session_start", fold);
-	pi.on("session_switch", fold);
-	pi.on("session_branch", fold);
-	pi.on("session_tree", fold);
+	on("session_start", fold);
+	on("session_switch", fold);
+	on("session_branch", fold);
+	on("session_tree", fold);
 }
 
 export const __testUtils = {
 	FAST_ENTRY_TYPE,
-	sessionFastPreferences,
+	get sessionFastPreferences() { return controlsState().sessionFastPreferences; },
 	setMetadataLookup(lookup: (id: string, apiKey?: string) => FastMetadata | undefined): void {
 		metadataLookup = lookup;
 	},
 	reset(): void {
-		sessionFastPreferences.clear();
-		controlsApi = undefined;
+		states.delete(getCursorSessionOwner());
 		metadataLookup = lookupCatalogMetadata;
-		lastDynamicFetch = undefined;
+		controlsState().lastDynamicFetch = undefined;
 	},
 };

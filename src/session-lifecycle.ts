@@ -1,21 +1,26 @@
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
-import { onCursorSessionScopeKeyChange } from "./session-scope.js";
+import { getCursorSessionOwner, sessionEvents } from "./session-scope.js";
 import { disposeRuntimeForScope, disposeRuntimeForShutdown, invalidateRuntime } from "./session-runtime.js";
 
 export function registerCursorSessionLifecycle(pi: Pick<ExtensionAPI, "on">): void {
-	onCursorSessionScopeKeyChange(async (previousScopeKey) => {
-		await disposeRuntimeForScope(previousScopeKey);
-	});
-	pi.on("session_shutdown", async () => {
+	const on = sessionEvents(pi);
+	const closeScope = async () => {
+		getCursorSessionOwner().generation++;
+		await disposeRuntimeForScope();
+	};
+	on("session_shutdown", async () => {
+		getCursorSessionOwner().generation++;
 		await disposeRuntimeForShutdown();
 	});
-	pi.on("session_compact", () => {
+	on("session_compact", () => {
+		getCursorSessionOwner().generation++;
 		invalidateRuntime("session_compact");
 	});
-	pi.on("session_before_tree", () => {
+	on("session_before_tree", () => {
+		getCursorSessionOwner().generation++;
 		invalidateRuntime("session_before_tree");
 	});
-	pi.on("session_tree", async () => {
-		await disposeRuntimeForScope();
-	});
+	on("session_before_switch", closeScope);
+	on("session_before_branch", closeScope);
+	on("session_tree", closeScope);
 }
