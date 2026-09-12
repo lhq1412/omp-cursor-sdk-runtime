@@ -107,7 +107,11 @@ export function computeContextFingerprint(context: Context): string {
 	const systemHash = hashValue(serializeSystemPrompt(context.systemPrompt));
 	const messageHashes = context.messages.map((message, index) => {
 		const role = "role" in message && typeof message.role === "string" ? message.role : "unknown";
-		return hashValue(`${index}:${role}:${JSON.stringify(message)}`);
+		// OMP stamps these after provider commit; neither changes model-visible history.
+		const stable = role === "assistant"
+			? { ...message, completedAt: undefined, contextSnapshot: undefined }
+			: message;
+		return hashValue(`${index}:${role}:${JSON.stringify(stable)}`);
 	});
 	return JSON.stringify({ format: NATIVE_HISTORY_FORMAT, systemHash, messageHashes });
 }
@@ -130,6 +134,9 @@ export function planSend(sendState: SendState, context: Context): SendPlan {
 	}
 	for (let index = 0; index < previous.messageHashes.length; index += 1) {
 		if (current.messageHashes[index] !== previous.messageHashes[index]) {
+			// Older v1 fingerprints include host metadata. Accept only an exact raw-message match.
+			const message = context.messages[index]!;
+			if (previous.messageHashes[index] === hashValue(`${index}:${message.role}:${JSON.stringify(message)}`)) continue;
 			return { mode: "bootstrap", resetAgent: true, reason: "context_divergence" };
 		}
 	}
