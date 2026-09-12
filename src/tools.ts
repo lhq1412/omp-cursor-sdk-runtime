@@ -95,6 +95,7 @@ export function buildCustomTools(
 	grantedTools: readonly GrantedTool[],
 	execute: ToolExecutor,
 	dedupe: ToolCallDedupe,
+	sdkToOmp?: Map<string, string>,
 ): Record<string, SDKCustomTool> {
 	const usedNames = new Set<string>();
 	const tools: Record<string, SDKCustomTool> = {};
@@ -103,6 +104,7 @@ export function buildCustomTools(
 		const sdkName = uniqueSdkToolName(tool.name, usedNames);
 		const inputSchema = sanitizeSchemaForCursor(tool.inputSchema);
 		if (inputSchema.type !== "object") continue;
+		sdkToOmp?.set(sdkName, tool.name);
 		tools[sdkName] = {
 			description: tool.description,
 			inputSchema: inputSchema as SDKCustomTool["inputSchema"],

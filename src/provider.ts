@@ -30,6 +30,7 @@ import {
 	closeOpenBlocks,
 	createEmptyAssistantMessage,
 	createProviderStream,
+	deliverWithoutUnendedPreviews,
 	runResultToStopReason,
 	projectRunUsage,
 	reconcileRunResult,
@@ -165,6 +166,11 @@ export function streamCursorRuntime(
 				slot = preparedSlot;
 				assertCurrent();
 				live.sink = { stream, partial };
+				if (live.projection.previews) {
+					for (const [id, preview] of live.projection.previews) {
+						if (!preview.ended) live.projection.previews.delete(id);
+					}
+				}
 
 				bindLiveAbort(live, abortSignal, () => {
 					if (!slot) return;
@@ -225,8 +231,9 @@ export function streamCursorRuntime(
 					projectRunUsage(partial, live.projection, live.run?.usage);
 					partial.stopReason = "aborted";
 					partial.errorMessage = "Cancelled";
-					stream.push({ type: "error", reason: "aborted", error: partial });
-					stream.end(partial);
+					const delivered = deliverWithoutUnendedPreviews(partial, live.projection, new Set());
+					stream.push({ type: "error", reason: "aborted", error: delivered });
+					stream.end(delivered);
 					await finishTurnFailed(preparedSlot, "cancelled");
 					return;
 				}
@@ -235,12 +242,13 @@ export function streamCursorRuntime(
 					assertCurrent();
 					projectRunUsage(partial, live.projection, live.run?.usage);
 					for (const call of batch) {
-						applyToolCall(stream, partial, { id: call.toolCallId, name: call.name, arguments: call.args });
+						applyToolCall(stream, partial, { id: call.toolCallId, name: call.name, arguments: call.args }, live.projection);
 					}
 					live.projection.answerText = "";
 					partial.stopReason = "toolUse";
-					stream.push({ type: "done", reason: "toolUse", message: partial });
-					stream.end(partial);
+					const delivered = deliverWithoutUnendedPreviews(partial, live.projection, new Set(batch.map((call) => call.toolCallId)));
+					stream.push({ type: "done", reason: "toolUse", message: delivered });
+					stream.end(delivered);
 					return;
 				}
 				stopWaitingForPark(live);
@@ -254,15 +262,17 @@ export function streamCursorRuntime(
 					partial.errorMessage = sanitizeCursorProviderError(
 						{ ...first.result.error, requestId: first.result.requestId }, apiKey,
 					);
-					stream.push({ type: "error", reason: "error", error: partial });
-					stream.end(partial);
+					const delivered = deliverWithoutUnendedPreviews(partial, live.projection, new Set());
+					stream.push({ type: "error", reason: "error", error: delivered });
+					stream.end(delivered);
 					await finishTurnFailed(preparedSlot, "run error");
 					return;
 				}
 				if (first.result.status === "cancelled") {
 					partial.errorMessage = "Cancelled";
-					stream.push({ type: "error", reason: "aborted", error: partial });
-					stream.end(partial);
+					const delivered = deliverWithoutUnendedPreviews(partial, live.projection, new Set());
+					stream.push({ type: "error", reason: "aborted", error: delivered });
+					stream.end(delivered);
 					await finishTurnFailed(preparedSlot, "cancelled");
 					return;
 				}
@@ -309,8 +319,9 @@ export function streamCursorRuntime(
 					partial.usage.contextTokens = occupancy.usedTokens;
 					partial.cursorSdk.contextOccupancy = occupancy;
 				}
-				stream.push({ type: "done", reason: "stop", message: partial });
-				stream.end(partial);
+				const delivered = deliverWithoutUnendedPreviews(partial, live.projection, new Set());
+				stream.push({ type: "done", reason: "stop", message: delivered });
+				stream.end(delivered);
 				await finishLiveKeepAgent(preparedSlot, "run finished");
 			});
 		} catch (error) {

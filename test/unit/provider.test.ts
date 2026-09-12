@@ -480,6 +480,138 @@ describe("streamCursorRuntime model selection", () => {
 		expect(sent).toHaveLength(1);
 	});
 
+	test("MCP tool-call-started preview is closed by the parked callback", async () => {
+		installCapturingAgent([], [], async (options) => {
+			const tool = options?.local?.customTools?.read;
+			if (!tool) return finishedRun();
+			await options?.onDelta?.({
+				update: {
+					type: "tool-call-started",
+					callId: "call-1",
+					modelCallId: "model-1",
+					toolCall: { type: "mcp", args: { toolName: "read", providerIdentifier: "custom-user-tools", args: { path: "a.ts" } } },
+				},
+			});
+			const pending = tool.execute({ path: "a.ts" }, { toolCallId: "call-1" });
+			return {
+				id: "run-preview",
+				supports: () => false,
+				wait: async () => {
+					await pending;
+					return { id: "run-preview", status: "finished", result: "done" } as RunResult;
+				},
+			} as unknown as Run;
+		});
+		const events = await drain(cursorModel("composer-2.5", 1_000_000), userContext("hi", [readTool()]), {
+			apiKey: "test-key",
+			cwd: "/tmp/project",
+		});
+		expect(events.filter((event) => event.type === "toolcall_start")).toHaveLength(1);
+		expect(events.at(-1)).toMatchObject({ type: "done", reason: "toolUse" });
+		const done = events.at(-1);
+		if (done?.type !== "done") throw new Error("expected toolUse");
+		expect(done.message.content.filter((block) => block.type === "toolCall")).toEqual([
+			expect.objectContaining({ type: "toolCall", id: "call-1", name: "read", arguments: { path: "a.ts" } }),
+		]);
+	});
+
+	test("host-executed tools do not leave preview toolCalls for OMP to run again", async () => {
+		const host = createFakeHost({ tools: ["read"] });
+		installCapturingAgent([], [], async (options) => {
+			const tool = options?.local?.customTools?.read;
+			if (!tool) return finishedRun();
+			await options?.onDelta?.({
+				update: {
+					type: "tool-call-started",
+					callId: "call-1",
+					modelCallId: "model-1",
+					toolCall: { type: "mcp", args: { toolName: "read", providerIdentifier: "custom-user-tools", args: { path: "a.ts" } } },
+				},
+			});
+			await tool.execute({ path: "a.ts" }, { toolCallId: "call-1" });
+			return {
+				id: "run-host",
+				supports: () => false,
+				wait: async () => ({ id: "run-host", status: "finished", result: "done" }) as RunResult,
+			} as unknown as Run;
+		});
+		const events = await drain(cursorModel("composer-2.5", 1_000_000), userContext("hi", [readTool()]), {
+			apiKey: "test-key",
+			cwd: "/tmp/project",
+			[HOST_BRIDGE_OPTION_KEY]: host,
+		} as SimpleStreamOptions);
+		expect(host.calls).toEqual([{ name: "read", args: { path: "a.ts" }, toolCallId: "call-1" }]);
+		expect(events.filter((event) => event.type === "toolcall_start")).toHaveLength(0);
+		const done = events.at(-1);
+		expect(done).toMatchObject({ type: "done", reason: "stop" });
+		if (done?.type !== "done") throw new Error("expected stop");
+		expect(done.message.content.some((block) => block.type === "toolCall")).toBe(false);
+	});
+
+	test("a dropped preview still yields when its callback parks on the next message", async () => {
+		installCapturingAgent([], [], async (options) => {
+			const tool = options?.local?.customTools?.read;
+			if (!tool) return finishedRun();
+			await options?.onDelta?.({
+				update: {
+					type: "tool-call-started",
+					callId: "call-B",
+					modelCallId: "model-B",
+					toolCall: { type: "mcp", args: { toolName: "read", providerIdentifier: "custom-user-tools", args: { path: "b.ts" } } },
+				},
+			});
+			const pendingA = tool.execute({ path: "a.ts" }, { toolCallId: "call-A" });
+			return {
+				id: "run-ab",
+				supports: () => false,
+				wait: async () => {
+					await pendingA;
+					const pendingB = tool.execute({ path: "b.ts" }, { toolCallId: "call-B" });
+					await pendingB;
+					return { id: "run-ab", status: "finished", result: "done" } as RunResult;
+				},
+			} as unknown as Run;
+		});
+		const first = await drain(cursorModel("composer-2.5", 1_000_000), userContext("hi", [readTool()]), {
+			apiKey: "test-key",
+			cwd: "/tmp/project",
+		});
+		expect(first.at(-1)).toMatchObject({ type: "done", reason: "toolUse" });
+		const firstDone = first.at(-1);
+		if (firstDone?.type !== "done") throw new Error("expected A");
+		expect(firstDone.message.content.filter((block) => block.type === "toolCall")).toEqual([
+			expect.objectContaining({ type: "toolCall", id: "call-A", name: "read", arguments: { path: "a.ts" } }),
+		]);
+		const second = await drain(
+			cursorModel("composer-2.5", 1_000_000),
+			{
+				messages: [
+					{ role: "user", content: "hi", timestamp: 1 } as Context["messages"][number],
+					{
+						role: "toolResult",
+						toolCallId: "call-A",
+						toolName: "read",
+						content: [{ type: "text", text: "ok" }],
+						isError: false,
+						timestamp: 2,
+					},
+				],
+				tools: [readTool()],
+			} as Context,
+			{ apiKey: "test-key", cwd: "/tmp/project" },
+		);
+		expect(second.filter((event) => event.type === "toolcall_start")).toHaveLength(1);
+		expect(second.filter((event) => event.type === "toolcall_end")).toHaveLength(1);
+		const secondDone = second.at(-1);
+		expect(secondDone).toMatchObject({ type: "done", reason: "toolUse" });
+		if (secondDone?.type !== "done") throw new Error("expected B");
+		expect(secondDone.message.content.filter((block) => block.type === "toolCall")).toEqual([
+			expect.objectContaining({ type: "toolCall", id: "call-B", name: "read", arguments: { path: "b.ts" } }),
+		]);
+	});
+
+
+
 	test("parked continuation resumes the original run instead of sending a new selection", async () => {
 		const created: ModelSelection[] = [];
 		const sent: ModelSelection[] = [];
