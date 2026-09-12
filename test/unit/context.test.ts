@@ -39,6 +39,36 @@ describe("send policy", () => {
 		expect(prepareSendInput(plan, second, modelLimits)).toEqual({ prompt: { text: "again" } });
 	});
 
+	test("ignores host completion metadata added after a tool continuation", () => {
+		const toolUse = {
+			role: "assistant",
+			content: [{ type: "toolCall", id: "call-1", name: "read", arguments: {} }],
+			api: "cursor-sdk-agent",
+			provider: "cursor-sdk",
+			model: "composer-2.5",
+			usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+			stopReason: "toolUse",
+			timestamp: 2,
+		} as Context["messages"][number];
+		const first = context([
+			{ role: "user", content: "inspect", timestamp: 1 } as Context["messages"][number],
+			toolUse,
+			{ role: "toolResult", toolCallId: "call-1", toolName: "read", content: [{ type: "text", text: "done" }], isError: false, timestamp: 3 },
+		]);
+		const fingerprint = computeContextFingerprint(first);
+		Object.assign(toolUse, {
+			completedAt: 4,
+			contextSnapshot: { promptTokens: 0, nonMessageTokens: 24_056, compactionEpoch: 0 },
+		});
+		const second = context([
+			...first.messages,
+			{ role: "user", content: "continue", timestamp: 5 } as Context["messages"][number],
+		]);
+		expect(planSend({ bootstrapped: true, contextFingerprint: fingerprint, incrementalSendCount: 0 }, second)).toEqual({
+			mode: "incremental", resetAgent: false, reason: "incremental",
+		});
+	});
+
 	test("rebuilds after a shortened history", () => {
 		const first = context([
 			{ role: "user", content: "a", timestamp: 1 } as Context["messages"][number],

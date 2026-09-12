@@ -107,7 +107,11 @@ export function computeContextFingerprint(context: Context): string {
 	const systemHash = hashValue(serializeSystemPrompt(context.systemPrompt));
 	const messageHashes = context.messages.map((message, index) => {
 		const role = "role" in message && typeof message.role === "string" ? message.role : "unknown";
-		return hashValue(`${index}:${role}:${JSON.stringify(message)}`);
+		// OMP stamps these after provider commit; neither changes model-visible history.
+		const stable = role === "assistant"
+			? { ...message, completedAt: undefined, contextSnapshot: undefined }
+			: message;
+		return hashValue(`${index}:${role}:${JSON.stringify(stable)}`);
 	});
 	return JSON.stringify({ format: NATIVE_HISTORY_FORMAT, systemHash, messageHashes });
 }
