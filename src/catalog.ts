@@ -385,7 +385,7 @@ function toModelConfig(metadata: CursorModelMetadata, name: string): ProviderMod
 	}
 	return {
 		id: metadata.piModelId,
-		name: `${name} ${reference ? `[base ref: ${reference.provider}/${reference.id}]` : "[price unknown; not free]"}`,
+		name,
 		reasoning: metadata.supportsReasoning,
 		...(metadata.supportsReasoning && metadata.thinkingLevelMap
 			? {
