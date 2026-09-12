@@ -10,15 +10,15 @@ This is a separate adapter from [lhq1412/omp-cursor-sdk](https://github.com/lhq1
 
 Pinned baselines:
 
-- OMP `18.1.14` (`daf07999`)
+- OMP `18.1.18` (`00085d4`)
 - `@cursor/sdk` `1.0.31`
-- Direct history-codec dependency: `@oh-my-pi/pi-catalog` `18.1.14`
+- Direct history-codec dependency: `@oh-my-pi/pi-catalog` `18.1.18`
 
 Native checkpoint conversion is coupled to these fixed versions, not a promise of compatibility with arbitrary OMP or SDK releases.
 
 ## Requirements
 
-- OMP 18.1.14
+- OMP 18.1.18
 - Bun 1.3.14 or newer (OMP and the extension runtime)
 - Node.js 22.19 or newer (maintenance scripts)
 - a Cursor SDK API key from Cursor Dashboard → API Keys
@@ -40,7 +40,7 @@ npm install
 omp plugin link .
 ```
 
-OMP 18.1.14 only loads plugins declared in `~/.omp/plugins/package.json`. After linking, add a `file:` dependency if `omp models cursor-sdk` is empty:
+OMP 18.1.18 only loads plugins declared in `~/.omp/plugins/package.json`. After linking, add a `file:` dependency if `omp models cursor-sdk` is empty:
 
 ```bash
 cd ~/.omp/plugins
@@ -92,7 +92,7 @@ Models are **canonical IDs only** (`cursor-sdk/composer-2.5`). Fast is a per-sen
 
 The native model browser's input/output prices are **base-mode reference USD per million tokens, not Cursor SDK charges**. The adapter first checks an exact, nonzero OMP bundled Cursor price, then exact IDs in the bundled OpenAI, Anthropic, Google and xAI catalogs. A small explicit map covers Cursor's alternate Claude names; display names, SDK aliases, arbitrary suffixes and Gemini preview variants are not guessed. The selected model's detail name identifies the source, for example `[base ref: openai/gpt-5.5]`. Prices follow the pinned OMP catalog, not a live price feed; SDK model IDs, capabilities and selection parameters remain authoritative.
 
-All bundled Cursor prices in OMP 18.1.14 are zero, so matched first-party models supply the current comparisons. Models without a reliable price, including Composer, show `[price unknown; not free]` in their detail name. **OMP 18.1.14 still renders structural zero prices as `free` in its native price column; this host label does not mean these models are free.** The plain `omp models` table has no price columns; use the interactive model browser for comparisons.
+All bundled Cursor prices in OMP 18.1.18 are zero, so matched first-party models supply the current comparisons. Models without a reliable price, including Composer, show `[price unknown; not free]` in their detail name. **OMP 18.1.18 still renders structural zero prices as `free` in its native price column; this host label does not mean these models are free.** The plain `omp models` table has no price columns; use the interactive model browser for comparisons.
 
 Reference rates do not account for Cursor fast mode, long-context premiums, discounts or plan coverage. Extended-context rows retain the SDK threshold but repeat the base reference rates; they do not import the vendor's pricing tiers. These catalog rates are not used to calculate assistant-message costs: message `usage.cost` remains unavailable, and token/context accounting is unchanged. Restart OMP after updating the extension, then run `/cursor-refresh-models` to refresh the model list.
 
@@ -182,7 +182,7 @@ Final SDK results fill missing answer text against the current answer step. A ma
 
 Assistant messages carry `cursorSdk` availability metadata: `tokenUsage` is `actual` or `unavailable`; `contextOccupancy` is `actual` with `source: "checkpoint"` after a successful settled turn whose public store root is new, idle, and stable, otherwise `unavailable`. Run billing and `turn-ended` totals are not occupancy. When occupancy is actual, `usage.contextTokens` is the checkpoint `usedTokens` value so OMP context accounting can use it; parked, cancelled, and unreadable checkpoints leave it unset. Message `cost` stays `unavailable`: OMP requires numeric cost fields, so their zero placeholders **do not mean free usage**. Official billed totals and dollar amounts come from `/cursor-usage` or OMP `/usage` (`agent.getUsage()`): top-level agent snapshots, not summed listed turns, and not written into `usage.cost`. Local billed IDs are per-turn identities, not SDK Run IDs, and costs can settle later. Some accounts return `feature_unavailable` for `getUsage()`. See the [public SDK usage contracts](https://cursor.com/docs/sdk/typescript#token-usage).
 
-SDK Run billing maps to `usage.orchestration`: input includes cache writes, with output and cache reads in their own orchestration fields. The prompt buckets (`usage.input`, `output`, `cacheRead`, and `cacheWrite`) stay zero, and `usage.totalTokens` is the orchestration sum. OMP 18.1.14 subtracts orchestration from `calculateContextTokens` and checks only prompt input/cache buckets for usage-backed overflow, so cumulative Run totals no longer masquerade as conversation context. When a settled checkpoint reports occupancy, `calculateContextTokens` prefers `usage.contextTokens`.
+SDK Run billing maps to `usage.orchestration`: input includes cache writes, with output and cache reads in their own orchestration fields. The prompt buckets (`usage.input`, `output`, `cacheRead`, and `cacheWrite`) stay zero, and `usage.totalTokens` is the orchestration sum. OMP 18.1.18 subtracts orchestration from `calculateContextTokens` and checks only prompt input/cache buckets for usage-backed overflow, so cumulative Run totals no longer masquerade as conversation context. When a settled checkpoint reports occupancy, `calculateContextTokens` prefers `usage.contextTokens`.
 
 Provider errors and diagnostic notifications redact credentials, authorization/cookie headers and sensitive query values before display/persistence, while retaining useful error categories and request IDs. Normal assistant/tool content is not globally rewritten.
 
