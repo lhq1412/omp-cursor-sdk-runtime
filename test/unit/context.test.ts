@@ -69,6 +69,37 @@ describe("send policy", () => {
 		});
 	});
 
+	test("migrates exact legacy fingerprints without replaying committed input or accepting changed history", () => {
+		const ctx = context([
+			{
+				role: "assistant", content: [{ type: "text", text: "Prior answer" }], timestamp: 1,
+				completedAt: 2, contextSnapshot: { promptTokens: 100, nonMessageTokens: 10 },
+			},
+			{ role: "user", content: "Already executed request", timestamp: 3 },
+		] as Context["messages"]);
+		const legacy = JSON.parse(computeContextFingerprint(ctx));
+		legacy.messageHashes = ctx.messages.map((message, index) =>
+			new Bun.CryptoHasher("sha256").update(`${index}:${message.role}:${JSON.stringify(message)}`).digest("hex").slice(0, 16),
+		);
+		const state = { bootstrapped: true, contextFingerprint: JSON.stringify(legacy), incrementalSendCount: 1 };
+		const plan = planSend(state, ctx);
+		expect(plan).toMatchObject({ mode: "incremental", resetAgent: false, continueOnly: true });
+		expect(prepareSendInput(plan, ctx, modelLimits).prompt.text).not.toContain("Already executed request");
+		const periodic = planSend({ ...state, incrementalSendCount: 20 }, ctx);
+		expect(periodic).toMatchObject({ mode: "bootstrap", continueOnly: true });
+		expect(prepareSendInput(periodic, ctx, modelLimits).history).toEqual(ctx.messages);
+		const appended = context([...ctx.messages, { role: "user", content: "New request", timestamp: 4 }]);
+		const next = planSend(state, appended);
+		expect(next.mode).toBe("incremental");
+		expect(prepareSendInput(next, appended, modelLimits).prompt.text).toBe("New request");
+		const changed = structuredClone(ctx);
+		changed.messages[1] = { role: "user", content: "Different request", timestamp: 3 };
+		expect(planSend(state, changed)).toMatchObject({ mode: "bootstrap", reason: "context_divergence" });
+		expect(planSend(state, { ...ctx, systemPrompt: "Changed policy" })).toMatchObject({
+			mode: "bootstrap", reason: "context_divergence", continueOnly: true,
+		});
+	});
+
 	test("rebuilds after a shortened history", () => {
 		const first = context([
 			{ role: "user", content: "a", timestamp: 1 } as Context["messages"][number],

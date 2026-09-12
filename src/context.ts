@@ -134,6 +134,9 @@ export function planSend(sendState: SendState, context: Context): SendPlan {
 	}
 	for (let index = 0; index < previous.messageHashes.length; index += 1) {
 		if (current.messageHashes[index] !== previous.messageHashes[index]) {
+			// Older v1 fingerprints include host metadata. Accept only an exact raw-message match.
+			const message = context.messages[index]!;
+			if (previous.messageHashes[index] === hashValue(`${index}:${message.role}:${JSON.stringify(message)}`)) continue;
 			return { mode: "bootstrap", resetAgent: true, reason: "context_divergence" };
 		}
 	}
