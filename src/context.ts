@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import type { SDKImage, SDKUserMessage } from "@cursor/sdk";
 import type { Context } from "@oh-my-pi/pi-ai";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
+import { classifyModel } from "@oh-my-pi/pi-catalog/compat/taxonomy";
 import {
 	BOOTSTRAP_OUTPUT_RESERVE_TOKENS,
 	CURSOR_SDK_API,
@@ -193,6 +194,17 @@ function textFromContent(content: unknown): string {
 		.join("\n");
 }
 
+function nativeToolResultText(content: unknown): string {
+	if (typeof content === "string") return content;
+	if (!Array.isArray(content)) return "";
+	return content.map((item) => {
+		if (!isRecord(item)) return "";
+		if (item.type === "text" && typeof item.text === "string") return item.text;
+		if (item.type === "image" && typeof item.mimeType === "string") return `[${item.mimeType} image]`;
+		return "";
+	}).join("\n");
+}
+
 function imagesFromContent(content: unknown): SDKImage[] {
 	if (!Array.isArray(content)) return [];
 	const images: SDKImage[] = [];
@@ -226,31 +238,70 @@ function historyUnits(messages: Context["messages"], recoveryStart?: number): Co
 	return units;
 }
 
-function estimatedHistoryTokens(messages: Context["messages"]): number {
+function canReplayNativeThinking(message: { api?: unknown; provider?: unknown; model?: unknown }, targetModelId: string | undefined): boolean {
+	// Mirror canReplayCursorThinking in the pinned codec. Do not relabel cursor-sdk identity.
+	return (
+		targetModelId !== undefined &&
+		classifyModel("cursor", targetModelId).family === "k3" &&
+		message.api === "cursor-agent" &&
+		message.provider === "cursor" &&
+		message.model === targetModelId
+	);
+}
+
+function estimatedHistoryTokens(messages: Context["messages"], targetModelId?: string): number {
 	const fragments: string[] = [];
 	let tokens = 0;
 	for (const message of messages) {
 		if (message.role === "user" || message.role === "developer") {
-			const text = textFromContent(message.content);
-			if (text) fragments.push(text);
-			tokens += imagesFromContent(message.content).length * IMAGE_TOKEN_RESERVE;
+			const text = textFromContent(message.content).trim();
+			const images = imagesFromContent(message.content);
+			tokens += images.length * IMAGE_TOKEN_RESERVE;
+			const content: unknown[] = [];
+			if (text) content.push({ type: "text", text });
+			for (const image of images) content.push({ type: "image", mediaType: "mimeType" in image ? image.mimeType : "image/png" });
+			if (content.length > 0) fragments.push(JSON.stringify({ role: "user", content }));
 			continue;
 		}
 		if (message.role === "assistant") {
 			if (!Array.isArray(message.content)) continue;
+			const content: unknown[] = [];
+			const replayThinking = canReplayNativeThinking(message, targetModelId);
 			for (const block of message.content) {
 				if (!isRecord(block)) continue;
-				if (block.type === "text" && typeof block.text === "string" && block.text) fragments.push(block.text);
-				else if (block.type === "toolCall") {
-					if (typeof block.name === "string") fragments.push(block.name);
-					fragments.push(JSON.stringify(block.arguments ?? null));
+				if (block.type === "text" && typeof block.text === "string" && block.text) content.push({ type: "text", text: block.text });
+				else if (block.type === "thinking" && replayThinking && typeof block.thinking === "string" && block.thinking) {
+					content.push({
+						type: "reasoning",
+						text: block.thinking,
+						providerOptions: { cursor: { modelName: message.model } },
+						...(typeof block.thinkingSignature === "string" ? { signature: block.thinkingSignature } : {}),
+					});
+				} else if (block.type === "toolCall" && typeof block.id === "string") {
+					content.push({
+						type: "tool-call",
+						toolCallId: nativeToolCallId(block.id),
+						toolName: typeof block.name === "string" ? block.name : "",
+						args: block.arguments ?? {},
+					});
 				}
 			}
+			if (content.length > 0) fragments.push(JSON.stringify({ role: "assistant", content }));
 			continue;
 		}
 		if (message.role === "toolResult") {
-			const text = textFromContent(message.content);
-			if (text) fragments.push(text);
+			const toolCallId = nativeToolCallId(message.toolCallId);
+			fragments.push(JSON.stringify({
+				role: "tool",
+				id: toolCallId,
+				content: [{
+					type: "tool-result",
+					toolName: message.toolName,
+					toolCallId,
+					result: nativeToolResultText(message.content),
+					...(message.isError ? { isError: true } : {}),
+				}],
+			}));
 			continue;
 		}
 		const extra = message as { role?: string; summary?: unknown };
@@ -339,7 +390,7 @@ function validateToolResultRecovery(context: Context): number | undefined {
 }
 
 /** Bootstrap instructions stay in the send text; conversation history is imported natively. */
-export function prepareSendInput(plan: SendPlan, context: Context, limits: ModelInputLimits): PreparedSendInput {
+export function prepareSendInput(plan: SendPlan, context: Context, limits: ModelInputLimits, targetModelId?: string): PreparedSendInput {
 	const current = activeUserInput(context, plan.continueOnly);
 	if (plan.mode === "incremental") {
 		if (estimatedTextTokens(current.text) > inputTextBudget(current, limits)) throwContextOverflow();
@@ -375,7 +426,7 @@ export function prepareSendInput(plan: SendPlan, context: Context, limits: Model
 	let remaining = budget - requiredTokens - estimatedTextTokens(toolContext);
 	let start = units.length;
 	while (start > 0) {
-		const cost = estimatedHistoryTokens(units[start - 1]!);
+		const cost = estimatedHistoryTokens(units[start - 1]!, targetModelId);
 		if (cost > remaining) break;
 		remaining -= cost;
 		start -= 1;
