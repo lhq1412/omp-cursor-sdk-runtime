@@ -8,8 +8,8 @@ import { EditTool } from "@oh-my-pi/pi-coding-agent/edit";
 import { getEditStore } from "@oh-my-pi/pi-coding-agent/edit/store";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { createAssistantMessageEventStream } from "@oh-my-pi/pi-ai";
-import { applyInteractionUpdate, applyToolCall, createEmptyAssistantMessage, projectRunUsage, reconcileRunResult, type RunProjection } from "../../src/projector.ts";
-import type { RunResult, TokenUsage } from "@cursor/sdk";
+import { applyInteractionUpdate, applyToolCall, createEmptyAssistantMessage, deliverWithoutUnendedPreviews, projectRunUsage, reconcileRunResult, type RunProjection } from "../../src/projector.ts";
+import type { InteractionUpdate, RunResult, TokenUsage } from "@cursor/sdk";
 import { CURSOR_SDK_API, CURSOR_SDK_PROVIDER_ID } from "../../src/constants.ts";
 import type { Model } from "@oh-my-pi/pi-ai";
 import type { Api } from "@oh-my-pi/pi-ai";
@@ -50,6 +50,117 @@ describe("projector", () => {
 			}
 		}
 	});
+
+	function mcpUpdate(
+		type: "tool-call-started" | "partial-tool-call",
+		callId: string,
+		toolName: string,
+		args: Record<string, unknown>,
+	): InteractionUpdate {
+		return {
+			type,
+			callId,
+			modelCallId: "model-1",
+			toolCall: { type: "mcp", args: { toolName, providerIdentifier: "custom-user-tools", args } },
+		} as InteractionUpdate;
+	}
+
+	test("previews correlatable MCP snapshots and closes them without a second call", async () => {
+		const model = {
+			id: "composer-2.5",
+			provider: CURSOR_SDK_PROVIDER_ID,
+			api: CURSOR_SDK_API,
+		} as Model<Api>;
+		const stream = createAssistantMessageEventStream();
+		const partial = createEmptyAssistantMessage(model);
+		const projection: RunProjection = { answerText: "", allowToolPreview: true, sdkToOmp: new Map([["read", "read"]]) };
+		applyInteractionUpdate(stream, partial, mcpUpdate("tool-call-started", "call-1", "read", { path: "a" }), projection);
+		applyInteractionUpdate(stream, partial, mcpUpdate("partial-tool-call", "call-1", "read", { path: "a.ts" }), projection);
+		expect(partial.content.filter((block) => block.type === "toolCall")).toHaveLength(1);
+		expect(partial.content[0]).toMatchObject({ type: "toolCall", id: "call-1", name: "read", arguments: { path: "a.ts" } });
+		applyToolCall(stream, partial, { id: "call-1", name: "read", arguments: { path: "a.ts" } }, projection);
+		applyInteractionUpdate(stream, partial, mcpUpdate("tool-call-started", "call-1", "read", { path: "a.ts" }), projection);
+		expect(partial.content.filter((block) => block.type === "toolCall")).toHaveLength(1);
+		stream.end(partial);
+		let argumentsJson = "";
+		let starts = 0;
+		let ends = 0;
+		for await (const event of stream) {
+			if (event.type === "toolcall_start") starts += 1;
+			if (event.type === "toolcall_delta") argumentsJson += event.delta;
+			if (event.type === "toolcall_end") ends += 1;
+		}
+		expect(starts).toBe(1);
+		expect(ends).toBe(1);
+		expect(JSON.parse(argumentsJson)).toEqual({ path: "a.ts" });
+	});
+
+	test("does not preview unmapped MCP tools and drops unmatched previews", () => {
+		const model = {
+			id: "composer-2.5",
+			provider: CURSOR_SDK_PROVIDER_ID,
+			api: CURSOR_SDK_API,
+		} as Model<Api>;
+		const stream = createAssistantMessageEventStream();
+		const partial = createEmptyAssistantMessage(model);
+		const projection: RunProjection = { answerText: "", allowToolPreview: true, sdkToOmp: new Map([["read", "read"]]) };
+		applyInteractionUpdate(stream, partial, mcpUpdate("tool-call-started", "other", "shellish", { command: "ls" }), projection);
+		expect(partial.content.some((block) => block.type === "toolCall")).toBe(false);
+		applyInteractionUpdate(stream, partial, mcpUpdate("tool-call-started", "orphan", "read", { path: "x.ts" }), projection);
+		applyToolCall(stream, partial, { id: "call-1", name: "read", arguments: { path: "a.ts" } }, projection);
+		const delivered = deliverWithoutUnendedPreviews(partial, projection, new Set(["call-1"]));
+		expect(partial.content.filter((block) => block.type === "toolCall").map((block) => block.type === "toolCall" ? block.id : "")).toEqual(["orphan", "call-1"]);
+		expect(delivered.content.filter((block) => block.type === "toolCall").map((block) => block.type === "toolCall" ? block.id : "")).toEqual(["call-1"]);
+		expect(delivered).not.toBe(partial);
+		applyToolCall(stream, partial, { id: "orphan", name: "read", arguments: { path: "x.ts" } }, projection);
+		expect(partial.content.filter((block) => block.type === "toolCall").map((block) => block.type === "toolCall" ? block.id : "")).toEqual(["orphan", "call-1", "orphan"]);
+	});
+
+	test("does not open executable previews without an explicit park-path allow", () => {
+		const model = {
+			id: "composer-2.5",
+			provider: CURSOR_SDK_PROVIDER_ID,
+			api: CURSOR_SDK_API,
+		} as Model<Api>;
+		const stream = createAssistantMessageEventStream();
+		const partial = createEmptyAssistantMessage(model);
+		applyInteractionUpdate(stream, partial, mcpUpdate("tool-call-started", "call-1", "read", { path: "a.ts" }), {
+			answerText: "",
+			sdkToOmp: new Map([["read", "read"]]),
+		});
+		expect(partial.content).toEqual([]);
+	});
+
+	test("keeps streamed contentIndex stable when an unconfirmed preview is omitted from delivery", async () => {
+		const model = {
+			id: "composer-2.5",
+			provider: CURSOR_SDK_PROVIDER_ID,
+			api: CURSOR_SDK_API,
+		} as Model<Api>;
+		const stream = createAssistantMessageEventStream();
+		const partial = createEmptyAssistantMessage(model);
+		const projection: RunProjection = { answerText: "", allowToolPreview: true, sdkToOmp: new Map([["edit", "edit"]]) };
+		applyInteractionUpdate(stream, partial, mcpUpdate("tool-call-started", "call-B", "edit", { input: "preview-B" }), projection);
+		applyToolCall(stream, partial, { id: "call-A", name: "edit", arguments: { input: "patch-for-A" } }, projection);
+		applyToolCall(stream, partial, { id: "call-C", name: "edit", arguments: { input: "patch-for-C" } }, projection);
+		const delivered = deliverWithoutUnendedPreviews(partial, projection, new Set(["call-A", "call-C"]));
+		expect(partial.content.map((block) => block.type === "toolCall" ? block.id : "")).toEqual(["call-B", "call-A", "call-C"]);
+		expect(delivered.content.filter((block) => block.type === "toolCall").map((block) => block.type === "toolCall" ? block.id : "")).toEqual(["call-A", "call-C"]);
+		stream.end(delivered);
+		const received = new Map<string, string>();
+		for await (const event of stream) {
+			if (event.type === "toolcall_start") {
+				const block = event.partial.content[event.contentIndex];
+				if (block?.type === "toolCall") received.set(block.id, "");
+			} else if (event.type === "toolcall_delta") {
+				const block = event.partial.content[event.contentIndex];
+				if (block?.type === "toolCall") received.set(block.id, (received.get(block.id) ?? "") + event.delta);
+			}
+		}
+		expect(JSON.parse(received.get("call-A") ?? "null")).toEqual({ input: "patch-for-A" });
+		expect(JSON.parse(received.get("call-C") ?? "null")).toEqual({ input: "patch-for-C" });
+	});
+
 
 	test("projected JSON arguments drive the host streaming edit to change a file", async () => {
 		const cwd = await mkdtemp(join(tmpdir(), "cursor-projector-edit-"));

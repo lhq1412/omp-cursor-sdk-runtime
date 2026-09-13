@@ -28,6 +28,7 @@ import {
 	applyInteractionUpdate,
 	applyToolCall,
 	closeOpenBlocks,
+	deliverWithoutUnendedPreviews,
 	runResultToStopReason,
 	projectRunUsage,
 	reconcileRunResult,
@@ -207,6 +208,11 @@ export class ProviderTurnRunner {
 		this.slot = prepared.slot;
 		this.assertCurrent();
 		prepared.live.sink = { stream, partial };
+		if (prepared.live.projection.previews) {
+			for (const [id, preview] of prepared.live.projection.previews) {
+				if (!preview.ended) prepared.live.projection.previews.delete(id);
+			}
+		}
 		return { ...prepared, cwd, agentInstanceId, host, snapshot, modelSelection };
 	}
 
@@ -266,12 +272,13 @@ export class ProviderTurnRunner {
 			this.assertCurrent();
 			projectRunUsage(partial, live.projection, live.run?.usage);
 			for (const call of batch) {
-				applyToolCall(stream, partial, { id: call.toolCallId, name: call.name, arguments: call.args });
+				applyToolCall(stream, partial, { id: call.toolCallId, name: call.name, arguments: call.args }, live.projection);
 			}
 			live.projection.answerText = "";
 			partial.stopReason = "toolUse";
-			stream.push({ type: "done", reason: "toolUse", message: partial });
-			stream.end(partial);
+			const delivered = deliverWithoutUnendedPreviews(partial, live.projection, new Set(batch.map((call) => call.toolCallId)));
+			stream.push({ type: "done", reason: "toolUse", message: delivered });
+			stream.end(delivered);
 			return { kind: "yielded" };
 		}
 		return { kind: "finished", result: first.result };
@@ -285,8 +292,9 @@ export class ProviderTurnRunner {
 			if (!outcome.beforeSend) projectRunUsage(partial, live.projection, live.run?.usage);
 			partial.stopReason = "aborted";
 			partial.errorMessage = "Cancelled";
-			stream.push({ type: "error", reason: "aborted", error: partial });
-			stream.end(partial);
+			const delivered = deliverWithoutUnendedPreviews(partial, live.projection, new Set());
+			stream.push({ type: "error", reason: "aborted", error: delivered });
+			stream.end(delivered);
 			await finishTurnFailed(preparedSlot, outcome.beforeSend ? "aborted" : "cancelled");
 			return;
 		}
@@ -301,15 +309,17 @@ export class ProviderTurnRunner {
 			partial.errorMessage = sanitizeCursorProviderError(
 				{ ...outcome.result.error, requestId: outcome.result.requestId }, this.apiKey,
 			);
-			stream.push({ type: "error", reason: "error", error: partial });
-			stream.end(partial);
+			const delivered = deliverWithoutUnendedPreviews(partial, live.projection, new Set());
+			stream.push({ type: "error", reason: "error", error: delivered });
+			stream.end(delivered);
 			await finishTurnFailed(preparedSlot, "run error");
 			return;
 		}
 		if (outcome.result.status === "cancelled") {
 			partial.errorMessage = "Cancelled";
-			stream.push({ type: "error", reason: "aborted", error: partial });
-			stream.end(partial);
+			const delivered = deliverWithoutUnendedPreviews(partial, live.projection, new Set());
+			stream.push({ type: "error", reason: "aborted", error: delivered });
+			stream.end(delivered);
 			await finishTurnFailed(preparedSlot, "cancelled");
 			return;
 		}
@@ -356,8 +366,9 @@ export class ProviderTurnRunner {
 			partial.usage.contextTokens = occupancy.usedTokens;
 			partial.cursorSdk.contextOccupancy = occupancy;
 		}
-		stream.push({ type: "done", reason: "stop", message: partial });
-		stream.end(partial);
+		const delivered = deliverWithoutUnendedPreviews(partial, live.projection, new Set());
+		stream.push({ type: "done", reason: "stop", message: delivered });
+		stream.end(delivered);
 		await finishLiveKeepAgent(preparedSlot, "run finished");
 	}
 }
