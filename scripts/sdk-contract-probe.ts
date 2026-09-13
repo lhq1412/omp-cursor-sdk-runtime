@@ -1,19 +1,58 @@
 import "../src/sdk-exit-guard.ts";
+import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { Agent, type Run, type RunResult, type SDKAgent } from "@cursor/sdk";
+import { isAbsolute, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { Agent, type Run, type RunResult, type RunStatus, type SDKAgent, type SDKCustomToolContext } from "@cursor/sdk";
 import { DEFAULT_MODEL_ID, SDK_TOOL_CONTEXT, SYSTEM_PROMPT_REPLACEMENT } from "../src/constants.ts";
 import { requireCursorApiKey } from "../src/auth.ts";
 import { buildAgentOptions, openAgent, openJsonlStore, type OpenAgentInput } from "../src/sdk-session.ts";
 import { readNativeCheckpoint } from "../src/native-history.ts";
+
+const SELF = fileURLToPath(import.meta.url);
+const SDK_PIN = "1.0.31";
+const WINDOW_MS = 10_000;
+const CHILD_MS = 180_000;
+const REUSE_TOKEN = "probe-reuse-token";
+const USAGE = "usage: --cancellation-case cancel|dispose <absolute-temp-root>";
 
 interface ProbeResult {
 	name: string;
 	ok: boolean;
 	detail: string;
 }
+
+type CaseKind = "cancel" | "dispose";
+type Phase = "setup" | "pending" | "late-release" | "cleanup";
+type Outcome =
+	| "resolved"
+	| "rejected"
+	| "pending-at-deadline"
+	| "observed"
+	| "not-observed"
+	| "unsupported"
+	| "unknown"
+	| "setup-failed";
+
+interface Capability {
+	case: CaseKind;
+	phase: Phase;
+	observation: string;
+	outcome: Outcome;
+	elapsedMs: number;
+	detail?: unknown;
+}
+
+interface Observer<T> {
+	promise: Promise<T>;
+	state: "pending" | "resolved" | "rejected";
+	value?: T;
+	error?: unknown;
+}
+
+class SetupFailed extends Error {}
 
 function scrub(text: string, apiKey: string): string {
 	return text.split(apiKey).join("<redacted>");
@@ -27,8 +66,423 @@ function formatRun(result: RunResult, apiKey: string): string {
 	].filter(Boolean).join(" ");
 }
 
-async function main(): Promise<void> {
+function errorDetail(error: unknown): { name?: string; message: string } {
+	if (error instanceof Error) return { name: error.name, message: error.message };
+	return { message: String(error) };
+}
+
+function emitCapability(apiKey: string, rec: Capability): void {
+	const body: Record<string, unknown> = {
+		case: rec.case,
+		phase: rec.phase,
+		observation: rec.observation,
+		outcome: rec.outcome,
+		elapsedMs: rec.elapsedMs,
+	};
+	if (rec.detail !== undefined) {
+		try {
+			body.detail = JSON.parse(scrub(JSON.stringify(rec.detail), apiKey));
+		} catch {
+			body.detail = { error: "unserializable" };
+		}
+	}
+	console.log(`CAPABILITY ${JSON.stringify(body)}`);
+}
+
+function observePromise<T>(promise: Promise<T>): Observer<T> {
+	const obs: Observer<T> = { promise, state: "pending" };
+	void promise.then(
+		(value) => {
+			obs.state = "resolved";
+			obs.value = value;
+		},
+		(error) => {
+			obs.state = "rejected";
+			obs.error = error;
+		},
+	);
+	return obs;
+}
+
+function sleep(ms: number): Promise<void> {
+	return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function awaitDeadline<T>(obs: Observer<T>): Promise<void> {
+	if (obs.state !== "pending") return;
+	await Promise.race([obs.promise.then(() => undefined, () => undefined), sleep(WINDOW_MS)]);
+}
+
+function attachLate<T>(apiKey: string, obs: Observer<T>, meta: Omit<Capability, "outcome" | "elapsedMs">, startedAt: number, detail?: (obs: Observer<T>) => unknown): void {
+	if (obs.state !== "pending") return;
+	void obs.promise.then(
+		() => emitCapability(apiKey, { ...meta, outcome: "resolved", elapsedMs: Date.now() - startedAt, detail: detail?.(obs) }),
+		() => emitCapability(apiKey, { ...meta, outcome: "rejected", elapsedMs: Date.now() - startedAt, detail: detail?.(obs) }),
+	);
+}
+
+async function observeWindow<T>(
+	apiKey: string,
+	obs: Observer<T>,
+	meta: Omit<Capability, "outcome" | "elapsedMs">,
+	startedAt: number,
+	detail?: (obs: Observer<T>) => unknown,
+): Promise<Observer<T>["state"] | "pending-at-deadline"> {
+	await awaitDeadline(obs);
+	const elapsedMs = Date.now() - startedAt;
+	if (obs.state === "pending") {
+		emitCapability(apiKey, { ...meta, outcome: "pending-at-deadline", elapsedMs, detail: detail?.(obs) });
+		attachLate(apiKey, obs, meta, startedAt, detail);
+		return "pending-at-deadline";
+	}
+	emitCapability(apiKey, { ...meta, outcome: obs.state, elapsedMs, detail: detail?.(obs) });
+	return obs.state;
+}
+
+function parseCancellationArgv(): { kind: CaseKind; root: string } | "invalid" | undefined {
+	const idx = process.argv.indexOf("--cancellation-case");
+	if (idx === -1) return undefined;
+	const kind = process.argv[idx + 1];
+	const root = process.argv[idx + 2];
+	if ((kind !== "cancel" && kind !== "dispose") || !root || !isAbsolute(root)) return "invalid";
+	return { kind, root };
+}
+
+function failSetup(apiKey: string, kind: CaseKind, observation: string, startedAt: number, detail?: unknown): never {
+	emitCapability(apiKey, { case: kind, phase: "setup", observation, outcome: "setup-failed", elapsedMs: Date.now() - startedAt, detail });
+	throw new SetupFailed(observation);
+}
+
+function emitContext(apiKey: string, kind: CaseKind, startedAt: number, context: SDKCustomToolContext): AbortSignal | undefined {
+	const rec = context as SDKCustomToolContext & { signal?: unknown; deadline?: unknown };
+	const elapsedMs = Date.now() - startedAt;
+	emitCapability(apiKey, {
+		case: kind, phase: "setup", observation: "context.keys", outcome: "observed", elapsedMs,
+		detail: { keys: Object.keys(rec).sort(), sdk: SDK_PIN },
+	});
+	const idIn = "toolCallId" in rec;
+	const id = rec.toolCallId;
+	emitCapability(apiKey, {
+		case: kind, phase: "setup", observation: "context.toolCallId",
+		outcome: idIn && typeof id === "string" && id.length > 0 ? "observed" : idIn ? "unknown" : "not-observed",
+		elapsedMs, detail: { in: idIn, typeof: typeof id },
+	});
+	const signalIn = "signal" in rec;
+	const signal = rec.signal;
+	const isAbort = signal instanceof AbortSignal;
+	emitCapability(apiKey, {
+		case: kind, phase: "setup", observation: "context.signal",
+		outcome: !signalIn ? "not-observed" : isAbort ? "observed" : "unknown",
+		elapsedMs, detail: { in: signalIn, typeof: typeof signal },
+	});
+	const deadlineIn = "deadline" in rec;
+	emitCapability(apiKey, {
+		case: kind, phase: "setup", observation: "context.deadline",
+		outcome: !deadlineIn ? "not-observed" : "unknown",
+		elapsedMs, detail: { in: deadlineIn, typeof: typeof rec.deadline },
+	});
+	return isAbort ? signal : undefined;
+}
+
+async function boundedCleanup(operation: Promise<unknown>): Promise<void> {
+	await Promise.race([operation.then(() => undefined, () => undefined), sleep(WINDOW_MS)]);
+}
+
+async function runIsolated(kind: CaseKind, root: string, apiKey: string): Promise<void> {
+	const startedAt = Date.now();
+	const store = openJsonlStore(join(root, "store"));
+	const toolGate = Promise.withResolvers<void>();
+	const entered = Promise.withResolvers<void>();
+	const callbackReturned = Promise.withResolvers<unknown>();
+	const callbackObs = observePromise(callbackReturned.promise);
+	const enteredObs = observePromise(entered.promise);
+	const statusTimeline: Array<{ status: RunStatus; elapsedMs: number }> = [];
+	let holdEntries = 0;
+	let signalNotified = false;
+	let released = false;
+	let disposed = false;
+	let agent: SDKAgent | undefined;
+	let run: Run | undefined;
+	let waitObs: Observer<RunResult> | undefined;
+	let followRun: Run | undefined;
+	let unsubscribeStatus: (() => void) | undefined;
+
+	const runDetail = (extra?: Record<string, unknown>) => ({
+		sdk: SDK_PIN,
+		runStatus: run?.status,
+		statusTimeline,
+		...extra,
+	});
+
+	const releaseGate = () => {
+		if (released) return;
+		released = true;
+		toolGate.resolve();
+	};
+
+	const input: OpenAgentInput = {
+		apiKey,
+		cwd: root,
+		model: { id: DEFAULT_MODEL_ID },
+		store,
+		customTools: {
+			hold: {
+				description: "Block until released. The only tool you may call, and you must call it exactly once.",
+				inputSchema: { type: "object", properties: {} },
+				execute: async (_args, context) => {
+					holdEntries += 1;
+					if (holdEntries === 1) {
+						const signal = emitContext(apiKey, kind, startedAt, context);
+						if (signal) {
+							const onAbort = () => {
+								if (signalNotified) return;
+								signalNotified = true;
+								emitCapability(apiKey, {
+									case: kind, phase: "pending", observation: "callback.notification",
+									outcome: "observed", elapsedMs: Date.now() - startedAt,
+									detail: { sdk: SDK_PIN, aborted: signal.aborted },
+								});
+							};
+							signal.addEventListener("abort", onAbort);
+							if (signal.aborted) onAbort();
+						}
+						entered.resolve();
+					}
+					try {
+						await toolGate.promise;
+						const result = { content: [{ type: "text" as const, text: "released" }] };
+						if (holdEntries === 1) callbackReturned.resolve(result);
+						return result;
+					} catch (error) {
+						if (holdEntries === 1) callbackReturned.reject(error);
+						throw error;
+					}
+				},
+			},
+		},
+	};
+
+	try {
+		const openObs = observePromise(openAgent(input));
+		await awaitDeadline(openObs);
+		if (openObs.state === "pending") failSetup(apiKey, kind, "agent.open", startedAt, { sdk: SDK_PIN, error: { message: "pending-at-deadline" } });
+		if (openObs.state === "rejected") failSetup(apiKey, kind, "agent.open", startedAt, { sdk: SDK_PIN, error: errorDetail(openObs.error) });
+		agent = openObs.value;
+		if (!agent) failSetup(apiKey, kind, "agent.open", startedAt, { sdk: SDK_PIN, error: { message: "missing-agent" } });
+
+		const sendObs = observePromise(agent.send("Call hold exactly once. Do not call any other tool."));
+		await awaitDeadline(sendObs);
+		if (sendObs.state === "pending") failSetup(apiKey, kind, "run.handle", startedAt, { sdk: SDK_PIN, error: { message: "pending-at-deadline" } });
+		if (sendObs.state === "rejected") failSetup(apiKey, kind, "run.handle", startedAt, { sdk: SDK_PIN, error: errorDetail(sendObs.error) });
+		run = sendObs.value;
+		if (!run) failSetup(apiKey, kind, "run.handle", startedAt, { sdk: SDK_PIN, error: { message: "missing-run" } });
+		unsubscribeStatus = run.onDidChangeStatus((status) => {
+			statusTimeline.push({ status, elapsedMs: Date.now() - startedAt });
+		});
+		waitObs = observePromise(run.wait());
+
+		const first = await Promise.race([
+			entered.promise.then(() => "entered" as const),
+			waitObs.promise.then(() => "finished" as const, () => "finished" as const),
+			sleep(WINDOW_MS).then(() => "timeout" as const),
+		]);
+		if (first !== "entered" || enteredObs.state !== "resolved") {
+			failSetup(apiKey, kind, "callback.entered", startedAt, runDetail({
+				reason: first === "finished" ? "finished-before-enter" : first === "timeout" ? "entered-timeout" : "missing-callback",
+				holdEntries,
+			}));
+		}
+
+		const supportsCancel = run.supports("cancel");
+		if (kind === "dispose") {
+			emitCapability(apiKey, {
+				case: kind, phase: "pending", observation: "run.cancel", outcome: "unsupported",
+				elapsedMs: Date.now() - startedAt,
+				detail: runDetail({ reason: "not-applicable" }),
+			});
+			emitCapability(apiKey, {
+				case: kind, phase: "pending", observation: "agent.reusable", outcome: "unknown",
+				elapsedMs: Date.now() - startedAt,
+				detail: runDetail({ reason: "not-applicable" }),
+			});
+			const disposeStarted = Date.now();
+			const disposeObs = observePromise(agent[Symbol.asyncDispose]());
+			disposed = true;
+			await observeWindow(apiKey, disposeObs, {
+				case: kind, phase: "pending", observation: "agent.dispose",
+			}, disposeStarted, (obs) => runDetail(obs.state === "rejected" ? { error: errorDetail(obs.error) } : undefined));
+		} else if (!supportsCancel) {
+			emitCapability(apiKey, {
+				case: kind, phase: "pending", observation: "run.cancel", outcome: "unsupported",
+				elapsedMs: Date.now() - startedAt,
+				detail: runDetail({ supports: false, reason: run.unsupportedReason("cancel") }),
+			});
+			emitCapability(apiKey, {
+				case: kind, phase: "pending", observation: "agent.reusable", outcome: "unsupported",
+				elapsedMs: Date.now() - startedAt,
+				detail: runDetail({ reason: "cancel-unsupported" }),
+			});
+		} else {
+			const cancelStarted = Date.now();
+			const cancelObs = observePromise(run.cancel());
+			await observeWindow(apiKey, cancelObs, {
+				case: kind, phase: "pending", observation: "run.cancel",
+			}, cancelStarted, (obs) => runDetail(obs.state === "rejected" ? { error: errorDetail(obs.error) } : { supports: true }));
+		}
+
+		await observeWindow(apiKey, waitObs, {
+			case: kind, phase: "pending", observation: "run.wait",
+		}, startedAt, (obs) => runDetail(
+			obs.state === "rejected" ? { error: errorDetail(obs.error) }
+				: obs.state === "resolved" ? { resultStatus: obs.value?.status } : undefined,
+		));
+
+		if (!signalNotified) {
+			emitCapability(apiKey, {
+				case: kind, phase: "pending", observation: "callback.notification",
+				outcome: "not-observed", elapsedMs: Date.now() - startedAt,
+				detail: { sdk: SDK_PIN, signal: "not-observed" },
+			});
+		}
+
+		await observeWindow(apiKey, callbackObs, {
+			case: kind, phase: "pending", observation: "callback.pending",
+		}, startedAt, (obs) => runDetail({ holdEntries, error: obs.state === "rejected" ? errorDetail(obs.error) : undefined }));
+
+		if (kind === "cancel" && supportsCancel) {
+			const followStarted = Date.now();
+			const followSend = observePromise(agent.send(`Reply with exactly ${REUSE_TOKEN}. Do not call any tools.`));
+			await awaitDeadline(followSend);
+			attachLate(apiKey, followSend, { case: kind, phase: "pending", observation: "agent.reusable" }, followStarted, (obs) => runDetail({
+				send: obs.state, error: obs.state === "rejected" ? errorDetail(obs.error) : undefined,
+			}));
+			const next = followSend.value;
+			if (followSend.state === "resolved" && next) {
+				followRun = next;
+				const followWait = observePromise(next.wait());
+				await awaitDeadline(followWait);
+				attachLate(apiKey, followWait, { case: kind, phase: "pending", observation: "agent.reusable" }, followStarted, (obs) => runDetail({
+					send: followSend.state, wait: obs.state,
+					tokenReturned: typeof obs.value?.result === "string" && obs.value.result.includes(REUSE_TOKEN),
+					resultStatus: obs.value?.status,
+					error: obs.state === "rejected" ? errorDetail(obs.error) : undefined,
+				}));
+				const tokenReturned = followWait.state === "resolved" && typeof followWait.value?.result === "string"
+					&& followWait.value.result.includes(REUSE_TOKEN);
+				const outcome: Outcome = followWait.state === "pending" ? "pending-at-deadline"
+					: followWait.state === "rejected" ? "rejected"
+					: tokenReturned ? "observed" : "unknown";
+				emitCapability(apiKey, {
+					case: kind, phase: "pending", observation: "agent.reusable", outcome,
+					elapsedMs: Date.now() - followStarted,
+					detail: runDetail({
+						send: followSend.state, wait: followWait.state, tokenReturned,
+						resultStatus: followWait.value?.status,
+						error: followWait.state === "rejected" ? errorDetail(followWait.error) : undefined,
+					}),
+				});
+			} else {
+				emitCapability(apiKey, {
+					case: kind, phase: "pending", observation: "agent.reusable",
+					outcome: followSend.state === "pending" ? "pending-at-deadline" : followSend.state === "rejected" ? "rejected" : "unknown",
+					elapsedMs: Date.now() - followStarted,
+					detail: runDetail({
+						send: followSend.state,
+						error: followSend.state === "rejected" ? errorDetail(followSend.error) : undefined,
+					}),
+				});
+			}
+		}
+
+		const lateStarted = Date.now();
+		releaseGate();
+		await observeWindow(apiKey, callbackObs, {
+			case: kind, phase: "late-release", observation: "callback.returned",
+		}, lateStarted, (obs) => runDetail({ holdEntries, extraCalls: Math.max(0, holdEntries - 1), error: obs.state === "rejected" ? errorDetail(obs.error) : undefined }));
+		emitCapability(apiKey, {
+			case: kind, phase: "late-release", observation: "lateCallbackAccepted", outcome: "unknown",
+			elapsedMs: Date.now() - lateStarted,
+			detail: runDetail({ reason: "no-public-accept-channel", extraCalls: Math.max(0, holdEntries - 1) }),
+		});
+
+		if (kind === "cancel" && !disposed) {
+			const disposeStarted = Date.now();
+			const disposeObs = observePromise(agent[Symbol.asyncDispose]());
+			disposed = true;
+			await observeWindow(apiKey, disposeObs, {
+				case: kind, phase: "cleanup", observation: "agent.dispose",
+			}, disposeStarted, (obs) => runDetail(obs.state === "rejected" ? { error: errorDetail(obs.error) } : undefined));
+		}
+	} finally {
+		unsubscribeStatus?.();
+		releaseGate();
+		if (followRun?.status === "running") await boundedCleanup(followRun.cancel());
+		if (run?.status === "running" && kind === "cancel") await boundedCleanup(run.cancel());
+		if (!disposed && agent) {
+			disposed = true;
+			await boundedCleanup(agent[Symbol.asyncDispose]());
+		}
+	}
+}
+
+async function runCancellationCase(kind: CaseKind, root: string): Promise<void> {
 	const apiKey = requireCursorApiKey();
+	const watchdog = setTimeout(() => {
+		console.error("cancellation-case watchdog: 180s");
+		process.exit(2);
+	}, CHILD_MS);
+	try {
+		await runIsolated(kind, root, apiKey);
+		clearTimeout(watchdog);
+		process.exit(0);
+	} catch (error) {
+		clearTimeout(watchdog);
+		if (error instanceof SetupFailed) process.exit(2);
+		const message = error instanceof Error ? error.message : String(error);
+		console.error(scrub(message, apiKey));
+		process.exit(2);
+	}
+}
+
+async function spawnCancellationChild(kind: CaseKind, apiKey: string): Promise<number> {
+	const root = await mkdtemp(join(tmpdir(), `omp-cursor-runtime-probe-${kind}-`));
+	const child = spawn(process.execPath, [SELF, "--cancellation-case", kind, root], {
+		stdio: ["ignore", "pipe", "pipe"],
+	});
+	child.stdout.setEncoding("utf8");
+	child.stderr.setEncoding("utf8");
+	child.stdout.on("data", (chunk: string) => {
+		process.stdout.write(scrub(chunk, apiKey));
+	});
+	child.stderr.on("data", (chunk: string) => {
+		process.stderr.write(scrub(chunk, apiKey));
+	});
+	let timedOut = false;
+	const timer = setTimeout(() => {
+		timedOut = true;
+		child.kill("SIGKILL");
+	}, CHILD_MS);
+	const stop = () => child.kill("SIGKILL");
+	process.once("SIGINT", stop);
+	process.once("SIGTERM", stop);
+	try {
+		return await new Promise<number>((resolve, reject) => {
+			child.once("error", reject);
+			child.once("exit", (code, signal) => {
+				if (timedOut) resolve(2);
+				else if (code !== null) resolve(code);
+				else resolve(signal ? 2 : 0);
+			});
+		});
+	} finally {
+		clearTimeout(timer);
+		process.removeListener("SIGINT", stop);
+		process.removeListener("SIGTERM", stop);
+		await rm(root, { recursive: true, force: true });
+	}
+}
+
+async function runNativeHistoryProbe(apiKey: string): Promise<boolean> {
 	const cwd = await mkdtemp(join(tmpdir(), "omp-cursor-runtime-probe-"));
 	const store = openJsonlStore(join(cwd, "store"));
 	const calls: Array<{ toolCallId?: string }> = [];
@@ -164,7 +618,30 @@ async function main(): Promise<void> {
 		}
 	}
 	for (const result of results) console.log(`${result.ok ? "PASS" : "FAIL"} ${result.name}: ${result.detail}`);
-	if (results.some((result) => !result.ok)) process.exitCode = 1;
+	if (results.some((result) => !result.ok)) {
+		process.exitCode = 1;
+		return false;
+	}
+	return true;
+}
+
+async function main(): Promise<void> {
+	const isolated = parseCancellationArgv();
+	if (isolated === "invalid") {
+		console.error(USAGE);
+		process.exit(2);
+	}
+	if (isolated) {
+		await runCancellationCase(isolated.kind, isolated.root);
+		return;
+	}
+	const apiKey = requireCursorApiKey();
+	const passed = await runNativeHistoryProbe(apiKey);
+	if (!passed) return;
+	for (const kind of ["cancel", "dispose"] as const) {
+		const code = await spawnCancellationChild(kind, apiKey);
+		if (code !== 0) process.exitCode = 2;
+	}
 }
 
 main().catch((error) => {

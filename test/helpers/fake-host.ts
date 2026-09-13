@@ -46,8 +46,17 @@ export function createFakeHost(options: FakeHostOptions = {}): OmpHostBridgeV1 &
 			if (!granted.has(name)) {
 				throw new Error(`tool ${name} is not granted`);
 			}
-			calls.push({ name, args, toolCallId });
-			return { content: [{ type: "text", text: `ok:${name}` }], isError: false };
+			const signal = host.signal;
+			if (signal.aborted) {
+				throw new Error("host aborted");
+			}
+			return await new Promise((resolve, reject) => {
+				const onAbort = () => reject(new Error("host aborted"));
+				signal.addEventListener("abort", onAbort, { once: true });
+				calls.push({ name, args, toolCallId });
+				signal.removeEventListener("abort", onAbort);
+				resolve({ content: [{ type: "text", text: `ok:${name}` }], isError: false });
+			});
 		},
 		async flushToolResults() {},
 		async commitBinding(binding) {

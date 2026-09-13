@@ -1,22 +1,29 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ModelListItem, Run, RunResult, SDKAgent, SendOptions } from "@cursor/sdk";
-import type { Api, AssistantMessageEvent, Context, Model, SimpleStreamOptions } from "@oh-my-pi/pi-ai";
+import type { Api, AssistantMessageEvent, Context, Model, SimpleStreamOptions, Tool } from "@oh-my-pi/pi-ai";
 import { CURSOR_SDK_API, CURSOR_SDK_PROVIDER_ID } from "../../src/constants.ts";
 import { HOST_BRIDGE_OPTION_KEY } from "../../src/host-option.ts";
 import { streamCursorRuntime } from "../../src/provider.ts";
 import { ensureCursorModels, __testUtils as catalogTestUtils } from "../../src/catalog.ts";
 import * as runtime from "../../src/session-runtime.ts";
-import { __testUtils as liveRunTestUtils } from "../../src/live-run.ts";
-import { __testUtils as scopeTestUtils } from "../../src/session-scope.ts";
+import { getLiveRun, __testUtils as liveRunTestUtils } from "../../src/live-run.ts";
+import { __testUtils as scopeTestUtils, ownerForContext, withCursorSessionOwner } from "../../src/session-scope.ts";
 import { getMatchingResumeHandle, registerCursorSessionResume, __testUtils as resumeTestUtils } from "../../src/session-resume.ts";
+import { registerCursorSessionLifecycle } from "../../src/session-lifecycle.ts";
 import { createFakeHost } from "../helpers/fake-host.ts";
 
 const ITEMS: ModelListItem[] = [{ id: "composer-2.5", displayName: "Composer 2.5" }];
 const MODEL = { id: "composer-2.5", provider: CURSOR_SDK_PROVIDER_ID, api: CURSOR_SDK_API, contextWindow: 200_000, maxTokens: 8_192 } as Model<Api>;
 const CONTEXT: Context = { messages: [{ role: "user", content: "request A", timestamp: 1 }] };
+const TOOL_A = { name: "a", description: "a", parameters: { type: "object", properties: { path: { type: "string" } } } } as Tool;
+const TOOL_B = { name: "b", description: "b", parameters: { type: "object", properties: { path: { type: "string" } } } } as Tool;
+const PARK_CONTEXT: Context = {
+	messages: [{ role: "user", content: "request A", timestamp: 1 }],
+	tools: [TOOL_A, TOOL_B],
+};
 
 function deferred<T>() {
 	let resolve!: (value: T) => void;
@@ -300,3 +307,401 @@ describe("provider cancellation before prepareTurn", () => {
 		}
 	});
 });
+
+function expectOneTerminal(events: AssistantMessageEvent[]) {
+	const terminal = events.filter((event) => event.type === "error" || event.type === "done");
+	expect(terminal).toHaveLength(1);
+	return terminal[0];
+}
+
+function toolResultMessage(toolCallId: string, name: string): Context["messages"][number] {
+	return {
+		role: "toolResult",
+		toolCallId,
+		toolName: name,
+		content: [{ type: "text", text: `ok:${name}` }],
+		isError: false,
+		timestamp: 3,
+	};
+}
+
+describe("provider late events after park and abort", () => {
+	let cwd: string;
+	let opens: string[];
+	let sends: string[];
+
+	beforeEach(() => {
+		cwd = mkdtempSync(join(tmpdir(), "omp-cancel-park-"));
+		runtime.__testUtils.clear();
+		liveRunTestUtils.clear();
+		scopeTestUtils.reset();
+		scopeTestUtils.set(cwd, join(cwd, "A.jsonl"), "A");
+		resumeTestUtils.reset();
+		catalogTestUtils.resetCatalog();
+		catalogTestUtils.setListModels(async () => ITEMS);
+		opens = [];
+		sends = [];
+	});
+
+	afterEach(() => {
+		runtime.__testUtils.clear();
+		liveRunTestUtils.clear();
+		resumeTestUtils.reset();
+		scopeTestUtils.reset();
+		catalogTestUtils.resetCatalog();
+		rmSync(cwd, { recursive: true, force: true });
+	});
+
+	function owned(options: SimpleStreamOptions): SimpleStreamOptions {
+		return { ...options, cwd, onPayload: scopeTestUtils.bindRequest };
+	}
+
+	type Late = "handle" | "delta" | "finished" | "result-a" | "result-b";
+
+	test.each([
+		[["handle", "delta", "finished", "result-a", "result-b"] as Late[]],
+		[["result-b", "delta", "handle", "result-a", "finished"] as Late[]],
+	])("stale A events after toolUse abort cannot rewrite B %j", async (order) => {
+		const sendA = deferred<Run>();
+		const waitA = deferred<RunResult>();
+		let onDelta: SendOptions["onDelta"];
+		const parks: Promise<unknown>[] = [];
+		runtime.__testUtils.setOpenAgent(async () => {
+			const agentId = `agent-${opens.length + 1}`;
+			opens.push(agentId);
+			return {
+				agentId,
+				async [Symbol.asyncDispose]() {},
+				async send(_message: unknown, options?: SendOptions) {
+					sends.push(agentId);
+					if (agentId !== "agent-1") {
+						return {
+							supports: () => false,
+							wait: async () => ({ status: "finished", result: "B answer" }) as RunResult,
+						} as unknown as Run;
+					}
+					onDelta = options?.onDelta;
+					const tools = options?.local?.customTools ?? {};
+					parks.push(tools.a.execute({ path: "a.ts" }, { toolCallId: "call-a" }));
+					parks.push(tools.b.execute({ path: "b.ts" }, { toolCallId: "call-b" }));
+					return await sendA.promise;
+				},
+			} as unknown as SDKAgent;
+		});
+		const controller = new AbortController();
+		const aEventsP = collect(owned({ apiKey: "test-key", signal: controller.signal }), PARK_CONTEXT);
+		const aEvents = await bounded(aEventsP);
+		const aTerminal = expectOneTerminal(aEvents);
+		expect(aTerminal).toMatchObject({ type: "done", reason: "toolUse" });
+		if (aTerminal.type !== "done") throw new Error("expected toolUse");
+		const live = getLiveRun(runtime.runtimeKey());
+		expect(live?.cancelled).toBe(false);
+		expect(live?.parked.map((call) => call.toolCallId)).toEqual(["call-a", "call-b"]);
+		expect(live?.agent?.agentId).toBe("agent-1");
+		controller.abort();
+		await Promise.allSettled(parks);
+		expect(live?.cancelled).toBe(true);
+		for (const park of parks) await expect(park).rejects.toThrow(/cancelled/);
+
+		const bHost = createFakeHost({ cwd, sessionId: "A", tools: [] });
+		const bEventsP = collect(owned({
+			apiKey: "test-key",
+			[HOST_BRIDGE_OPTION_KEY]: bHost,
+		} as SimpleStreamOptions), { messages: [{ role: "user", content: "request B", timestamp: 2 }] });
+
+		for (const step of order) {
+			if (step === "handle") {
+				sendA.resolve({
+					supports: () => false,
+					wait: () => waitA.promise,
+				} as unknown as Run);
+			} else if (step === "delta") {
+				await onDelta?.({ update: { type: "text-delta", text: "stale A" } });
+			} else if (step === "finished") {
+				waitA.resolve({ status: "finished", result: "stale A" } as RunResult);
+			} else if (step === "result-a" || step === "result-b") {
+				const id = step === "result-a" ? "call-a" : "call-b";
+				await bounded(collect(owned({ apiKey: "test-key" }), {
+					messages: [
+						PARK_CONTEXT.messages[0]!,
+						aTerminal.message,
+						toolResultMessage(id, id === "call-a" ? "a" : "b"),
+					],
+					tools: PARK_CONTEXT.tools,
+				}));
+			}
+		}
+		if (!sendA.promise) sendA.resolve({ supports: () => false, wait: () => waitA.promise } as unknown as Run);
+		waitA.resolve({ status: "cancelled" } as RunResult);
+
+		const bEvents = await bounded(bEventsP);
+		const bTerminal = expectOneTerminal(bEvents);
+		expect(bTerminal).toMatchObject({ type: "done", reason: "stop" });
+		if (bTerminal.type !== "done") throw new Error("expected B stop");
+		expect(JSON.stringify(bTerminal.message.content)).not.toContain("stale A");
+		expect(bHost.bindings).toHaveLength(1);
+		expect(bHost.bindings[0]?.sdkAgentId).toBe("agent-2");
+		expect(bTerminal.message.usage.contextTokens).toBeUndefined();
+	});
+
+	test("abort before send handle and terminal then start B isolates late A events", async () => {
+		const sendA = deferred<Run>();
+		const waitA = deferred<RunResult>();
+		const entered = deferred<void>();
+		let onDelta: SendOptions["onDelta"];
+		runtime.__testUtils.setOpenAgent(async () => {
+			const agentId = `agent-${opens.length + 1}`;
+			opens.push(agentId);
+			return {
+				agentId,
+				async [Symbol.asyncDispose]() {},
+				async send(_message: unknown, options?: SendOptions) {
+					sends.push(agentId);
+					if (agentId !== "agent-1") {
+						return {
+							supports: () => false,
+							wait: async () => ({ status: "finished", result: "B answer" }) as RunResult,
+						} as unknown as Run;
+					}
+					onDelta = options?.onDelta;
+					entered.resolve();
+					return await sendA.promise;
+				},
+			} as unknown as SDKAgent;
+		});
+		const controller = new AbortController();
+		const aEventsP = collect(owned({ apiKey: "test-key", signal: controller.signal }));
+		await awaitEntered(entered.promise, aEventsP);
+		controller.abort();
+		expectAborted(await bounded(aEventsP));
+
+		const bHost = createFakeHost({ cwd, sessionId: "A", tools: [] });
+		const bEventsP = collect(owned({
+			apiKey: "test-key",
+			[HOST_BRIDGE_OPTION_KEY]: bHost,
+		} as SimpleStreamOptions), { messages: [{ role: "user", content: "request B", timestamp: 2 }] });
+		sendA.resolve({
+			supports: () => false,
+			wait: () => waitA.promise,
+		} as unknown as Run);
+		await onDelta?.({ update: { type: "text-delta", text: "stale A" } });
+		waitA.resolve({ status: "finished", result: "stale A" } as RunResult);
+		const bEvents = await bounded(bEventsP);
+		const bTerminal = expectOneTerminal(bEvents);
+		expect(bTerminal).toMatchObject({ type: "done", reason: "stop" });
+		expect(JSON.stringify(bEvents)).not.toContain("stale A");
+		expect(bHost.bindings).toHaveLength(1);
+		expect(bHost.bindings[0]?.sdkAgentId).toBe("agent-2");
+	});
+});
+
+describe("provider session events reject parked work", () => {
+	let cwd: string;
+	let opens: string[];
+	let saved: Array<string | undefined>;
+
+	beforeEach(() => {
+		cwd = mkdtempSync(join(tmpdir(), "omp-session-event-"));
+		runtime.__testUtils.clear();
+		liveRunTestUtils.clear();
+		scopeTestUtils.reset();
+		scopeTestUtils.set(cwd, join(cwd, "A.jsonl"), "A");
+		resumeTestUtils.reset();
+		catalogTestUtils.resetCatalog();
+		catalogTestUtils.setListModels(async () => ITEMS);
+		opens = [];
+		saved = [];
+		runtime.__testUtils.setOpenAgent(async (input) => {
+			saved.push(input.savedAgentId);
+			const agentId = `agent-${opens.length + 1}`;
+			opens.push(agentId);
+			return {
+				agentId,
+				async [Symbol.asyncDispose]() {},
+				async send(_message: unknown, options?: SendOptions) {
+					const tools = options?.local?.customTools ?? {};
+					if (tools.a) {
+						void tools.a.execute({ path: "a.ts" }, { toolCallId: "call-a" }).catch(() => undefined);
+						await new Promise<Run>(() => undefined);
+					}
+					return { supports: () => false, wait: async () => ({ status: "finished", result: "ok" }) as RunResult } as unknown as Run;
+				},
+			} as unknown as SDKAgent;
+		});
+	});
+
+	afterEach(() => {
+		runtime.__testUtils.clear();
+		liveRunTestUtils.clear();
+		resumeTestUtils.reset();
+		scopeTestUtils.reset();
+		catalogTestUtils.resetCatalog();
+		rmSync(cwd, { recursive: true, force: true });
+	});
+
+	function hooks() {
+		const sessionFile = join(cwd, "A.jsonl");
+		writeFileSync(sessionFile, "");
+		const handlers = new Map<string, Array<(event: unknown, ctx: unknown) => unknown>>();
+		const branch = [{ type: "message", id: "u1", parentId: null, message: { role: "user" } }];
+		const ctx = {
+			cwd,
+			sessionManager: {
+				getSessionFile: () => sessionFile,
+				getSessionId: () => "A",
+				getBranch: () => branch,
+				getEntries: () => branch,
+			},
+		};
+		const pi = {
+			appendEntry() {},
+			on(event: string, handler: (event: unknown, ctx: unknown) => unknown) {
+				const list = handlers.get(event) ?? [];
+				list.push(handler);
+				handlers.set(event, list);
+			},
+		};
+		registerCursorSessionResume(pi as never);
+		registerCursorSessionLifecycle(pi as never);
+		void handlers.get("session_start")?.[0]?.({ type: "session_start" }, ctx);
+		return { handlers, ctx, sessionFile };
+	}
+
+	test.each([
+		["session_switch", "session_before_switch"],
+		["session_branch", "session_before_branch"],
+		["session_compact", "session_compact"],
+	] as const)("%s after park rejects callbacks and next turn bootstraps", async (event, before) => {
+		const { handlers, ctx } = hooks();
+		const otherFile = join(cwd, "B.jsonl");
+		writeFileSync(otherFile, "");
+		const ctxB = {
+			cwd,
+			sessionManager: {
+				getSessionFile: () => otherFile,
+				getSessionId: () => "B",
+				getBranch: () => [{ type: "message", id: "u1", parentId: null, message: { role: "user" } }],
+				getEntries: () => [{ type: "message", id: "u1", parentId: null, message: { role: "user" } }],
+			},
+		};
+		const ownerB = ownerForContext(ctxB as never);
+		await withCursorSessionOwner(ownerB, () => runtime.prepareTurn({
+			modelLimits: { contextWindow: 200_000, maxTokens: 8_192 },
+			cwd,
+			agentInstanceId: "main",
+			apiKey: "test-key",
+			modelSelection: { id: "composer-2.5" },
+			context: { messages: [{ role: "user", content: "other", timestamp: 1 }] },
+			grantedTools: [],
+		}));
+		const otherAgent = [...runtime.__testUtils.slots.values()].find((slot) => slot.owner === ownerB)?.agent?.agentId;
+		expect(otherAgent).toBeDefined();
+
+		const aEvents = await bounded(collect({ apiKey: "test-key", cwd, onPayload: scopeTestUtils.bindRequest }, PARK_CONTEXT));
+		expect(expectOneTerminal(aEvents)).toMatchObject({ type: "done", reason: "toolUse" });
+		const live = getLiveRun(runtime.runtimeKey());
+		expect(live?.parked).toHaveLength(1);
+		const rejected = Promise.withResolvers<void>();
+		const callback = live!.parked[0]!;
+		const previous = callback.reject.bind(callback);
+		callback.reject = (error) => {
+			previous(error);
+			rejected.resolve();
+		};
+		for (const handler of handlers.get(before) ?? []) await handler({ type: before }, ctx);
+		if (event !== before) {
+			for (const handler of handlers.get(event) ?? []) {
+				await handler({ type: event, reason: "new", compactionEntry: { type: "compaction", id: "c1", parentId: "u1" } }, ctx);
+			}
+		}
+		await bounded(rejected.promise);
+		expect(getMatchingResumeHandle("main", undefined, cwd)).toBeUndefined();
+		expect([...runtime.__testUtils.slots.values()].find((slot) => slot.owner === ownerB)?.agent?.agentId).toBe(otherAgent);
+
+		const next = await bounded(collect({ apiKey: "test-key", cwd, onPayload: scopeTestUtils.bindRequest }, {
+			messages: [{ role: "user", content: "after switch", timestamp: 4 }],
+		}));
+		expectOneTerminal(next);
+		expect(saved.at(-1)).toBeUndefined();
+	});
+
+	test("session_switch while send handle is pending rejects the live run", async () => {
+		const { handlers, ctx } = hooks();
+		const entered = deferred<void>();
+		runtime.__testUtils.setOpenAgent(async () => {
+			const agentId = `agent-${opens.length + 1}`;
+			opens.push(agentId);
+			return {
+				agentId,
+				async [Symbol.asyncDispose]() {},
+				async send() {
+					entered.resolve();
+					return await new Promise<Run>(() => undefined);
+				},
+			} as unknown as SDKAgent;
+		});
+		const pending = collect({ apiKey: "test-key", cwd, onPayload: scopeTestUtils.bindRequest });
+		await awaitEntered(entered.promise, pending);
+		await handlers.get("session_before_switch")?.[0]?.({ type: "session_before_switch" }, ctx);
+		await handlers.get("session_switch")?.[0]?.({ type: "session_switch", reason: "new" }, ctx);
+		expectAborted(await bounded(pending));
+	});
+});
+
+describe("provider grant fail-closed", () => {
+	let cwd: string;
+
+	beforeEach(() => {
+		cwd = mkdtempSync(join(tmpdir(), "omp-grant-"));
+		runtime.__testUtils.clear();
+		liveRunTestUtils.clear();
+		scopeTestUtils.reset();
+		scopeTestUtils.set(cwd, join(cwd, "A.jsonl"), "A");
+		resumeTestUtils.reset();
+		catalogTestUtils.resetCatalog();
+		catalogTestUtils.setListModels(async () => ITEMS);
+	});
+
+	afterEach(() => {
+		runtime.__testUtils.clear();
+		liveRunTestUtils.clear();
+		resumeTestUtils.reset();
+		scopeTestUtils.reset();
+		catalogTestUtils.resetCatalog();
+		rmSync(cwd, { recursive: true, force: true });
+	});
+
+	test("parked continuation fails closed when webSearch grant is revoked", async () => {
+		runtime.__testUtils.setOpenAgent(async () => ({
+			agentId: "agent-1",
+			async [Symbol.asyncDispose]() {},
+			async send(_message: unknown, options?: SendOptions) {
+				const tools = options?.local?.customTools ?? {};
+				void tools.a.execute({ path: "a.ts" }, { toolCallId: "call-a" }).catch(() => undefined);
+				return {
+					supports: () => false,
+					wait: () => new Promise<RunResult>(() => undefined),
+				} as unknown as Run;
+			},
+		} as unknown as SDKAgent));
+		const webSearch = { name: "web_search", description: "search", parameters: { type: "object", properties: { query: { type: "string" } } } } as Tool;
+		const parkContext: Context = {
+			messages: [{ role: "user", content: "request A", timestamp: 1 }],
+			tools: [TOOL_A, webSearch],
+		};
+		const parked = await bounded(collect({ apiKey: "test-key", cwd, onPayload: scopeTestUtils.bindRequest }, parkContext));
+		const terminal = expectOneTerminal(parked);
+		expect(terminal).toMatchObject({ type: "done", reason: "toolUse" });
+		if (terminal.type !== "done") throw new Error("expected toolUse");
+		const next = await bounded(collect({ apiKey: "test-key", cwd, onPayload: scopeTestUtils.bindRequest }, {
+			messages: [parkContext.messages[0]!, terminal.message, toolResultMessage("call-a", "a")],
+			tools: [TOOL_A],
+		}));
+		const failed = expectOneTerminal(next);
+		expect(failed.type).toBe("error");
+		if (failed.type !== "error") throw new Error("expected grant error");
+		expect(failed.error.errorMessage).toMatch(/webSearch grant changed/);
+	});
+});
+
+

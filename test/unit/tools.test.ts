@@ -37,6 +37,37 @@ describe("custom tools", () => {
 		).rejects.toBeInstanceOf(ToolBridgeError);
 	});
 
+	test("joins inflight same payload and rejects inflight conflict", async () => {
+		const dedupe = createToolCallDedupe("run-1");
+		const gate = Promise.withResolvers<{ content: Array<{ type: "text"; text: string }>; isError: boolean }>();
+		let runs = 0;
+		const first = dedupe.execute("call-1", "read", { path: "a.ts" }, async () => {
+			runs += 1;
+			return gate.promise;
+		});
+		const same = dedupe.execute("call-1", "read", { path: "a.ts" }, async () => {
+			runs += 1;
+			throw new Error("should not run twice");
+		});
+		await expect(
+			dedupe.execute("call-1", "read", { path: "b.ts" }, async () => {
+				runs += 1;
+				throw new Error("should not run args conflict");
+			}),
+		).rejects.toBeInstanceOf(ToolBridgeError);
+		await expect(
+			dedupe.execute("call-1", "grep", { pattern: "x" }, async () => {
+				runs += 1;
+				throw new Error("should not run name conflict");
+			}),
+		).rejects.toBeInstanceOf(ToolBridgeError);
+		const result = { content: [{ type: "text", text: "ok" }], isError: false };
+		gate.resolve(result);
+		expect(await first).toEqual(result);
+		expect(await same).toEqual(result);
+		expect(runs).toBe(1);
+	});
+
 	test("does not grant write when the snapshot has only read", async () => {
 		const host = createFakeHost({ tools: ["read"] });
 		const tools = buildCustomTools(host.snapshot().grantedTools, (name, args, toolCallId) => host.executeTool(name, args, toolCallId), createToolCallDedupe("run-1"));

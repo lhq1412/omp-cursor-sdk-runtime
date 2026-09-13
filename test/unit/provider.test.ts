@@ -334,6 +334,248 @@ describe("streamCursorRuntime model selection", () => {
 		expect(last.error.cursorSdk.contextOccupancy).toEqual({ status: "unavailable" });
 	});
 
+	test("abort during flushToolResults does not publish occupancy", async () => {
+		const host = createFakeHost({ tools: [] });
+		const started = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		host.flushToolResults = async () => { started.resolve(); await release.promise; };
+		let root = "baseline";
+		runtimeTestUtils.setOpenAgent(async (input) => {
+			input.store.agents.get = async () => ({
+				agentId: "agent-occupancy", cwd: input.cwd, status: "idle" as const, createdAt: 1, updatedAt: 2,
+				latestCheckpoint: { schemaVersion: 1 as const, rootBlobId: root },
+			});
+			input.store.checkpoints.get = async () => new Uint8Array([42, 5, 8, 150, 1, 16, 100]);
+			return {
+				agentId: "agent-occupancy", close() {}, async [Symbol.asyncDispose]() {},
+				async send() {
+					root = "fresh";
+					return { id: "run-occupancy", agentId: "agent-occupancy", supports: () => false,
+						wait: async () => ({ id: "run-occupancy", status: "finished", result: "answer" }) } as Run;
+				},
+			} as SDKAgent;
+		});
+		const controller = new AbortController();
+		const pending = drain(cursorModel("composer-2.5", 200_000), userContext("hi"), {
+			apiKey: "test-key",
+			signal: controller.signal,
+			[HOST_BRIDGE_OPTION_KEY]: host,
+		} as SimpleStreamOptions);
+		await started.promise;
+		controller.abort();
+		release.resolve();
+		const last = (await pending).at(-1);
+		expect(last?.type).toBe("error");
+		if (last?.type !== "error") throw new Error("Expected aborted turn");
+		expect(last.error.usage.contextTokens).toBeUndefined();
+		expect(last.error.cursorSdk.contextOccupancy).toEqual({ status: "unavailable" });
+		expect(host.bindings).toEqual([]);
+	});
+
+	test("abort at occupancy store read does not publish occupancy", async () => {
+		const started = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		let root = "baseline";
+		let afterSend = false;
+		runtimeTestUtils.setOpenAgent(async (input) => {
+			input.store.agents.get = async () => {
+				if (afterSend) {
+					started.resolve();
+					await release.promise;
+				}
+				return {
+					agentId: "agent-occupancy", cwd: input.cwd, status: "idle" as const, createdAt: 1, updatedAt: 2,
+					latestCheckpoint: { schemaVersion: 1 as const, rootBlobId: root },
+				};
+			};
+			input.store.checkpoints.get = async () => new Uint8Array([42, 5, 8, 150, 1, 16, 100]);
+			return {
+				agentId: "agent-occupancy", close() {}, async [Symbol.asyncDispose]() {},
+				async send() {
+					root = "fresh";
+					afterSend = true;
+					return { id: "run-occupancy", agentId: "agent-occupancy", supports: () => false,
+						wait: async () => ({ id: "run-occupancy", status: "finished", result: "answer" }) } as Run;
+				},
+			} as SDKAgent;
+		});
+		const controller = new AbortController();
+		const pending = drain(cursorModel("composer-2.5", 200_000), userContext("hi"), {
+			apiKey: "test-key",
+			signal: controller.signal,
+		});
+		await started.promise;
+		controller.abort();
+		release.resolve();
+		const last = (await pending).at(-1);
+		expect(last?.type).toBe("error");
+		if (last?.type !== "error") throw new Error("Expected aborted turn");
+		expect(last.error.usage.contextTokens).toBeUndefined();
+		expect(last.error.cursorSdk.contextOccupancy).toEqual({ status: "unavailable" });
+	});
+
+	test("same-session supersede during commitBinding keeps B's binding and occupancy", async () => {
+		const hostA = createFakeHost({ tools: [] });
+		const hostB = createFakeHost({ tools: [] });
+		const started = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		hostA.commitBinding = async () => { started.resolve(); await release.promise; };
+		let n = 0;
+		runtimeTestUtils.setOpenAgent(async (input) => {
+			const agentId = `agent-${++n}`;
+			input.store.agents.get = async () => ({
+				agentId, cwd: input.cwd, status: "idle" as const, createdAt: 1, updatedAt: 2,
+				latestCheckpoint: { schemaVersion: 1 as const, rootBlobId: agentId === "agent-1" ? "stale" : "fresh" },
+			});
+			input.store.checkpoints.get = async () => new Uint8Array([42, 5, 8, 150, 1, 16, 100]);
+			return {
+				agentId, close() {}, async [Symbol.asyncDispose]() {},
+				async send() {
+					return { id: `run-${agentId}`, agentId, supports: () => false,
+						wait: async () => ({ id: `run-${agentId}`, status: "finished", result: agentId === "agent-1" ? "A" : "B" }) } as Run;
+				},
+			} as SDKAgent;
+		});
+		const a = drain(cursorModel("composer-2.5", 200_000), userContext("A"), {
+			apiKey: "test-key",
+			[HOST_BRIDGE_OPTION_KEY]: hostA,
+		} as SimpleStreamOptions);
+		await started.promise;
+		const b = await drain(cursorModel("composer-2.5", 200_000), userContext("B"), {
+			apiKey: "test-key",
+			[HOST_BRIDGE_OPTION_KEY]: hostB,
+		} as SimpleStreamOptions);
+		release.resolve();
+		const aLast = (await a).at(-1);
+		expect(aLast?.type).toBe("error");
+		if (aLast?.type !== "error") throw new Error("Expected superseded A");
+		expect(aLast.error.usage.contextTokens).toBeUndefined();
+		expect(hostA.bindings).toEqual([]);
+		const bLast = b.at(-1);
+		expect(bLast).toMatchObject({ type: "done", reason: "stop" });
+		expect(hostB.bindings).toHaveLength(1);
+		expect(hostB.bindings[0]?.sdkAgentId).toBe("agent-2");
+	});
+
+	test("contextTokens stay unobservable until commitBinding resolves while current", async () => {
+		const host = createFakeHost({ tools: [] });
+		const started = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		host.commitBinding = async (binding) => {
+			started.resolve();
+			await release.promise;
+			host.bindings.push(binding);
+		};
+		let root = "baseline";
+		runtimeTestUtils.setOpenAgent(async (input) => {
+			input.store.agents.get = async () => ({
+				agentId: "agent-occupancy", cwd: input.cwd, status: "idle" as const, createdAt: 1, updatedAt: 2,
+				latestCheckpoint: { schemaVersion: 1 as const, rootBlobId: root },
+			});
+			input.store.checkpoints.get = async () => new Uint8Array([42, 5, 8, 150, 1, 16, 100]);
+			return {
+				agentId: "agent-occupancy", close() {}, async [Symbol.asyncDispose]() {},
+				async send() {
+					root = "fresh";
+					return {
+						id: "run-occupancy", agentId: "agent-occupancy", supports: () => false,
+						wait: async () => ({
+							id: "run-occupancy", status: "finished", result: "answer",
+							usage: { inputTokens: 20, outputTokens: 3, cacheReadTokens: 0, cacheWriteTokens: 0, totalTokens: 23 },
+						}),
+					} as Run;
+				},
+			} as SDKAgent;
+		});
+		const events: Awaited<ReturnType<typeof drain>> = [];
+		const pending = (async () => {
+			for await (const event of streamCursorRuntime(cursorModel("composer-2.5", 200_000), userContext("hi"), {
+				apiKey: "test-key",
+				onPayload: scopeTestUtils.bindRequest,
+				[HOST_BRIDGE_OPTION_KEY]: host,
+			} as SimpleStreamOptions)) {
+				events.push(event);
+			}
+		})();
+		await started.promise;
+		expect(events.some((event) => event.type === "done" || event.type === "error")).toBe(false);
+		expect(events.some((event) => "message" in event && event.message.usage?.contextTokens != null)).toBe(false);
+		release.resolve();
+		await pending;
+		const last = events.at(-1);
+		expect(last).toMatchObject({
+			type: "done",
+			message: {
+				usage: { contextTokens: 150, totalTokens: 23, orchestration: { input: 20, output: 3 } },
+				cursorSdk: { contextOccupancy: { status: "actual", source: "checkpoint" } },
+			},
+		});
+		expect(host.bindings).toHaveLength(1);
+	});
+
+	test("explicit host executeTool rejects on host.signal abort without commitBinding", async () => {
+		const host = createFakeHost({ tools: ["read"] });
+		const controller = new AbortController();
+		host.signal = controller.signal;
+		const entered = Promise.withResolvers<void>();
+		const toolGate = Promise.withResolvers<{ content: { type: "text"; text: string }[]; isError: boolean }>();
+		host.executeTool = async () => {
+			const onAbort = () => toolGate.reject(new Error("host aborted"));
+			host.signal.addEventListener("abort", onAbort, { once: true });
+			if (host.signal.aborted) onAbort();
+			return toolGate.promise;
+		};
+		runtimeTestUtils.setOpenAgent(async () => ({
+			agentId: "agent-host",
+			close() {},
+			async [Symbol.asyncDispose]() {},
+			async send(_message, options) {
+				const tool = options?.local?.customTools?.read;
+				if (!tool) throw new Error("read tool missing");
+				void tool.execute({ path: "a.ts" }, { toolCallId: "call-host" }).catch(() => undefined);
+				entered.resolve();
+				return {
+					supports: () => false,
+					wait: () => new Promise<RunResult>(() => undefined),
+				} as unknown as Run;
+			},
+		} as SDKAgent));
+		const pending = drain(cursorModel("composer-2.5", 200_000), userContext("hi", [readTool()]), {
+			apiKey: "test-key",
+			signal: controller.signal,
+			[HOST_BRIDGE_OPTION_KEY]: host,
+		} as SimpleStreamOptions);
+		await entered.promise;
+		void toolGate.promise.catch(() => undefined);
+		controller.abort();
+		const last = (await pending).at(-1);
+		expect(last?.type).toBe("error");
+		if (last?.type !== "error") throw new Error("Expected aborted turn");
+		expect(last.reason).toBe("aborted");
+		expect(host.bindings).toEqual([]);
+		await expect(toolGate.promise).rejects.toThrow(/host aborted/);
+	});
+
+	test("ungranted tools are not advertised and host executeTool rejects them", async () => {
+		const host = createFakeHost({ tools: ["read"] });
+		let names: string[] = [];
+		runtimeTestUtils.setOpenAgent(async () => ({
+			agentId: "agent-1",
+			close() {},
+			async [Symbol.asyncDispose]() {},
+			async send(_message, options) {
+				names = Object.keys(options?.local?.customTools ?? {});
+				return finishedRun();
+			},
+		} as SDKAgent));
+		await drain(cursorModel("composer-2.5", 200_000), userContext("hi", [readTool()]), {
+			apiKey: "test-key",
+			[HOST_BRIDGE_OPTION_KEY]: host,
+		} as SimpleStreamOptions);
+		expect(names).toEqual(["read"]);
+		await expect(host.executeTool("write", { path: "x.ts" }, "call-x")).rejects.toThrow(/not granted/);
+	});
+
 	test("passes one built ModelSelection to Agent.create and send", async () => {
 		const created: ModelSelection[] = [];
 		const sent: ModelSelection[] = [];

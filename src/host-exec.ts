@@ -10,9 +10,10 @@ export interface SharedToolExec {
 }
 
 /**
- * Grant-only, once-only tool execution. The `already executed` marker is
- * `bridgeRunId + toolCallId`; a second call with the same id returns the first
- * result and never reaches the host/park callback again.
+ * Grant-only, once-only tool execution. The execution key is
+ * `bridgeRunId + toolCallId`; that id maps to one immutable name, arguments, and result.
+ * Same payload returns the first result without reaching the host/park callback again.
+ * A conflicting name or arguments throws ToolBridgeError, including while the first call is inflight.
  */
 export function createSharedToolExec(
 	grantedTools: readonly GrantedTool[],
