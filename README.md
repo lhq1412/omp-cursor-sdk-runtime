@@ -10,15 +10,15 @@ This is a separate adapter from [lhq1412/omp-cursor-sdk](https://github.com/lhq1
 
 Pinned baselines:
 
-- OMP `18.1.14` (`daf07999`)
+- OMP `18.1.18` (`00085d4`)
 - `@cursor/sdk` `1.0.31`
-- Direct history-codec dependency: `@oh-my-pi/pi-catalog` `18.1.14`
+- Direct history-codec dependency: `@oh-my-pi/pi-catalog` `18.1.18`
 
 Native checkpoint conversion is coupled to these fixed versions, not a promise of compatibility with arbitrary OMP or SDK releases.
 
 ## Requirements
 
-- OMP 18.1.14
+- OMP 18.1.18
 - Bun 1.3.14 or newer (OMP and the extension runtime)
 - Node.js 22.19 or newer (maintenance scripts)
 - a Cursor SDK API key from Cursor Dashboard → API Keys
@@ -40,7 +40,7 @@ npm install
 omp plugin link .
 ```
 
-OMP 18.1.14 only loads plugins declared in `~/.omp/plugins/package.json`. After linking, add a `file:` dependency if `omp models cursor-sdk` is empty:
+OMP 18.1.18 only loads plugins declared in `~/.omp/plugins/package.json`. After linking, add a `file:` dependency if `omp models cursor-sdk` is empty:
 
 ```bash
 cd ~/.omp/plugins
@@ -90,9 +90,9 @@ omp models refresh
 
 Models are **canonical IDs only** (`cursor-sdk/composer-2.5`). Fast is a per-send flag, not a catalog alias: there are no `@fast` / slow suffix rows.
 
-The native model browser's input/output prices are **base-mode reference USD per million tokens, not Cursor SDK charges**. The adapter first checks an exact, nonzero OMP bundled Cursor price, then exact IDs in the bundled OpenAI, Anthropic, Google and xAI catalogs. A small explicit map covers Cursor's alternate Claude names; display names, SDK aliases, arbitrary suffixes and Gemini preview variants are not guessed. The selected model's detail name identifies the source, for example `[base ref: openai/gpt-5.5]`. Prices follow the pinned OMP catalog, not a live price feed; SDK model IDs, capabilities and selection parameters remain authoritative.
+The native model browser's input/output prices are **base-mode reference USD per million tokens, not Cursor SDK charges**. The adapter first checks an exact, nonzero OMP bundled Cursor price, then exact IDs in the bundled OpenAI, Anthropic, Google and xAI catalogs. A small explicit map covers Cursor's alternate Claude names; display names, SDK aliases, arbitrary suffixes and Gemini preview variants are not guessed. Prices follow the pinned OMP catalog, not a live price feed; SDK model IDs, capabilities and selection parameters remain authoritative.
 
-All bundled Cursor prices in OMP 18.1.14 are zero, so matched first-party models supply the current comparisons. Models without a reliable price, including Composer, show `[price unknown; not free]` in their detail name. **OMP 18.1.14 still renders structural zero prices as `free` in its native price column; this host label does not mean these models are free.** The plain `omp models` table has no price columns; use the interactive model browser for comparisons.
+All bundled Cursor prices in OMP 18.1.18 are zero, so matched first-party models supply the current comparisons. Models without a reliable price, including Composer, retain structural zero prices because the provider config requires numeric rates. **OMP 18.1.18 renders those zero prices as `free` in its native price column; this does not mean these models are free.** The plain `omp models` table has no price columns; use the interactive model browser for comparisons.
 
 Reference rates do not account for Cursor fast mode, long-context premiums, discounts or plan coverage. Extended-context rows retain the SDK threshold but repeat the base reference rates; they do not import the vendor's pricing tiers. These catalog rates are not used to calculate assistant-message costs: message `usage.cost` remains unavailable, and token/context accounting is unchanged. Restart OMP after updating the extension, then run `/cursor-refresh-models` to refresh the model list.
 
@@ -162,7 +162,7 @@ Sanitizer (`serializeSystemPrompt` joins `string | string[]` with newlines):
 
 ## Session behavior
 
-Local agents are bound to the current OMP JSONL session leaf, cwd, and credential identity. Same-session incremental turns reuse the agent and send only the current user/developer input, or an explicit continuation when no new input exists. Parked tool callbacks retain precedence. Fresh agents import budgeted prior history as native checkpoint blobs, then send the separate sanitized system prefix, the tool-context cue for nonempty history, and current input/continuation. Empty history uses normal `Agent.create`. Resume records persist the agent's execution cwd; a matching committed handle can be resumed after process restart. Branch navigation, compaction, failed turns, cwd/key changes, and the existing 20-completed-incremental-send threshold start a fresh bootstrap.
+Local agents are bound to the current OMP JSONL session leaf, cwd, and credential identity. Same-session incremental turns reuse the agent and send only the current user/developer input, or an explicit continuation when no new input exists. Parked tool callbacks retain precedence. Parked continuation fails closed if cwd, credentials, or the webSearch grant change; a changed ordinary custom-tool grant set does not. Fresh agents import budgeted prior history as native checkpoint blobs, then send the separate sanitized system prefix, the tool-context cue for nonempty history, and current input/continuation. Empty history uses normal `Agent.create`. Resume records persist the agent's execution cwd; a matching committed handle can be resumed after process restart. Branch navigation, compaction, failed turns, cwd/key changes, and the existing 20-completed-incremental-send threshold start a fresh bootstrap.
 
 Session ownership comes from OMP's `onPayload` → `before_provider_request` hook and its actual session manager, not the most recently registered provider or a routing `sessionId` alone. The hook receives the provider's `Context`; a returned replacement `Context` is used for the request. Parent and child sessions retain separate runtime, resume writers, fast preferences, and tool catalogs. Navigation and shutdown invalidate only the owning session, including requests still awaiting a payload hook or model discovery.
 
@@ -174,7 +174,7 @@ The imported format follows the pinned codec's model-family limits, not lossless
 
 Cancellation while model discovery is pending ends that request before any runtime binding is prepared; shared discovery may finish for other requests, but its late result cannot resume the cancelled request or touch a newly selected session. Once prepared, cancellation belongs to the in-flight live run (including park-and-yield). SDK `process.reallyExit(0|1)` during teardown is swallowed so `/quit` does not throw `ExtensionExitError`.
 
-Bootstrap budgeting reserves the model's output limit, framing overhead, and 4096 tokens per image in native user/developer history or send attachments (including required recovery tool-result images), then removes oldest complete history interaction units without splitting tool calls/results. Necessary system instructions and the current input are never silently truncated: oversized **text** fails before opening/resuming an agent. Recovery also retains its initiating request and completed interaction as one unit; image reserves can make that required unit exceed the budget. Image payload size is not treated as model tokens and does not by itself produce a context-overflow error. The text estimator deliberately counts UTF-8 bytes conservatively rather than claiming exact tokenization. Unknown model limits fail explicitly. Backend overflow is reported separately from quota/rate limits; no automatic retries or tool reexecution are added.
+Bootstrap budgeting reserves `min(advertised maxTokens, 16,384)`, framing overhead, and 4096 tokens per image in native user/developer history or send attachments (including required recovery tool-result images), then removes oldest complete history interaction units without splitting tool calls/results. Necessary system instructions and the current input are never silently truncated: oversized **text** fails before opening/resuming an agent. Recovery also retains its initiating request and completed interaction as one unit; image reserves can make that required unit exceed the budget. Image payload size is not treated as model tokens. The text estimator sizes native-history JSON the codec would emit: user/assistant/tool framing, SHA-256 `toolCallId`s, result ids, and K3 thinking only when `api=cursor-agent`, `provider=cursor`, and the exact target K3 model match. It uses OMP's approximate `(UTF-8 bytes + 3) >> 2` heuristic and ignores serialized OMP host metadata. A required recovery unit that still cannot fit fails as a dedicated recovery-budget error so OMP does not start ContextOverflow compaction. Unknown model limits fail explicitly. Backend overflow is reported separately from quota/rate limits and from local recovery-budget failures; no automatic retries or tool reexecution are added.
 
 ## Results, usage, and diagnostics
 
@@ -182,7 +182,7 @@ Final SDK results fill missing answer text against the current answer step. A ma
 
 Assistant messages carry `cursorSdk` availability metadata: `tokenUsage` is `actual` or `unavailable`; `contextOccupancy` is `actual` with `source: "checkpoint"` after a successful settled turn whose public store root is new, idle, and stable, otherwise `unavailable`. Run billing and `turn-ended` totals are not occupancy. When occupancy is actual, `usage.contextTokens` is the checkpoint `usedTokens` value so OMP context accounting can use it; parked, cancelled, and unreadable checkpoints leave it unset. Message `cost` stays `unavailable`: OMP requires numeric cost fields, so their zero placeholders **do not mean free usage**. Official billed totals and dollar amounts come from `/cursor-usage` or OMP `/usage` (`agent.getUsage()`): top-level agent snapshots, not summed listed turns, and not written into `usage.cost`. Local billed IDs are per-turn identities, not SDK Run IDs, and costs can settle later. Some accounts return `feature_unavailable` for `getUsage()`. See the [public SDK usage contracts](https://cursor.com/docs/sdk/typescript#token-usage).
 
-SDK Run billing maps to `usage.orchestration`: input includes cache writes, with output and cache reads in their own orchestration fields. The prompt buckets (`usage.input`, `output`, `cacheRead`, and `cacheWrite`) stay zero, and `usage.totalTokens` is the orchestration sum. OMP 18.1.14 subtracts orchestration from `calculateContextTokens` and checks only prompt input/cache buckets for usage-backed overflow, so cumulative Run totals no longer masquerade as conversation context. When a settled checkpoint reports occupancy, `calculateContextTokens` prefers `usage.contextTokens`.
+SDK Run billing maps to `usage.orchestration`: input includes cache writes, with output and cache reads in their own orchestration fields. The prompt buckets (`usage.input`, `output`, `cacheRead`, and `cacheWrite`) stay zero, and `usage.totalTokens` is the orchestration sum. OMP 18.1.18 subtracts orchestration from `calculateContextTokens` and checks only prompt input/cache buckets for usage-backed overflow, so cumulative Run totals no longer masquerade as conversation context. When a settled checkpoint reports occupancy, `calculateContextTokens` prefers `usage.contextTokens`.
 
 Provider errors and diagnostic notifications redact credentials, authorization/cookie headers and sensitive query values before display/persistence, while retaining useful error categories and request IDs. Normal assistant/tool content is not globally rewritten.
 
@@ -204,7 +204,7 @@ export CURSOR_API_KEY=...
 npm run probe:sdk
 ```
 
-The probe records that native `AgentOptions.systemPrompt` is omitted, imports a synthetic history token through the production importer, prefixes only its first imported-history send with the provider's shared `SDK_TOOL_CONTEXT`, checks one new custom-tool callback and its `toolCallId`, then verifies that `Agent.resume` retains the token without another tool execution.
+The probe records that native `AgentOptions.systemPrompt` is omitted, imports a synthetic history token through the production importer, prefixes only its first imported-history send with the provider's shared `SDK_TOOL_CONTEXT`, checks one new custom-tool callback and its `toolCallId`, then verifies that `Agent.resume` retains the token without another tool execution. If those PASS, it spawns isolated `--cancellation-case cancel|dispose` children that emit `CAPABILITY` JSON; a child non-zero exit becomes probe exit 2 and does not rewrite PASS lines.
 
 Native-history smoke verification exercised the real provider and official SDK with synthetic OMP lifecycle hooks and session JSONL in isolated scratch, not the full OMP TUI or every model. Eight scenarios passed, covering native history continuation, one actual new-tool side effect, parked-result continuation on the same Agent, persisted resume retaining system/history, raw system-change reimport, cancelled parked Run followed by an isolated branch, compaction reimport, and completed screenshot-result recovery identifying blue/magenta/orange. This separate smoke is not part of the probe command above.
 

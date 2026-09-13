@@ -2,12 +2,15 @@ import { createHash } from "node:crypto";
 import type { SDKImage, SDKUserMessage } from "@cursor/sdk";
 import type { Context } from "@oh-my-pi/pi-ai";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
+import { classifyModel } from "@oh-my-pi/pi-catalog/compat/taxonomy";
 import {
+	BOOTSTRAP_OUTPUT_RESERVE_TOKENS,
 	CURSOR_SDK_API,
 	CURSOR_SDK_PROVIDER_ID,
 	MAX_COMPLETED_INCREMENTAL_SENDS_BEFORE_REBOOTSTRAP,
 	SDK_TOOL_CONTEXT,
 } from "./constants.js";
+import { CursorRecoveryBudgetError } from "./errors.js";
 
 export type SendMode = "bootstrap" | "incremental";
 
@@ -35,6 +38,7 @@ export interface PreparedSendInput {
 }
 
 const NATIVE_HISTORY_FORMAT = "native-checkpoint-v1";
+const IMAGE_TOKEN_RESERVE = 4096;
 
 export function nativeToolCallId(id: string): string {
 	return createHash("sha256").update("omp-native-history:tool-call\0").update(id).digest("hex");
@@ -107,7 +111,11 @@ export function computeContextFingerprint(context: Context): string {
 	const systemHash = hashValue(serializeSystemPrompt(context.systemPrompt));
 	const messageHashes = context.messages.map((message, index) => {
 		const role = "role" in message && typeof message.role === "string" ? message.role : "unknown";
-		return hashValue(`${index}:${role}:${JSON.stringify(message)}`);
+		// OMP stamps these after provider commit; neither changes model-visible history.
+		const stable = role === "assistant"
+			? { ...message, completedAt: undefined, contextSnapshot: undefined }
+			: message;
+		return hashValue(`${index}:${role}:${JSON.stringify(stable)}`);
 	});
 	return JSON.stringify({ format: NATIVE_HISTORY_FORMAT, systemHash, messageHashes });
 }
@@ -130,6 +138,9 @@ export function planSend(sendState: SendState, context: Context): SendPlan {
 	}
 	for (let index = 0; index < previous.messageHashes.length; index += 1) {
 		if (current.messageHashes[index] !== previous.messageHashes[index]) {
+			// Older v1 fingerprints include host metadata. Accept only an exact raw-message match.
+			const message = context.messages[index]!;
+			if (previous.messageHashes[index] === hashValue(`${index}:${message.role}:${JSON.stringify(message)}`)) continue;
 			return { mode: "bootstrap", resetAgent: true, reason: "context_divergence" };
 		}
 	}
@@ -183,6 +194,17 @@ function textFromContent(content: unknown): string {
 		.join("\n");
 }
 
+function nativeToolResultText(content: unknown): string {
+	if (typeof content === "string") return content;
+	if (!Array.isArray(content)) return "";
+	return content.map((item) => {
+		if (!isRecord(item)) return "";
+		if (item.type === "text" && typeof item.text === "string") return item.text;
+		if (item.type === "image" && typeof item.mimeType === "string") return `[${item.mimeType} image]`;
+		return "";
+	}).join("\n");
+}
+
 function imagesFromContent(content: unknown): SDKImage[] {
 	if (!Array.isArray(content)) return [];
 	const images: SDKImage[] = [];
@@ -216,25 +238,84 @@ function historyUnits(messages: Context["messages"], recoveryStart?: number): Co
 	return units;
 }
 
-function estimatedHistoryTokens(messages: Context["messages"]): number {
-	let tokens = messages.length + 1;
+function canReplayNativeThinking(message: { api?: unknown; provider?: unknown; model?: unknown }, targetModelId: string | undefined): boolean {
+	// Mirror canReplayCursorThinking in the pinned codec. Do not relabel cursor-sdk identity.
+	return (
+		targetModelId !== undefined &&
+		classifyModel("cursor", targetModelId).family === "k3" &&
+		message.api === "cursor-agent" &&
+		message.provider === "cursor" &&
+		message.model === targetModelId
+	);
+}
+
+function estimatedHistoryTokens(messages: Context["messages"], targetModelId?: string): number {
+	const fragments: string[] = [];
+	let tokens = 0;
 	for (const message of messages) {
-		const text = JSON.stringify(message, (_key, value: unknown) => {
-			if (isRecord(value) && value.type === "image") {
-				// Native tool results contain placeholders; recovery attaches their bytes separately.
-				if (message.role !== "toolResult") tokens += 4096;
-				return { type: "image", mimeType: value.mimeType };
+		if (message.role === "user" || message.role === "developer") {
+			const text = textFromContent(message.content).trim();
+			const images = imagesFromContent(message.content);
+			tokens += images.length * IMAGE_TOKEN_RESERVE;
+			const content: unknown[] = [];
+			if (text) content.push({ type: "text", text });
+			for (const image of images) content.push({ type: "image", mediaType: "mimeType" in image ? image.mimeType : "image/png" });
+			if (content.length > 0) fragments.push(JSON.stringify({ role: "user", content }));
+			continue;
+		}
+		if (message.role === "assistant") {
+			if (!Array.isArray(message.content)) continue;
+			const content: unknown[] = [];
+			const replayThinking = canReplayNativeThinking(message, targetModelId);
+			for (const block of message.content) {
+				if (!isRecord(block)) continue;
+				if (block.type === "text" && typeof block.text === "string" && block.text) content.push({ type: "text", text: block.text });
+				else if (block.type === "thinking" && replayThinking && typeof block.thinking === "string" && block.thinking) {
+					content.push({
+						type: "reasoning",
+						text: block.thinking,
+						providerOptions: { cursor: { modelName: message.model } },
+						...(typeof block.thinkingSignature === "string" ? { signature: block.thinkingSignature } : {}),
+					});
+				} else if (block.type === "toolCall" && typeof block.id === "string") {
+					content.push({
+						type: "tool-call",
+						toolCallId: nativeToolCallId(block.id),
+						toolName: typeof block.name === "string" ? block.name : "",
+						args: block.arguments ?? {},
+					});
+				}
 			}
-			return value;
-		});
-		tokens += estimatedTextTokens(text);
+			if (content.length > 0) fragments.push(JSON.stringify({ role: "assistant", content }));
+			continue;
+		}
+		if (message.role === "toolResult") {
+			const toolCallId = nativeToolCallId(message.toolCallId);
+			fragments.push(JSON.stringify({
+				role: "tool",
+				id: toolCallId,
+				content: [{
+					type: "tool-result",
+					toolName: message.toolName,
+					toolCallId,
+					result: nativeToolResultText(message.content),
+					...(message.isError ? { isError: true } : {}),
+				}],
+			}));
+			continue;
+		}
+		const extra = message as { role?: string; summary?: unknown };
+		if ((extra.role === "compactionSummary" || extra.role === "branchSummary") && typeof extra.summary === "string" && extra.summary) {
+			fragments.push(extra.summary);
+		}
 	}
+	for (const fragment of fragments) tokens += estimatedTextTokens(fragment);
 	return tokens;
 }
 
 function estimatedTextTokens(text: string): number {
-	// ponytail: conservative UTF-8 byte estimate, not a tokenizer; use SDK token counting when public.
-	return Buffer.byteLength(text, "utf8");
+	// ponytail: OMP Tokenizer approximate; use a model tokenizer when this adapter owns one.
+	return (Buffer.byteLength(text, "utf8") + 3) >> 2;
 }
 
 function throwContextOverflow(): never {
@@ -246,9 +327,9 @@ function inputTextBudget(current: SDKUserMessage, limits: ModelInputLimits): num
 		throw new Error("Cursor SDK model context/output limits are unknown or invalid");
 	}
 	// ponytail: 4096/image reserve; SDK image tokens are unpublished.
-	// Encoded payload bytes are not tokens.
-	const imageReserve = (current.images?.length ?? 0) * 4096;
-	return limits.contextWindow - limits.maxTokens - imageReserve - 1024;
+	// Encoded payload bytes are not tokens. Advertised maxTokens is not the bootstrap reserve.
+	const imageReserve = (current.images?.length ?? 0) * IMAGE_TOKEN_RESERVE;
+	return limits.contextWindow - Math.min(limits.maxTokens, BOOTSTRAP_OUTPUT_RESERVE_TOKENS) - imageReserve - 1024;
 }
 
 /**
@@ -309,7 +390,7 @@ function validateToolResultRecovery(context: Context): number | undefined {
 }
 
 /** Bootstrap instructions stay in the send text; conversation history is imported natively. */
-export function prepareSendInput(plan: SendPlan, context: Context, limits: ModelInputLimits): PreparedSendInput {
+export function prepareSendInput(plan: SendPlan, context: Context, limits: ModelInputLimits, targetModelId?: string): PreparedSendInput {
 	const current = activeUserInput(context, plan.continueOnly);
 	if (plan.mode === "incremental") {
 		if (estimatedTextTokens(current.text) > inputTextBudget(current, limits)) throwContextOverflow();
@@ -336,19 +417,22 @@ export function prepareSendInput(plan: SendPlan, context: Context, limits: Model
 	const budget = inputTextBudget(current, limits);
 	let text = system + current.text;
 	const requiredTokens = estimatedTextTokens(text);
-	if (requiredTokens > budget) throwContextOverflow();
+	if (requiredTokens > budget) {
+		if (recoveryStart !== undefined) throw new CursorRecoveryBudgetError();
+		throwContextOverflow();
+	}
 	const units = historyUnits(prior, recoveryStart);
 	const toolContext = prior.length > 0 ? `${SDK_TOOL_CONTEXT}\n\n` : "";
 	let remaining = budget - requiredTokens - estimatedTextTokens(toolContext);
 	let start = units.length;
 	while (start > 0) {
-		const cost = estimatedHistoryTokens(units[start - 1]!);
+		const cost = estimatedHistoryTokens(units[start - 1]!, targetModelId);
 		if (cost > remaining) break;
 		remaining -= cost;
 		start -= 1;
 	}
 	if (recoveryStart !== undefined && start === units.length) {
-		throw new Error("Context window exceeded: required tool recovery history, initiating request, and continuation exceed the model input budget (conservative estimate)");
+		throw new CursorRecoveryBudgetError();
 	}
 	if (start < units.length) text = system + toolContext + current.text;
 	return {

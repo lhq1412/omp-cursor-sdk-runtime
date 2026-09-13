@@ -27,7 +27,9 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	pi.registerProvider(CURSOR_SDK_PROVIDER_ID, {
 		baseUrl: "https://cursor.com",
 		api: CURSOR_SDK_API,
-		apiKey: CURSOR_API_KEY_ENV_VAR,
+		// OMP pins ProviderConfig.apiKey above /login. The env-var name becomes a
+		// literal key when unset, so only pass it when CURSOR_API_KEY is actually set.
+		apiKey: process.env[CURSOR_API_KEY_ENV_VAR]?.trim() ? CURSOR_API_KEY_ENV_VAR : undefined,
 		usage: cursorSdkUsageProvider,
 		oauth: {
 			name: "Cursor SDK API key",

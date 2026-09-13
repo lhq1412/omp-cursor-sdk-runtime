@@ -239,7 +239,7 @@ export async function prepareTurn(input: OpenRuntimeTurnInput): Promise<Prepared
 	const plan = trailing.length > 0
 		? { mode: "bootstrap" as const, resetAgent: true, reason: "context_divergence" as const }
 		: planSend(sendState, input.context);
-	const { prompt, history } = prepareSendInput(plan, input.context, input.modelLimits);
+	const { prompt, history } = prepareSendInput(plan, input.context, input.modelLimits, modelSelection.id);
 
 	slot.preparation?.abort();
 	const preparation = new AbortController();
