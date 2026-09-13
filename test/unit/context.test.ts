@@ -10,8 +10,8 @@ function context(messages: Context["messages"], systemPrompt: Context["systemPro
 	return { systemPrompt, messages };
 }
 
-function bootstrap(ctx: Context, limits: ModelInputLimits = modelLimits) {
-	return prepareSendInput(planSend(emptySendState(), ctx), ctx, limits);
+function bootstrap(ctx: Context, limits: ModelInputLimits = modelLimits, targetModelId?: string) {
+	return prepareSendInput(planSend(emptySendState(), ctx), ctx, limits, targetModelId);
 }
 
 const firstUser = [{ role: "user", content: "hi", timestamp: 1 } as Context["messages"][number]];
@@ -469,6 +469,56 @@ describe("send policy", () => {
 			{ role: "user", content: "Continue", timestamp: 2 },
 		] as Context["messages"]);
 		expect(bootstrap(ctx).history).toEqual(ctx.messages.slice(0, -1));
+	});
+
+	test("counts builtin cursor K3 thinking when bootstrapping the same K3", () => {
+		const thinking = "t".repeat(40_000);
+		const k3 = {
+			role: "assistant" as const,
+			content: [
+				{ type: "thinking" as const, thinking },
+				{ type: "toolCall" as const, id: "read-1", name: "read", arguments: {} },
+			],
+			api: "cursor-agent" as const,
+			provider: "cursor",
+			model: "kimi-k3",
+			timestamp: 2,
+		};
+		const ctx = context([
+			{ role: "user", content: "Inspect", timestamp: 1 },
+			k3,
+			{ role: "toolResult", toolCallId: "read-1", toolName: "read", content: [{ type: "text", text: "ok" }], timestamp: 3 },
+		] as Context["messages"]);
+		const limits = { contextWindow: 8_000, maxTokens: 200 };
+		expect(bootstrap(ctx, limits).history).toEqual(ctx.messages);
+		expect(bootstrap(ctx, limits, "composer-2.5").history).toEqual(ctx.messages);
+		expect(() => bootstrap(ctx, limits, "kimi-k3")).toThrow(CursorRecoveryBudgetError);
+		const sdkOwn = context([
+			{ role: "user", content: "Inspect", timestamp: 1 },
+			{ ...k3, api: "cursor-sdk-agent", provider: "cursor-sdk" },
+			{ role: "toolResult", toolCallId: "read-1", toolName: "read", content: [{ type: "text", text: "ok" }], timestamp: 3 },
+		] as Context["messages"]);
+		expect(bootstrap(sdkOwn, limits, "kimi-k3").history).toEqual(sdkOwn.messages);
+	});
+
+	test("counts native tool-call ids and framing on a long recovery chain", () => {
+		const ctx = context([
+			{ role: "user", content: "Inspect", timestamp: 1 },
+			{
+				role: "assistant",
+				content: Array.from({ length: 80 }, (_, i) => ({ type: "toolCall" as const, id: `c${i}`, name: "r", arguments: {} })),
+				timestamp: 2,
+			},
+			...Array.from({ length: 80 }, (_, i) => ({
+				role: "toolResult" as const,
+				toolCallId: `c${i}`,
+				toolName: "r",
+				content: [{ type: "text" as const, text: "ok" }],
+				timestamp: 3 + i,
+			})),
+		] as Context["messages"]);
+		expect(() => bootstrap(ctx, { contextWindow: 3_500, maxTokens: 200 })).toThrow(CursorRecoveryBudgetError);
+		expect(bootstrap(ctx, { contextWindow: 200_000, maxTokens: 200 }).history).toEqual(ctx.messages);
 	});
 });
 
