@@ -3,11 +3,13 @@ import type { SDKImage, SDKUserMessage } from "@cursor/sdk";
 import type { Context } from "@oh-my-pi/pi-ai";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import {
+	BOOTSTRAP_OUTPUT_RESERVE_TOKENS,
 	CURSOR_SDK_API,
 	CURSOR_SDK_PROVIDER_ID,
 	MAX_COMPLETED_INCREMENTAL_SENDS_BEFORE_REBOOTSTRAP,
 	SDK_TOOL_CONTEXT,
 } from "./constants.js";
+import { CursorRecoveryBudgetError } from "./errors.js";
 
 export type SendMode = "bootstrap" | "incremental";
 
@@ -35,6 +37,7 @@ export interface PreparedSendInput {
 }
 
 const NATIVE_HISTORY_FORMAT = "native-checkpoint-v1";
+const IMAGE_TOKEN_RESERVE = 4096;
 
 export function nativeToolCallId(id: string): string {
 	return createHash("sha256").update("omp-native-history:tool-call\0").update(id).digest("hex");
@@ -224,24 +227,44 @@ function historyUnits(messages: Context["messages"], recoveryStart?: number): Co
 }
 
 function estimatedHistoryTokens(messages: Context["messages"]): number {
-	let tokens = messages.length + 1;
+	const fragments: string[] = [];
+	let tokens = 0;
 	for (const message of messages) {
-		const text = JSON.stringify(message, (_key, value: unknown) => {
-			if (isRecord(value) && value.type === "image") {
-				// Native tool results contain placeholders; recovery attaches their bytes separately.
-				if (message.role !== "toolResult") tokens += 4096;
-				return { type: "image", mimeType: value.mimeType };
+		if (message.role === "user" || message.role === "developer") {
+			const text = textFromContent(message.content);
+			if (text) fragments.push(text);
+			tokens += imagesFromContent(message.content).length * IMAGE_TOKEN_RESERVE;
+			continue;
+		}
+		if (message.role === "assistant") {
+			if (!Array.isArray(message.content)) continue;
+			for (const block of message.content) {
+				if (!isRecord(block)) continue;
+				if (block.type === "text" && typeof block.text === "string" && block.text) fragments.push(block.text);
+				else if (block.type === "toolCall") {
+					if (typeof block.name === "string") fragments.push(block.name);
+					fragments.push(JSON.stringify(block.arguments ?? null));
+				}
 			}
-			return value;
-		});
-		tokens += estimatedTextTokens(text);
+			continue;
+		}
+		if (message.role === "toolResult") {
+			const text = textFromContent(message.content);
+			if (text) fragments.push(text);
+			continue;
+		}
+		const extra = message as { role?: string; summary?: unknown };
+		if ((extra.role === "compactionSummary" || extra.role === "branchSummary") && typeof extra.summary === "string" && extra.summary) {
+			fragments.push(extra.summary);
+		}
 	}
+	for (const fragment of fragments) tokens += estimatedTextTokens(fragment);
 	return tokens;
 }
 
 function estimatedTextTokens(text: string): number {
-	// ponytail: conservative UTF-8 byte estimate, not a tokenizer; use SDK token counting when public.
-	return Buffer.byteLength(text, "utf8");
+	// ponytail: OMP Tokenizer approximate; use a model tokenizer when this adapter owns one.
+	return (Buffer.byteLength(text, "utf8") + 3) >> 2;
 }
 
 function throwContextOverflow(): never {
@@ -253,9 +276,9 @@ function inputTextBudget(current: SDKUserMessage, limits: ModelInputLimits): num
 		throw new Error("Cursor SDK model context/output limits are unknown or invalid");
 	}
 	// ponytail: 4096/image reserve; SDK image tokens are unpublished.
-	// Encoded payload bytes are not tokens.
-	const imageReserve = (current.images?.length ?? 0) * 4096;
-	return limits.contextWindow - limits.maxTokens - imageReserve - 1024;
+	// Encoded payload bytes are not tokens. Advertised maxTokens is not the bootstrap reserve.
+	const imageReserve = (current.images?.length ?? 0) * IMAGE_TOKEN_RESERVE;
+	return limits.contextWindow - Math.min(limits.maxTokens, BOOTSTRAP_OUTPUT_RESERVE_TOKENS) - imageReserve - 1024;
 }
 
 /**
@@ -343,7 +366,10 @@ export function prepareSendInput(plan: SendPlan, context: Context, limits: Model
 	const budget = inputTextBudget(current, limits);
 	let text = system + current.text;
 	const requiredTokens = estimatedTextTokens(text);
-	if (requiredTokens > budget) throwContextOverflow();
+	if (requiredTokens > budget) {
+		if (recoveryStart !== undefined) throw new CursorRecoveryBudgetError();
+		throwContextOverflow();
+	}
 	const units = historyUnits(prior, recoveryStart);
 	const toolContext = prior.length > 0 ? `${SDK_TOOL_CONTEXT}\n\n` : "";
 	let remaining = budget - requiredTokens - estimatedTextTokens(toolContext);
@@ -355,7 +381,7 @@ export function prepareSendInput(plan: SendPlan, context: Context, limits: Model
 		start -= 1;
 	}
 	if (recoveryStart !== undefined && start === units.length) {
-		throw new Error("Context window exceeded: required tool recovery history, initiating request, and continuation exceed the model input budget (conservative estimate)");
+		throw new CursorRecoveryBudgetError();
 	}
 	if (start < units.length) text = system + toolContext + current.text;
 	return {

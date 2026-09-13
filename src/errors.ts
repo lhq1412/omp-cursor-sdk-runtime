@@ -1,13 +1,22 @@
 import { CURSOR_API_KEY_ENV_VAR } from "./constants.js";
 
+export class CursorRecoveryBudgetError extends Error {
+	constructor() {
+		super("Cursor SDK recovery cannot restore the current tool turn within the bootstrap input budget");
+		this.name = "CursorRecoveryBudgetError";
+	}
+}
+
 /** Provider diagnostics only: never apply this to assistant content or tool results. */
 export function sanitizeCursorProviderError(error: unknown, apiKey?: string): string {
 	const parts: string[] = [];
 	const seen = new Set<object>();
+	let recoveryBudget = false;
 	let current = error;
 	while (current !== null && typeof current === "object" && !seen.has(current)) {
 		seen.add(current);
 		const record = current as Record<string, unknown>;
+		if (record.name === "CursorRecoveryBudgetError") recoveryBudget = true;
 		if (typeof record.message === "string") parts.push(record.message);
 		for (const field of ["name", "code", "status", "requestId", "request_id"] as const) {
 			const value = record[field];
@@ -46,7 +55,7 @@ export function sanitizeCursorProviderError(error: unknown, apiKey?: string): st
 		category = "Quota exhausted";
 	} else if (rate) {
 		category = "Rate limited";
-	} else if (/context (?:window|length).*(?:exceed|full|overflow|too (?:long|large))|(?:exceed|maximum).*context (?:window|length)|(?:prompt|input|conversation).*(?:too long|too large)|too many (?:input )?tokens/.test(detail)) {
+	} else if (!recoveryBudget && /context (?:window|length).*(?:exceed|full|overflow|too (?:long|large))|(?:exceed|maximum).*context (?:window|length)|(?:prompt|input|conversation).*(?:too long|too large)|too many (?:input )?tokens/.test(detail)) {
 		category = "Context window exceeded";
 	} else if (/authentication|unauthenticated|unauthori[sz]ed|invalid api key|permission denied|status=(?:401|403)\b/.test(detail)) {
 		category = "Authentication failed";

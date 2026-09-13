@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { SDK_TOOL_CONTEXT } from "../../src/constants.ts";
 import { activeUserInput, activeUserText, computeContextFingerprint, emptySendState, planSend, prepareSendInput, registerCursorToolCallIds, type ModelInputLimits } from "../../src/context.ts";
+import { CursorRecoveryBudgetError } from "../../src/errors.ts";
 import type { Context } from "@oh-my-pi/pi-ai";
 
 const modelLimits = { contextWindow: 200_000, maxTokens: 20_000 };
@@ -259,7 +260,7 @@ describe("send policy", () => {
 
 	test("trims oldest interaction units without splitting tool calls across injected developer input", () => {
 		const ctx = context([
-			{ role: "user", content: "OLD " + "x".repeat(3000), timestamp: 1 },
+			{ role: "user", content: "OLD " + "x".repeat(8000), timestamp: 1 },
 			{ role: "assistant", content: [{ type: "toolCall", id: "old-call", name: "read", arguments: {} }], timestamp: 2 },
 			{ role: "developer", content: "injected policy", timestamp: 3 },
 			{ role: "toolResult", toolCallId: "old-call", toolName: "read", content: [{ type: "text", text: "old-result" }], timestamp: 4 },
@@ -276,7 +277,7 @@ describe("send policy", () => {
 
 	test("recovery trims older turns but keeps the initiating request and all completed batches", () => {
 		const ctx = context([
-			{ role: "user", content: "OBSOLETE " + "x".repeat(5000), timestamp: 1 },
+			{ role: "user", content: "OBSOLETE " + "x".repeat(20_000), timestamp: 1 },
 			{ role: "assistant", content: [{ type: "text", text: "Old answer" }], timestamp: 2 },
 			{ role: "user", content: "Compare a.ts and b.ts", timestamp: 3 },
 			{ role: "assistant", content: [{ type: "toolCall", id: "call-a", name: "read", arguments: { path: "a.ts" } }], timestamp: 4 },
@@ -285,7 +286,7 @@ describe("send policy", () => {
 			{ role: "developer", content: "Use the recorded evidence", timestamp: 6 },
 			{ role: "toolResult", toolCallId: "call-b", toolName: "read", content: [{ type: "text", text: "contents of b.ts" }], timestamp: 7 },
 		] as Context["messages"], "required system");
-		const prepared = bootstrap(ctx, { contextWindow: 2400 + Buffer.byteLength(`${SDK_TOOL_CONTEXT}\n\n`), maxTokens: 200 });
+		const prepared = bootstrap(ctx, { contextWindow: 2400, maxTokens: 200 });
 		expect(prepared.history).toEqual(ctx.messages.slice(2));
 		expect(prepared.prompt.text).toContain("required system");
 		expect(prepared.prompt.text).not.toContain("Compare a.ts and b.ts");
@@ -316,7 +317,7 @@ describe("send policy", () => {
 		]);
 		expect(prepared.prompt.text).not.toContain(requestImage.data);
 		expect(prepared.prompt.text).not.toContain(resultImage.data);
-		expect(() => bootstrap(ctx, { contextWindow: 14_000, maxTokens: 500 })).toThrow(/context window exceeded/i);
+		expect(() => bootstrap(ctx, { contextWindow: 14_000, maxTokens: 500 })).toThrow(CursorRecoveryBudgetError);
 		const ordinary = bootstrap({ ...ctx, messages: [...ctx.messages, { role: "user", content: "New request", timestamp: 7 }] });
 		expect(ordinary.history).toEqual(ctx.messages);
 		expect(ordinary.prompt.images).toBeUndefined();
@@ -355,13 +356,13 @@ describe("send policy", () => {
 		const ctx = context([{ role: "user", content: "x".repeat(1000), timestamp: 1 }], "required system");
 		expect(bootstrap(ctx, limits).prompt.text).toContain("x".repeat(1000));
 		expect(() => bootstrap(ctx, { ...limits, maxTokens: 5000 })).toThrow(/context window exceeded/i);
-		expect(() => bootstrap({ ...ctx, systemPrompt: ["s".repeat(6000)] }, limits)).toThrow(/context window exceeded/i);
-		const withImage = context([{ role: "user", content: [{ type: "text", text: "x".repeat(1000) }, { type: "image", data: "abc", mimeType: "image/png" }], timestamp: 1 }]);
+		expect(() => bootstrap({ ...ctx, systemPrompt: ["s".repeat(20_000)] }, limits)).toThrow(/context window exceeded/i);
+		const withImage = context([{ role: "user", content: [{ type: "text", text: "x".repeat(4000) }, { type: "image", data: "abc", mimeType: "image/png" }], timestamp: 1 }]);
 		expect(() => bootstrap(withImage, limits)).toThrow(/context window exceeded/i);
 		const imported = { ...ctx, messages: [...firstUser, ...ctx.messages] };
 		const required = bootstrap(ctx);
-		const requiredTextBytes = Buffer.byteLength(required.prompt.text);
-		expect(bootstrap(imported, { contextWindow: 1024 + limits.maxTokens + requiredTextBytes, maxTokens: limits.maxTokens })).toEqual(required);
+		const requiredTokens = (Buffer.byteLength(required.prompt.text) + 3) >> 2;
+		expect(bootstrap(imported, { contextWindow: 1024 + limits.maxTokens + requiredTokens + 8, maxTokens: limits.maxTokens })).toEqual(required);
 	});
 
 	test("does not treat image encoding size as context tokens", () => {
@@ -439,6 +440,35 @@ describe("send policy", () => {
 		expect(bootstrap(ctx, { contextWindow: 6000, maxTokens: 500 }).history).toEqual(ctx.messages.slice(0, -1));
 		expect(bootstrap(ctx, { contextWindow: 5000, maxTokens: 500 }).history).toEqual([]);
 		expect(() => bootstrap(context([{ role: "user", content: [image], timestamp: 1 }], ""), { contextWindow: 5000, maxTokens: 500 })).toThrow(/context window exceeded/i);
+	});
+
+	test("recovers ASCII-heavy tool results under 64k maxTokens without counting host metadata", () => {
+		const payload = "x".repeat(140_000);
+		const ctx = context([
+			{ role: "user", content: "Inspect a.ts", timestamp: 1 },
+			{ role: "assistant", content: [{ type: "toolCall", id: "read-1", name: "read", arguments: { path: "a.ts" } }], timestamp: 2, contextSnapshot: "snap".repeat(50_000) },
+			{ role: "toolResult", toolCallId: "read-1", toolName: "read", content: [{ type: "text", text: payload }], timestamp: 3 },
+		] as Context["messages"]);
+		const prepared = bootstrap(ctx, { contextWindow: 200_000, maxTokens: 64_000 });
+		expect(prepared.history).toEqual(ctx.messages);
+		expect(prepared.prompt.text).toContain("Continue the initiating request");
+	});
+
+	test("unsplittable recovery failure is not ContextOverflow", () => {
+		const ctx = context([
+			{ role: "user", content: "Inspect", timestamp: 1 },
+			{ role: "assistant", content: [{ type: "toolCall", id: "read-1", name: "read", arguments: {} }], timestamp: 2 },
+			{ role: "toolResult", toolCallId: "read-1", toolName: "read", content: [{ type: "text", text: "x".repeat(20_000) }], timestamp: 3 },
+		]);
+		expect(() => bootstrap(ctx, { contextWindow: 4_000, maxTokens: 2_000 })).toThrow(CursorRecoveryBudgetError);
+	});
+
+	test("bootstraps compaction summaries as visible history", () => {
+		const ctx = context([
+			{ role: "compactionSummary", summary: "Earlier turns summarized", timestamp: 1 },
+			{ role: "user", content: "Continue", timestamp: 2 },
+		] as Context["messages"]);
+		expect(bootstrap(ctx).history).toEqual(ctx.messages.slice(0, -1));
 	});
 });
 
