@@ -55,7 +55,7 @@ export interface ToolCallDedupe {
 }
 
 export function createToolCallDedupe(bridgeRunId: string): ToolCallDedupe {
-	const inflight = new Map<string, Promise<HostToolResult>>();
+	const inflight = new Map<string, { name: string; argsJson: string; promise: Promise<HostToolResult> }>();
 	const completed = new Map<string, { name: string; argsJson: string; result: HostToolResult }>();
 
 	return {
@@ -73,13 +73,18 @@ export function createToolCallDedupe(bridgeRunId: string): ToolCallDedupe {
 				return previous.result;
 			}
 			const pending = inflight.get(key);
-			if (pending) return pending;
+			if (pending) {
+				if (pending.name !== name || pending.argsJson !== argsJson) {
+					throw new ToolBridgeError(`duplicate toolCallId ${toolCallId} with conflicting name or arguments`);
+				}
+				return pending.promise;
+			}
 			const next = run().then((result) => {
 				completed.set(key, { name, argsJson, result });
 				inflight.delete(key);
 				return result;
 			});
-			inflight.set(key, next);
+			inflight.set(key, { name, argsJson, promise: next });
 			return next;
 		},
 	};

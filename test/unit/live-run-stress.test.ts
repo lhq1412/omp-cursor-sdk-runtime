@@ -433,18 +433,31 @@ describe("live-run state-machine stress", () => {
 			observers.push(again);
 			expect(actor.live.parked).toHaveLength(1);
 			expect(actor.hostCount.n).toBe(1);
-			const conflict = observe(actor.live.toolExec.execute("read", { path: "other.ts" }, "call-a"));
-			observers.push(conflict);
-			expect(actor.live.parked).toHaveLength(1);
-			expect(actor.hostCount.n).toBe(1);
 			resumeParked(actor.live, { messages: [toolResult("call-a", "ok:call-a")] } as Context);
 			await actor.callbacks.get("call-a")!.promise;
 			await again.promise;
 			expect(again.outcome).toBe("resolved");
-			await Promise.allSettled([conflict.promise]);
-			// Production dedupe joins an inflight same toolCallId; conflict is only rejected after the first call completes.
-			expect(conflict.outcome).toBe("resolved");
 			expect(actor.hostCount.n).toBe(1);
+			await release(actor);
+			await disposeLiveRun(KEY, "end");
+		} finally {
+			liveRunTestUtils.clear();
+		}
+	});
+
+	test("duplicate-conflict rejects while the first call is still inflight", async () => {
+		liveRunTestUtils.clear();
+		try {
+			const actor = createActor("A", "bridge-a");
+			setLiveRun(KEY, actor.live);
+			const observers: Observer[] = [actor.starting];
+			const boom = (name: string, detail?: string): never => fail(1, "happy", ["park-a"], name, detail);
+			await parkCall(actor, "call-a", { path: "a.ts" }, observers, boom);
+			await expect(actor.live.toolExec.execute("read", { path: "other.ts" }, "call-a")).rejects.toBeInstanceOf(ToolBridgeError);
+			expect(actor.live.parked).toHaveLength(1);
+			expect(actor.hostCount.n).toBe(1);
+			resumeParked(actor.live, { messages: [toolResult("call-a", "ok:call-a")] } as Context);
+			await actor.callbacks.get("call-a")!.promise;
 			await release(actor);
 			await disposeLiveRun(KEY, "end");
 		} finally {
