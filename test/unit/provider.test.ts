@@ -699,7 +699,7 @@ describe("streamCursorRuntime model selection", () => {
 		const sent: ModelSelection[] = [];
 		installCapturingAgent(created, sent);
 		const events = await drain(cursorModel("composer-2.5", 10_000), context, { apiKey: "test-key", cwd: "/tmp/project" });
-		expect(events.at(-1)).toMatchObject({ type: "error", error: { errorMessage: expect.stringMatching(/context window exceeded/i) } });
+		expect(events.at(-1)).toMatchObject({ type: "error", error: { errorMessage: expect.stringMatching(/cannot restore the current tool turn/i) } });
 		expect(created).toEqual([]);
 		expect(sent).toEqual([]);
 	});
