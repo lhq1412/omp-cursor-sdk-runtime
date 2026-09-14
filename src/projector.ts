@@ -25,6 +25,11 @@ export interface CursorAssistantMessage extends AssistantMessage {
 			usedTokens: number;
 			maxTokens: number;
 		};
+		summary?: {
+			count: number;
+			text?: string;
+			checkpointRootBlobId?: string;
+		};
 	};
 }
 
@@ -150,6 +155,10 @@ export function applyInteractionUpdate(
 		applyThinkingDelta(stream, partial, update.text);
 		return;
 	}
+	if (update.type === "summary-started" || update.type === "summary" || update.type === "summary-completed") {
+		if (hasCursorSdk(partial)) applySummaryUpdate(partial, update);
+		return;
+	}
 	previewMcpToolCall(stream, partial, update, projection);
 }
 
@@ -258,6 +267,18 @@ export function reconcileRunResult(
 	projection.answerText = final;
 }
 
+function hasCursorSdk(partial: AssistantMessage): partial is CursorAssistantMessage {
+	return "cursorSdk" in partial;
+}
+
+function applySummaryUpdate(partial: CursorAssistantMessage, update: InteractionUpdate): void {
+	const summary = partial.cursorSdk.summary ??= { count: 0 };
+	if (update.type === "summary") {
+		summary.text = update.summary;
+		return;
+	}
+	if (update.type === "summary-completed") summary.count += 1;
+}
 export function projectRunUsage(
 	partial: CursorAssistantMessage,
 	projection: RunProjection,

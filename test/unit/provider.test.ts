@@ -206,7 +206,7 @@ describe("streamCursorRuntime model selection", () => {
 				{ role: "toolResult", toolCallId: "call-occupancy", toolName: "read", content: [{ type: "text", text: "ok" }], isError: false, timestamp: 2 }],
 		}, { apiKey: "test-key" })).at(-1);
 		expect(settled).toMatchObject({ type: "done", message: {
-			usage: { contextTokens: 150, input: 0, output: 0, totalTokens: 135,
+			usage: { contextTokens: 150, contextTokensScope: "provider", input: 0, output: 0, totalTokens: 135,
 				orchestration: { input: 105, output: 10, cacheRead: 20 }, cost: { total: 0 } },
 			cursorSdk: { cost: "unavailable", contextOccupancy: { status: "actual", source: "checkpoint", rootBlobId: "settled", maxTokens: 100 } },
 		} });

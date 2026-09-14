@@ -383,23 +383,25 @@ function toModelConfig(metadata: CursorModelMetadata, name: string): ProviderMod
 		// Base-mode reference only: preserve the SDK threshold, not the vendor's tier pricing.
 		cost.longContext = { ...cost, inputThreshold: metadata.extendedContext.standardContextWindow };
 	}
-	return {
+	const config = {
 		id: metadata.piModelId,
 		name,
 		reasoning: metadata.supportsReasoning,
 		...(metadata.supportsReasoning && metadata.thinkingLevelMap
 			? {
-					thinking: {
-						mode: "effort",
-						efforts: getSupportedThinkingEfforts(metadata.thinkingLevelMap),
-					},
-				}
+				thinking: {
+					mode: "effort" as const,
+					efforts: getSupportedThinkingEfforts(metadata.thinkingLevelMap),
+				},
+			}
 			: {}),
 		input: [...TEXT_AND_IMAGE_INPUT],
 		cost,
 		contextWindow: metadata.contextWindow,
 		maxTokens: FALLBACK_MAX_TOKENS,
+		contextManagement: { owner: "provider" as const },
 	};
+	return config;
 }
 
 function getModelName(item: Pick<ModelListItem, "id" | "displayName">, context?: string): string {

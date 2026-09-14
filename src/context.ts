@@ -149,11 +149,8 @@ export function planSend(sendState: SendState, context: Context): SendPlan {
 		return { mode: "bootstrap", resetAgent: true, reason: "context_divergence", ...continuation };
 	}
 	if (current.messageHashes.length > previous.messageHashes.length) {
-		for (let index = previous.messageHashes.length; index < context.messages.length; index += 1) {
-			const role = (context.messages[index] as { role?: string }).role;
-			if (role === "branchSummary" || role === "compactionSummary") {
-				return { mode: "bootstrap", resetAgent: true, reason: "context_divergence" };
-			}
+		if (suffixRequiresBootstrap(context.messages, previous.messageHashes.length)) {
+			return { mode: "bootstrap", resetAgent: true, reason: "context_divergence" };
 		}
 	}
 	if (sendState.incrementalSendCount >= MAX_COMPLETED_INCREMENTAL_SENDS_BEFORE_REBOOTSTRAP) {
@@ -171,6 +168,26 @@ function parseFingerprint(value: string): { systemHash: string; messageHashes: s
 	} catch {
 		return undefined;
 	}
+}
+
+function suffixRequiresBootstrap(messages: Context["messages"], fromIndex: number): boolean {
+	let extraTurns = 0;
+	for (let index = fromIndex; index < messages.length; index += 1) {
+		const message = messages[index];
+		if (!isRecord(message) || typeof message.role !== "string") return true;
+		if (message.role === "user" || message.role === "developer") {
+			extraTurns += 1;
+			if (extraTurns > 1) return true;
+			continue;
+		}
+		if (message.role === "assistant") {
+			if (message.provider !== CURSOR_SDK_PROVIDER_ID || message.api !== CURSOR_SDK_API) return true;
+			continue;
+		}
+		if (message.role === "toolResult") continue;
+		return true;
+	}
+	return false;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
