@@ -32,10 +32,12 @@ import {
 	runResultToStopReason,
 	projectRunUsage,
 	reconcileRunResult,
+	ompToolCallId,
 	type CursorAssistantMessage,
 } from "./projector.js";
 import { readSettledCheckpointOccupancy } from "./native-history.js";
 import { openJsonlStore } from "./sdk-session.js";
+import { nativeReadHooked, runWithNativeTools } from "./sdk-native-hook.js";
 
 const bridgeOwners = new Map<string, { owner: CursorSessionOwner; signal: AbortSignal; onAbort: () => void }>();
 
@@ -241,17 +243,20 @@ export class ProviderTurnRunner {
 			this.assertCurrent();
 		}
 		const starting = startSend(live, () =>
-			withSdkExitSuppressed(() =>
-				agent.send(userPrompt, {
-					model: modelSelection,
-					local: { customTools },
-					onDelta: ({ update }) => {
-						const sink = live.sink;
-						if (!sink || live.cancelled || getRuntimeSlot(prepared.slot.key) !== prepared.slot) return;
-						applyInteractionUpdate(sink.stream, sink.partial, update, live.projection);
-					},
-				}),
-			),
+			withSdkExitSuppressed(() => {
+				const send = () =>
+					agent.send(userPrompt, {
+						model: modelSelection,
+						local: { customTools },
+						onDelta: ({ update }) => {
+							const sink = live.sink;
+							if (!sink || live.cancelled || getRuntimeSlot(prepared.slot.key) !== prepared.slot) return;
+							applyInteractionUpdate(sink.stream, sink.partial, update, live.projection);
+						},
+					});
+				if (!nativeReadHooked) return send();
+				return runWithNativeTools((name, args, sdkToolCallId) => live.toolExec.execute(name, args, sdkToolCallId), send);
+			}),
 		);
 		void starting.catch(() => undefined);
 	}

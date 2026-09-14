@@ -9,6 +9,7 @@ export const MAX_COMPLETED_INCREMENTAL_SENDS_BEFORE_REBOOTSTRAP = 20;
 export const BOOTSTRAP_OUTPUT_RESERVE_TOKENS = 16_384;
 
 export const SDK_TOOL_CONTEXT = "Cursor SDK tool access: use the custom-user-tools namespace for any tools granted in this run. Discover their schemas before invoking them. Native Cursor tools are unavailable. Do not call FetchMcpResource or readMcpResource; memory uses granted mcp__* tools or read memory://.";
+export const SDK_TOOL_CONTEXT_WITH_READ = "Cursor SDK tool access: native `read`, `grep`, `shell`, and `edit` are available. Other native Cursor tools are unavailable. Use the custom-user-tools namespace for remaining granted tools. Discover their schemas before invoking them. Do not call FetchMcpResource or readMcpResource; memory uses granted mcp__* tools or read memory://.";
 
 /**
  * Live probe (2026-09-08): this backend rejects `AgentOptions.systemPrompt`

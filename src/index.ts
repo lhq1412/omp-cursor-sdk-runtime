@@ -1,4 +1,5 @@
 import "./sdk-exit-guard.js";
+import "./sdk-native-hook.js";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import { CURSOR_API_KEY_ENV_VAR, CURSOR_SDK_API, CURSOR_SDK_PROVIDER_ID } from "./constants.js";
 import { fallbackModels, fetchCursorModels } from "./catalog.js";

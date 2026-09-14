@@ -9,9 +9,11 @@ import {
 	CURSOR_SDK_PROVIDER_ID,
 	MAX_COMPLETED_INCREMENTAL_SENDS_BEFORE_REBOOTSTRAP,
 	SDK_TOOL_CONTEXT,
+	SDK_TOOL_CONTEXT_WITH_READ,
 } from "./constants.js";
 import { CursorRecoveryBudgetError } from "./errors.js";
 import { nativeToolCallId, projectSdkToolCallId } from "./tool-call-id.js";
+import { nativeReadHooked } from "./sdk-native-hook.js";
 
 export type SendMode = "bootstrap" | "incremental";
 
@@ -436,7 +438,7 @@ export function prepareSendInput(plan: SendPlan, context: Context, limits: Model
 		throwContextOverflow();
 	}
 	const units = historyUnits(prior, recoveryStart);
-	const toolContext = prior.length > 0 ? `${SDK_TOOL_CONTEXT}\n\n` : "";
+	const toolContext = prior.length > 0 ? `${nativeReadHooked ? SDK_TOOL_CONTEXT_WITH_READ : SDK_TOOL_CONTEXT}\n\n` : "";
 	let remaining = budget - requiredTokens - estimatedTextTokens(toolContext);
 	let start = units.length;
 	while (start > 0) {

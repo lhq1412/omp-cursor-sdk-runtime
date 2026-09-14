@@ -70,6 +70,22 @@ describe("buildAgentOptions", () => {
 		expect(options.disallowedTools).not.toContain("webSearch");
 	});
 
+	test("enables hooked native tools and drops them from disallowedTools", () => {
+		const options = buildAgentOptions({
+			apiKey: "test-key",
+			cwd: "/tmp",
+			model: { id: "composer-2.5" },
+			store,
+			customTools: {},
+			includeNativeTools: ["read", "grep", "shell", "edit"],
+		});
+		expect(options.tools).toEqual(expect.arrayContaining(["read", "grep", "shell", "edit"]));
+		expect(options.disallowedTools).not.toContain("read");
+		expect(options.disallowedTools).not.toContain("grep");
+		expect(options.disallowedTools).not.toContain("shell");
+		expect(options.disallowedTools).not.toContain("edit");
+	});
+
 	test("rejects cloud agent ids", () => {
 		expect(() =>
 			buildAgentOptions({

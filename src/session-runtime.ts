@@ -18,6 +18,7 @@ import {
 } from "./live-run.js";
 import { trailingToolResults } from "./omp-tools.js";
 import { withSdkExitSuppressed } from "./sdk-exit-guard.js";
+import { nativeSdkToolsFromGrants, isHookedOmpTool } from "./sdk-native-hook.js";
 import { openAgent, type OpenAgentInput } from "./sdk-session.js";
 import { flushResumeHandleNow, getMatchingResumeHandle, persistResumeHandle, type ResumeStoreIdentity } from "./session-resume.js";
 import { getCursorSessionCwd, getCursorSessionOwner, getCursorSessionScopeKey, withCursorSessionOwner, type CursorSessionOwner } from "./session-scope.js";
@@ -296,7 +297,8 @@ export async function prepareTurn(input: OpenRuntimeTurnInput): Promise<Prepared
 		}, newBridgeRunId()));
 		const toolExec = attachParkExecutor(live, input.grantedTools, input.host);
 		const sdkToOmp = new Map<string, string>();
-		const customTools = buildCustomTools(input.grantedTools, toolExec.execute, toolExec.dedupe, sdkToOmp);
+		const customGranted = input.grantedTools.filter((tool) => !isHookedOmpTool(tool.name));
+		const customTools = buildCustomTools(customGranted, toolExec.execute, toolExec.dedupe, sdkToOmp);
 		live.projection.sdkToOmp = sdkToOmp;
 		live.projection.allowToolPreview = !input.host;
 
@@ -309,6 +311,7 @@ export async function prepareTurn(input: OpenRuntimeTurnInput): Promise<Prepared
 					store,
 					customTools,
 					includeWebSearch: input.includeWebSearch,
+					includeNativeTools: nativeSdkToolsFromGrants(input.grantedTools.map((tool) => tool.name)),
 					savedAgentId,
 					...(!savedAgentId ? { bootstrapHistory: history } : {}),
 					signal,

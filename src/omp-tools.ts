@@ -1,11 +1,13 @@
 import type { Context, Tool, ToolResultMessage } from "@oh-my-pi/pi-ai";
 import { toolWireSchema } from "@oh-my-pi/pi-ai/utils/schema/wire";
 import type { GrantedTool, HostToolResult } from "./contracts.js";
+import { isHookedOmpTool } from "./sdk-native-hook.js";
 
 export function grantedToolsFromContext(context: Context): GrantedTool[] {
 	const granted: GrantedTool[] = [];
 	for (const tool of context.tools ?? []) {
-		if (tool.native || tool.name === "web_search") continue;
+		if (tool.name === "web_search") continue;
+		if (tool.native && !isHookedOmpTool(tool.name)) continue;
 		granted.push({
 			name: tool.name,
 			description: descriptionFromTool(tool),
