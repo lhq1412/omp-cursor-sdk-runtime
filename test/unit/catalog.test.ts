@@ -62,7 +62,6 @@ describe("identity mapping", () => {
 			}),
 		]);
 		expect(models.map((model) => model.id)).toEqual(["gpt-5.5"]);
-		expect(models[0]).toMatchObject({ contextManagement: { owner: "provider" } });
 		expect(models[0]?.contextWindow).toBe(1_000_000);
 		expect(models[0]?.cost).toMatchObject({ longContext: { inputThreshold: 272_000 } });
 		expect(getModelMetadata("gpt-5.5")?.extendedContext).toEqual({

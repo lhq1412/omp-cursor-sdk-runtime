@@ -399,7 +399,6 @@ function toModelConfig(metadata: CursorModelMetadata, name: string): ProviderMod
 		cost,
 		contextWindow: metadata.contextWindow,
 		maxTokens: FALLBACK_MAX_TOKENS,
-		contextManagement: { owner: "provider" as const },
 	};
 	return config;
 }
