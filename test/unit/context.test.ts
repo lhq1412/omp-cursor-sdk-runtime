@@ -2,8 +2,10 @@ import { describe, expect, test } from "bun:test";
 import { SDK_TOOL_CONTEXT } from "../../src/constants.ts";
 import { activeUserInput, activeUserText, computeContextFingerprint, emptySendState, planSend, prepareSendInput, registerLegacyCursorToolCallIdMigration, type ModelInputLimits } from "../../src/context.ts";
 import { CursorRecoveryBudgetError } from "../../src/errors.ts";
+import type { ModelSelection } from "@cursor/sdk";
 import type { Context } from "@oh-my-pi/pi-ai";
 import { normalizeToolCallId } from "@oh-my-pi/pi-ai/utils";
+import { buildNativeHistory } from "../../src/native-history.ts";
 
 const modelLimits = { contextWindow: 200_000, maxTokens: 20_000 };
 
@@ -695,5 +697,19 @@ describe("legacy Cursor session tool-call migration", () => {
 		expect(calls.content[0].id.length).toBeLessThanOrEqual(64);
 		expect(projected.messages[1]).toMatchObject({ toolCallId: calls.content[1].id });
 		expect(projected.messages[2]).toMatchObject({ toolCallId: calls.content[0].id });
+	});
+
+	test("does not collapse duplicate toolCalls; native import still rejects them", async () => {
+		const raw = ids[0]!;
+		const messages = [assistant([raw, raw])];
+		const projected = await migrate()(messages);
+		const first = projected[0]!;
+		if (first.role !== "assistant") throw new Error("Missing migrated assistant");
+		const calls = first.content.filter((block) => block.type === "toolCall");
+		expect(calls).toHaveLength(2);
+		expect(calls[0]!.id).toBe(calls[1]!.id);
+		expect(normalizeToolCallId(calls[0]!.id)).toBe(calls[0]!.id);
+		await expect(buildNativeHistory(projected, { id: "composer-2.5" } as ModelSelection))
+			.rejects.toThrow("Cannot import native history with duplicate tool call IDs");
 	});
 });
