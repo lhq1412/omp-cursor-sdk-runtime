@@ -2,6 +2,7 @@ import type { AssistantMessage, AssistantMessageEventStream, Model } from "@oh-m
 import type { Api } from "@oh-my-pi/pi-ai";
 import { createAssistantMessageEventStream } from "@oh-my-pi/pi-ai";
 import type { InteractionUpdate, RunResult, TokenUsage } from "@cursor/sdk";
+import { projectSdkToolCallId } from "./tool-call-id.js";
 
 export interface RunProjection {
 	answerText: string;
@@ -10,6 +11,8 @@ export interface RunProjection {
 	sdkToOmp?: ReadonlyMap<string, string>;
 	allowToolPreview?: boolean;
 	previews?: Map<string, { contentIndex: number; ended: boolean }>;
+	/** SDK-native tool-call ID → OMP-portable ID for this run. */
+	toolCallIds?: Map<string, string>;
 }
 
 export interface CursorAssistantMessage extends AssistantMessage {
@@ -58,6 +61,15 @@ export function createEmptyAssistantMessage(model: Model<Api>): CursorAssistantM
 		stopReason: "stop",
 		timestamp: Date.now(),
 	};
+}
+
+/** Map one SDK-native tool-call ID to the OMP-portable ID for this run. */
+export function ompToolCallId(projection: RunProjection, sdkToolCallId: string): string {
+	const existing = projection.toolCallIds?.get(sdkToolCallId);
+	if (existing) return existing;
+	const projected = projectSdkToolCallId(sdkToolCallId);
+	(projection.toolCallIds ??= new Map()).set(sdkToolCallId, projected);
+	return projected;
 }
 
 export function applyTextDelta(stream: AssistantMessageEventStream, partial: AssistantMessage, text: string, startNew = false): void {
@@ -114,20 +126,27 @@ function previewMcpToolCall(
 	const name = projection.sdkToOmp.get(call.sdkName);
 	if (!name) return;
 	const previews = projection.previews ??= new Map();
-	const existing = previews.get(call.callId);
+	const ompId = ompToolCallId(projection, call.callId);
+	const existing = previews.get(ompId);
 	if (existing?.ended) return;
-	if (existing) {
+	let contentIndex = partial.content.findIndex((block) => block.type === "toolCall" && block.id === ompId);
+	if (contentIndex < 0 && existing) {
 		const block = partial.content[existing.contentIndex];
+		if (block?.type === "toolCall") contentIndex = existing.contentIndex;
+	}
+	if (contentIndex >= 0) {
+		const block = partial.content[contentIndex];
 		if (block?.type === "toolCall") {
 			block.name = name;
 			block.arguments = call.args;
 		}
+		previews.set(ompId, { contentIndex, ended: false });
 		return;
 	}
 	endLastOpenBlock(stream, partial);
-	partial.content.push({ type: "toolCall", id: call.callId, name, arguments: call.args });
-	const contentIndex = partial.content.length - 1;
-	previews.set(call.callId, { contentIndex, ended: false });
+	partial.content.push({ type: "toolCall", id: ompId, name, arguments: call.args });
+	contentIndex = partial.content.length - 1;
+	previews.set(ompId, { contentIndex, ended: false });
 	stream.push({ type: "toolcall_start", contentIndex, partial });
 }
 
@@ -169,30 +188,38 @@ export function applyToolCall(
 	toolCall: { id: string; name: string; arguments: Record<string, unknown> },
 	projection?: RunProjection,
 ): void {
-	const preview = projection?.previews?.get(toolCall.id);
+	// toolCall.id is SDK-native; every emitted block/event id is OMP-portable.
+	const id = projection ? ompToolCallId(projection, toolCall.id) : projectSdkToolCallId(toolCall.id);
+	const preview = projection?.previews?.get(id);
 	if (preview?.ended) return;
-	if (preview) {
+	let contentIndex = partial.content.findIndex((block) => block.type === "toolCall" && block.id === id);
+	if (contentIndex < 0 && preview) {
 		const block = partial.content[preview.contentIndex];
-		if (block?.type === "toolCall") {
-			block.id = toolCall.id;
-			block.name = toolCall.name;
-			block.arguments = toolCall.arguments;
-			stream.push({ type: "toolcall_delta", contentIndex: preview.contentIndex, delta: JSON.stringify(block.arguments), partial });
-			stream.push({ type: "toolcall_end", contentIndex: preview.contentIndex, toolCall: block, partial });
-			preview.ended = true;
-			return;
+		if (block?.type === "toolCall") contentIndex = preview.contentIndex;
+	}
+	if (contentIndex >= 0) {
+		const block = partial.content[contentIndex];
+		if (block.type !== "toolCall") return;
+		block.id = id;
+		block.name = toolCall.name;
+		block.arguments = toolCall.arguments;
+		stream.push({ type: "toolcall_delta", contentIndex, delta: JSON.stringify(block.arguments), partial });
+		stream.push({ type: "toolcall_end", contentIndex, toolCall: block, partial });
+		if (projection) {
+			(projection.previews ??= new Map()).set(id, { contentIndex, ended: true });
 		}
+		return;
 	}
 	endLastOpenBlock(stream, partial);
-	partial.content.push({ type: "toolCall", id: toolCall.id, name: toolCall.name, arguments: toolCall.arguments });
-	const contentIndex = partial.content.length - 1;
+	partial.content.push({ type: "toolCall", id, name: toolCall.name, arguments: toolCall.arguments });
+	contentIndex = partial.content.length - 1;
 	const block = partial.content[contentIndex];
 	if (block.type !== "toolCall") return;
 	stream.push({ type: "toolcall_start", contentIndex, partial });
 	stream.push({ type: "toolcall_delta", contentIndex, delta: JSON.stringify(block.arguments), partial });
 	stream.push({ type: "toolcall_end", contentIndex, toolCall: block, partial });
 	if (projection) {
-		(projection.previews ??= new Map()).set(toolCall.id, { contentIndex, ended: true });
+		(projection.previews ??= new Map()).set(id, { contentIndex, ended: true });
 	}
 }
 
@@ -202,16 +229,31 @@ export function deliverWithoutUnendedPreviews(
 	keepIds: ReadonlySet<string>,
 ): AssistantMessage {
 	const previews = projection.previews;
-	if (!previews) return partial;
+	let content = partial.content;
 	let changed = false;
-	const content = partial.content.filter((block) => {
-		if (block.type !== "toolCall" || keepIds.has(block.id)) return true;
-		const preview = previews.get(block.id);
-		if (!preview || preview.ended) return true;
-		previews.delete(block.id);
+	if (previews) {
+		const filtered = partial.content.filter((block) => {
+			if (block.type !== "toolCall" || keepIds.has(block.id)) return true;
+			const preview = previews.get(block.id);
+			if (!preview || preview.ended) return true;
+			previews.delete(block.id);
+			changed = true;
+			return false;
+		});
+		if (changed) content = filtered;
+	}
+	const lastById = new Map<string, number>();
+	let toolCalls = 0;
+	for (let i = 0; i < content.length; i += 1) {
+		const block = content[i]!;
+		if (block.type !== "toolCall") continue;
+		toolCalls += 1;
+		lastById.set(block.id, i);
+	}
+	if (lastById.size < toolCalls) {
+		content = content.filter((block, index) => block.type !== "toolCall" || lastById.get(block.id) === index);
 		changed = true;
-		return false;
-	});
+	}
 	return changed ? { ...partial, content } : partial;
 }
 

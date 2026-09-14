@@ -12,6 +12,7 @@ import { __testUtils as scopeTestUtils } from "../../src/session-scope.ts";
 import { __testUtils as resumeTestUtils } from "../../src/session-resume.ts";
 import { HOST_BRIDGE_OPTION_KEY } from "../../src/host-option.ts";
 import { createFakeHost } from "../helpers/fake-host.ts";
+import { projectSdkToolCallId } from "../../src/tool-call-id.ts";
 
 const COMPOSER: ModelListItem = {
 	id: "composer-2.5",
@@ -758,6 +759,79 @@ describe("streamCursorRuntime model selection", () => {
 		expect(done.message.content.filter((block) => block.type === "toolCall")).toEqual([
 			expect.objectContaining({ type: "toolCall", id: "call-1", name: "read", arguments: { path: "a.ts" } }),
 		]);
+	});
+
+	test("projects 87-char SDK IDs into OMP yield and resumes on the portable ID", async () => {
+		const sdkId = `${"x".repeat(64)}${"y".repeat(23)}`;
+		const ompId = projectSdkToolCallId(sdkId);
+		installCapturingAgent([], [], async (options) => {
+			const tool = options?.local?.customTools?.read;
+			if (!tool) return finishedRun();
+			const pending = tool.execute({ path: "a.ts" }, { toolCallId: sdkId });
+			return {
+				id: "run-long-id",
+				supports: () => false,
+				wait: async () => {
+					await pending;
+					return { id: "run-long-id", status: "finished", result: "done" } as RunResult;
+				},
+			} as unknown as Run;
+		});
+		const first = await drain(cursorModel("composer-2.5", 1_000_000), userContext("hi", [readTool()]), {
+			apiKey: "test-key",
+			cwd: "/tmp/project",
+		});
+		expect(first.at(-1)).toMatchObject({ type: "done", reason: "toolUse" });
+		const done = first.at(-1);
+		if (done?.type !== "done") throw new Error("expected toolUse");
+		expect(done.message.content.filter((block) => block.type === "toolCall")).toEqual([
+			expect.objectContaining({ type: "toolCall", id: ompId, name: "read", arguments: { path: "a.ts" } }),
+		]);
+		expect(ompId).not.toBe(sdkId);
+		expect(ompId.length).toBeLessThanOrEqual(64);
+		const second = await drain(
+			cursorModel("composer-2.5", 1_000_000),
+			{
+				messages: [
+					{ role: "user", content: "hi", timestamp: 1 } as Context["messages"][number],
+					{
+						role: "toolResult",
+						toolCallId: ompId,
+						toolName: "read",
+						content: [{ type: "text", text: "ok" }],
+						isError: false,
+						timestamp: 2,
+					},
+				],
+				tools: [readTool()],
+			} as Context,
+			{ apiKey: "test-key", cwd: "/tmp/project" },
+		);
+		expect(second.at(-1)).toMatchObject({ type: "done", reason: "stop" });
+	});
+
+	test("host executeTool receives the portable ID, not the 87-char SDK ID", async () => {
+		const host = createFakeHost({ tools: ["read"] });
+		const sdkId = `${"x".repeat(64)}${"y".repeat(23)}`;
+		const ompId = projectSdkToolCallId(sdkId);
+		installCapturingAgent([], [], async (options) => {
+			const tool = options?.local?.customTools?.read;
+			if (!tool) return finishedRun();
+			await tool.execute({ path: "a.ts" }, { toolCallId: sdkId });
+			return {
+				id: "run-host-long",
+				supports: () => false,
+				wait: async () => ({ id: "run-host-long", status: "finished", result: "done" }) as RunResult,
+			} as unknown as Run;
+		});
+		await drain(cursorModel("composer-2.5", 1_000_000), userContext("hi", [readTool()]), {
+			apiKey: "test-key",
+			cwd: "/tmp/project",
+			[HOST_BRIDGE_OPTION_KEY]: host,
+		} as SimpleStreamOptions);
+		expect(host.calls).toEqual([{ name: "read", args: { path: "a.ts" }, toolCallId: ompId }]);
+		expect(host.calls[0]?.toolCallId).not.toBe(sdkId);
+		expect(host.calls[0]?.toolCallId.length).toBeLessThanOrEqual(64);
 	});
 
 	test("host-executed tools do not leave preview toolCalls for OMP to run again", async () => {

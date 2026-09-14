@@ -11,6 +11,7 @@ import { createAssistantMessageEventStream } from "@oh-my-pi/pi-ai";
 import { applyInteractionUpdate, applyToolCall, createEmptyAssistantMessage, deliverWithoutUnendedPreviews, projectRunUsage, reconcileRunResult, type RunProjection } from "../../src/projector.ts";
 import type { InteractionUpdate, RunResult, TokenUsage } from "@cursor/sdk";
 import { CURSOR_SDK_API, CURSOR_SDK_PROVIDER_ID } from "../../src/constants.ts";
+import { projectSdkToolCallId } from "../../src/tool-call-id.ts";
 import type { Model } from "@oh-my-pi/pi-ai";
 import type { Api } from "@oh-my-pi/pi-ai";
 
@@ -132,7 +133,7 @@ describe("projector", () => {
 		expect(delivered.content.filter((block) => block.type === "toolCall").map((block) => block.type === "toolCall" ? block.id : "")).toEqual(["call-1"]);
 		expect(delivered).not.toBe(partial);
 		applyToolCall(stream, partial, { id: "orphan", name: "read", arguments: { path: "x.ts" } }, projection);
-		expect(partial.content.filter((block) => block.type === "toolCall").map((block) => block.type === "toolCall" ? block.id : "")).toEqual(["orphan", "call-1", "orphan"]);
+		expect(partial.content.filter((block) => block.type === "toolCall").map((block) => block.type === "toolCall" ? block.id : "")).toEqual(["orphan", "call-1"]);
 	});
 
 	test("does not open executable previews without an explicit park-path allow", () => {
@@ -178,6 +179,159 @@ describe("projector", () => {
 		}
 		expect(JSON.parse(received.get("call-A") ?? "null")).toEqual({ input: "patch-for-A" });
 		expect(JSON.parse(received.get("call-C") ?? "null")).toEqual({ input: "patch-for-C" });
+	});
+
+	test("emits one portable ID for an 87-char SDK tool call across events", async () => {
+		const model = {
+			id: "composer-2.5",
+			provider: CURSOR_SDK_PROVIDER_ID,
+			api: CURSOR_SDK_API,
+		} as Model<Api>;
+		const stream = createAssistantMessageEventStream();
+		const partial = createEmptyAssistantMessage(model);
+		const projection: RunProjection = { answerText: "" };
+		const raw = `${"x".repeat(64)}${"y".repeat(23)}`;
+		const ompId = projectSdkToolCallId(raw);
+		applyToolCall(stream, partial, { id: raw, name: "read", arguments: { path: "a.ts" } }, projection);
+		const block = partial.content[0];
+		if (block?.type !== "toolCall") throw new Error("Missing tool call");
+		expect(block.id).toBe(ompId);
+		expect(block.id.length).toBeLessThanOrEqual(64);
+		expect(block.id).toMatch(/^[A-Za-z0-9_-]+$/);
+		stream.end(partial);
+		const ids: string[] = [];
+		for await (const event of stream) {
+			if (event.type === "toolcall_start" || event.type === "toolcall_delta") {
+				const seen = event.partial.content[event.contentIndex];
+				if (seen?.type === "toolCall") ids.push(seen.id);
+			} else if (event.type === "toolcall_end") {
+				ids.push(event.toolCall.id);
+			}
+		}
+		expect(new Set(ids)).toEqual(new Set([ompId]));
+	});
+
+	test("reconciles a long-ID preview with the final applyToolCall into one block", () => {
+		const model = {
+			id: "composer-2.5",
+			provider: CURSOR_SDK_PROVIDER_ID,
+			api: CURSOR_SDK_API,
+		} as Model<Api>;
+		const stream = createAssistantMessageEventStream();
+		const partial = createEmptyAssistantMessage(model);
+		const projection: RunProjection = { answerText: "", allowToolPreview: true, sdkToOmp: new Map([["read", "read"]]) };
+		const raw = `${"x".repeat(64)}${"y".repeat(23)}`;
+		const ompId = projectSdkToolCallId(raw);
+		applyInteractionUpdate(stream, partial, mcpUpdate("partial-tool-call", raw, "read", { path: "a.ts" }), projection);
+		expect(partial.content.filter((block) => block.type === "toolCall")).toHaveLength(1);
+		expect(partial.content[0]).toMatchObject({ type: "toolCall", id: ompId });
+		applyToolCall(stream, partial, { id: raw, name: "read", arguments: { path: "a.ts" } }, projection);
+		expect(partial.content.filter((block) => block.type === "toolCall")).toHaveLength(1);
+		expect(partial.content[0]).toMatchObject({ type: "toolCall", id: ompId, name: "read", arguments: { path: "a.ts" } });
+	});
+
+	test("projects two long SDK IDs with a shared prefix to distinct OMP IDs", () => {
+		const model = {
+			id: "composer-2.5",
+			provider: CURSOR_SDK_PROVIDER_ID,
+			api: CURSOR_SDK_API,
+		} as Model<Api>;
+		const stream = createAssistantMessageEventStream();
+		const partial = createEmptyAssistantMessage(model);
+		const projection: RunProjection = { answerText: "" };
+		const rawA = `${"x".repeat(64)}A`.padEnd(87, "A");
+		const rawB = `${"x".repeat(64)}B`.padEnd(87, "B");
+		applyToolCall(stream, partial, { id: rawA, name: "read", arguments: { path: "a.ts" } }, projection);
+		applyToolCall(stream, partial, { id: rawB, name: "read", arguments: { path: "b.ts" } }, projection);
+		const ids = partial.content.filter((block) => block.type === "toolCall").map((block) => block.type === "toolCall" ? block.id : "");
+		expect(ids).toHaveLength(2);
+		expect(ids[0]).not.toBe(ids[1]);
+		expect(ids[0]).toBe(projectSdkToolCallId(rawA));
+		expect(ids[1]).toBe(projectSdkToolCallId(rawB));
+	});
+
+	test("filters unended previews by OMP IDs when keepIds are canonical", () => {
+		const model = {
+			id: "composer-2.5",
+			provider: CURSOR_SDK_PROVIDER_ID,
+			api: CURSOR_SDK_API,
+		} as Model<Api>;
+		const stream = createAssistantMessageEventStream();
+		const partial = createEmptyAssistantMessage(model);
+		const projection: RunProjection = { answerText: "", allowToolPreview: true, sdkToOmp: new Map([["edit", "edit"]]) };
+		const rawB = `${"x".repeat(64)}${"B".repeat(23)}`;
+		const rawA = `${"x".repeat(64)}${"A".repeat(23)}`;
+		const rawC = `${"x".repeat(64)}${"C".repeat(23)}`;
+		applyInteractionUpdate(stream, partial, mcpUpdate("tool-call-started", rawB, "edit", { input: "preview-B" }), projection);
+		applyToolCall(stream, partial, { id: rawA, name: "edit", arguments: { input: "patch-for-A" } }, projection);
+		applyToolCall(stream, partial, { id: rawC, name: "edit", arguments: { input: "patch-for-C" } }, projection);
+		const ompA = projectSdkToolCallId(rawA);
+		const ompB = projectSdkToolCallId(rawB);
+		const ompC = projectSdkToolCallId(rawC);
+		expect(partial.content.map((block) => block.type === "toolCall" ? block.id : "")).toEqual([ompB, ompA, ompC]);
+		const delivered = deliverWithoutUnendedPreviews(partial, projection, new Set([ompA, ompC]));
+		expect(delivered.content.filter((block) => block.type === "toolCall").map((block) => block.type === "toolCall" ? block.id : "")).toEqual([ompA, ompC]);
+	});
+
+	test("applyToolCall does not record the same ID twice on one assistant message", () => {
+		const model = {
+			id: "composer-2.5",
+			provider: CURSOR_SDK_PROVIDER_ID,
+			api: CURSOR_SDK_API,
+		} as Model<Api>;
+		const stream = createAssistantMessageEventStream();
+		const partial = createEmptyAssistantMessage(model);
+		const projection: RunProjection = { answerText: "", allowToolPreview: true, sdkToOmp: new Map([["read", "read"]]) };
+		applyInteractionUpdate(stream, partial, mcpUpdate("tool-call-started", "call-1", "read", { path: "x.ts" }), projection);
+		const preview = projection.previews?.get("call-1");
+		if (preview) preview.contentIndex = 99;
+		applyToolCall(stream, partial, { id: "call-1", name: "read", arguments: { path: "a.ts" } }, projection);
+		applyToolCall(stream, partial, { id: "call-1", name: "read", arguments: { path: "a.ts" } }, projection);
+		expect(partial.content.filter((block) => block.type === "toolCall")).toEqual([
+			expect.objectContaining({ type: "toolCall", id: "call-1", arguments: { path: "a.ts" } }),
+		]);
+	});
+
+	test("delivery keeps one toolCall when keepIds matches two blocks with the same ID", () => {
+		const model = {
+			id: "composer-2.5",
+			provider: CURSOR_SDK_PROVIDER_ID,
+			api: CURSOR_SDK_API,
+		} as Model<Api>;
+		const partial = createEmptyAssistantMessage(model);
+		partial.content = [
+			{ type: "toolCall", id: "call-1", name: "read", arguments: { path: "preview" } },
+			{ type: "toolCall", id: "call-1", name: "read", arguments: { path: "final" } },
+		];
+		const projection: RunProjection = {
+			answerText: "",
+			previews: new Map([["call-1", { contentIndex: 1, ended: true }]]),
+		};
+		const delivered = deliverWithoutUnendedPreviews(partial, projection, new Set(["call-1"]));
+		expect(delivered.content.filter((block) => block.type === "toolCall")).toEqual([
+			expect.objectContaining({ type: "toolCall", id: "call-1", arguments: { path: "final" } }),
+		]);
+	});
+
+	test("a later assistant message does not replay an already-ended toolCall ID", () => {
+		const model = {
+			id: "composer-2.5",
+			provider: CURSOR_SDK_PROVIDER_ID,
+			api: CURSOR_SDK_API,
+		} as Model<Api>;
+		const stream = createAssistantMessageEventStream();
+		const first = createEmptyAssistantMessage(model);
+		const projection: RunProjection = { answerText: "" };
+		applyToolCall(stream, first, { id: "call-1", name: "read", arguments: { path: "a.ts" } }, projection);
+		expect(first.content.filter((block) => block.type === "toolCall")).toHaveLength(1);
+		const second = createEmptyAssistantMessage(model);
+		applyToolCall(stream, second, { id: "call-1", name: "read", arguments: { path: "a.ts" } }, projection);
+		applyInteractionUpdate(stream, second, mcpUpdate("tool-call-started", "call-1", "read", { path: "a.ts" }), {
+			...projection,
+			allowToolPreview: true,
+			sdkToOmp: new Map([["read", "read"]]),
+		});
+		expect(second.content.filter((block) => block.type === "toolCall")).toHaveLength(0);
 	});
 
 

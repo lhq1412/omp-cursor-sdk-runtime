@@ -23,6 +23,7 @@ import { flushResumeHandleNow, getMatchingResumeHandle, persistResumeHandle, typ
 import { getCursorSessionCwd, getCursorSessionOwner, getCursorSessionScopeKey, withCursorSessionOwner, type CursorSessionOwner } from "./session-scope.js";
 import { openScopedJsonlStore, storeRootForScope } from "./store.js";
 import { buildCustomTools, newBridgeRunId } from "./tools.js";
+import { ompToolCallId } from "./projector.js";
 
 export interface RuntimeSlot {
 	key: string;
@@ -128,10 +129,11 @@ export interface PreparedTurn {
 }
 
 function attachParkExecutor(live: LiveRun, grantedTools: readonly GrantedTool[], host?: OmpHostBridgeV1): SharedToolExec {
-	const exec = createSharedToolExec(grantedTools, (name, args, toolCallId) => {
+	const exec = createSharedToolExec(grantedTools, (name, args, sdkToolCallId) => {
 		if (live.cancelled) throw new Error("Cursor SDK live run was cancelled");
-		if (host) return host.executeTool(name, args, toolCallId);
-		return parkToolCall(live, name, args, toolCallId);
+		const ompId = ompToolCallId(live.projection, sdkToolCallId);
+		if (host) return host.executeTool(name, args, ompId);
+		return parkToolCall(live, name, args, sdkToolCallId, ompId);
 	}, live.toolExec.bridgeRunId);
 	live.toolExec = exec;
 	return exec;

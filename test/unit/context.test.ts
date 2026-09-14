@@ -1,8 +1,11 @@
 import { describe, expect, test } from "bun:test";
 import { SDK_TOOL_CONTEXT } from "../../src/constants.ts";
-import { activeUserInput, activeUserText, computeContextFingerprint, emptySendState, planSend, prepareSendInput, registerCursorToolCallIds, type ModelInputLimits } from "../../src/context.ts";
+import { activeUserInput, activeUserText, computeContextFingerprint, emptySendState, planSend, prepareSendInput, registerLegacyCursorToolCallIdMigration, type ModelInputLimits } from "../../src/context.ts";
 import { CursorRecoveryBudgetError } from "../../src/errors.ts";
+import type { ModelSelection } from "@cursor/sdk";
 import type { Context } from "@oh-my-pi/pi-ai";
+import { normalizeToolCallId } from "@oh-my-pi/pi-ai/utils";
+import { buildNativeHistory } from "../../src/native-history.ts";
 
 const modelLimits = { contextWindow: 200_000, maxTokens: 20_000 };
 
@@ -580,17 +583,17 @@ describe("send policy", () => {
 	});
 });
 
-describe("Cursor tool call context projection", () => {
-	function registerProjection() {
+describe("legacy Cursor session tool-call migration", () => {
+	function migrate() {
 		const handlers = new Map<string, (event: unknown, ctx: unknown) => unknown>();
-		registerCursorToolCallIds({
+		registerLegacyCursorToolCallIdMigration({
 			on(event: string, handler: (event: unknown, ctx: unknown) => unknown) {
 				handlers.set(event, handler);
 			},
 		} as never);
-		return async (messages: Context["messages"], api?: string) => {
+		return async (messages: Context["messages"], ctx?: unknown) => {
 			const event = { type: "context", messages: structuredClone(messages) };
-			const result = await handlers.get("context")!(event, { model: api ? { api } : undefined }) as { messages?: Context["messages"] } | undefined;
+			const result = await handlers.get("context")!(event, ctx) as { messages?: Context["messages"] } | undefined;
 			return result?.messages ?? event.messages;
 		};
 	}
@@ -614,11 +617,10 @@ describe("Cursor tool call context projection", () => {
 
 	const ids = ["a", "b"].map((suffix) => "x".repeat(64) + suffix.repeat(22));
 
-	test("projects historical same-name calls to distinct Codex-safe IDs and pairs reversed results", async () => {
-		const project = registerProjection();
+	test("migrates legacy long Cursor IDs and pairs reversed results", async () => {
 		const messages = [assistant(ids), result(ids[1]!), result(ids[0]!)];
 		const original = structuredClone(messages);
-		const projected = await project(messages, "openai-codex-responses");
+		const projected = await migrate()(messages);
 		const calls = projected.flatMap((message) => message.role === "assistant"
 			? message.content.filter((block) => block.type === "toolCall")
 			: []);
@@ -626,21 +628,27 @@ describe("Cursor tool call context projection", () => {
 		expect(calls).toHaveLength(2);
 		expect(calls[0]!.id).not.toBe(calls[1]!.id);
 		for (const call of calls) {
+			expect(call.id).toMatch(/^[A-Za-z0-9_-]+$/);
 			expect(call.id.length).toBeGreaterThan(0);
 			expect(call.id.length).toBeLessThanOrEqual(64);
+			expect(normalizeToolCallId(call.id)).toBe(call.id);
 		}
 		expect(projected[1]).toMatchObject({ toolCallId: calls[1]!.id, content: [{ type: "text", text: ids[1] }] });
 		expect(projected[2]).toMatchObject({ toolCallId: calls[0]!.id, content: [{ type: "text", text: ids[0] }] });
 		expect(messages).toEqual(original);
-		expect(await project(messages, "cursor-sdk-agent")).toEqual(original);
 	});
 
-	test.each(["openai-responses", undefined])("retains callback IDs outside Codex (%s)", async (api) => {
+	test.each(["openai-codex-responses", "openai-responses", "cursor-sdk-agent", undefined])("migrates regardless of target model (%s)", async (api: string | undefined) => {
 		const messages = [assistant(ids), result(ids[0]!), result(ids[1]!)];
-		expect(await registerProjection()(messages, api)).toEqual(messages);
+		const projected = await migrate()(messages, api ? { model: { api } } : {});
+		const first = projected[0]!;
+		if (first.role !== "assistant" || first.content[0]?.type !== "toolCall") throw new Error("Missing migrated call");
+		expect(first.content[0].id).not.toBe(ids[0]);
+		expect(normalizeToolCallId(first.content[0].id)).toBe(first.content[0].id);
+		expect(projected[1]).toMatchObject({ toolCallId: first.content[0].id });
 	});
 
-	test("leaves non-adapter origins, unpaired results, and 64-character IDs unchanged", async () => {
+	test("leaves other providers, unpaired results, and already-portable IDs unchanged", async () => {
 		const boundaryId = "b".repeat(64);
 		const messages = [
 			assistant([ids[0]!], "other-provider"),
@@ -651,7 +659,7 @@ describe("Cursor tool call context projection", () => {
 			result(boundaryId),
 			result("unpaired".repeat(11)),
 		];
-		expect(await registerProjection()(messages, "openai-codex-responses")).toEqual(messages);
+		expect(await migrate()(messages)).toEqual(messages);
 	});
 
 	test("does not rewrite an unrelated provider's result when it later reuses an adapter ID", async () => {
@@ -660,9 +668,9 @@ describe("Cursor tool call context projection", () => {
 			assistant([id]), result(id),
 			assistant([id], "other-provider", "openai-responses"), result(id),
 		];
-		const projected = await registerProjection()(messages, "openai-codex-responses");
+		const projected = await migrate()(messages);
 		const first = projected[0]!;
-		if (first.role !== "assistant" || first.content[0]?.type !== "toolCall") throw new Error("Missing projected call");
+		if (first.role !== "assistant" || first.content[0]?.type !== "toolCall") throw new Error("Missing migrated call");
 		expect(first.content[0].id.length).toBeLessThanOrEqual(64);
 		expect(projected[1]).toMatchObject({ toolCallId: first.content[0].id });
 		expect(projected.slice(2)).toEqual(messages.slice(2));
@@ -670,25 +678,38 @@ describe("Cursor tool call context projection", () => {
 
 	test("does not mutate messages when OMP only shallow-copied the array", async () => {
 		const handlers = new Map<string, (event: unknown, ctx: unknown) => unknown>();
-		registerCursorToolCallIds({
+		registerLegacyCursorToolCallIdMigration({
 			on(event: string, handler: (event: unknown, ctx: unknown) => unknown) {
 				handlers.set(event, handler);
 			},
 		} as never);
 		const messages = [assistant(ids), result(ids[1]!), result(ids[0]!)];
 		const original = structuredClone(messages);
-		// Mirror OMP's structuredClone failure path: array copy only, shared message objects.
 		const event = { type: "context", messages: [...messages] };
-		const projected = await handlers.get("context")!(event, { model: { api: "openai-codex-responses" } }) as { messages: Context["messages"] };
+		const projected = await handlers.get("context")!(event, {}) as { messages: Context["messages"] };
 		expect(messages).toEqual(original);
 		expect(event.messages).toEqual(original);
 		const calls = projected.messages[0]!;
 		if (calls.role !== "assistant" || calls.content[0]?.type !== "toolCall" || calls.content[1]?.type !== "toolCall") {
-			throw new Error("Missing projected call");
+			throw new Error("Missing migrated call");
 		}
 		expect(calls.content[0].id).not.toBe(ids[0]);
 		expect(calls.content[0].id.length).toBeLessThanOrEqual(64);
 		expect(projected.messages[1]).toMatchObject({ toolCallId: calls.content[1].id });
 		expect(projected.messages[2]).toMatchObject({ toolCallId: calls.content[0].id });
+	});
+
+	test("does not collapse duplicate toolCalls; native import still rejects them", async () => {
+		const raw = ids[0]!;
+		const messages = [assistant([raw, raw])];
+		const projected = await migrate()(messages);
+		const first = projected[0]!;
+		if (first.role !== "assistant") throw new Error("Missing migrated assistant");
+		const calls = first.content.filter((block) => block.type === "toolCall");
+		expect(calls).toHaveLength(2);
+		expect(calls[0]!.id).toBe(calls[1]!.id);
+		expect(normalizeToolCallId(calls[0]!.id)).toBe(calls[0]!.id);
+		await expect(buildNativeHistory(projected, { id: "composer-2.5" } as ModelSelection))
+			.rejects.toThrow("Cannot import native history with duplicate tool call IDs");
 	});
 });

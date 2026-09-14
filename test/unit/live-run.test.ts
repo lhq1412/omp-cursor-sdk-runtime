@@ -17,6 +17,7 @@ import {
 	cancelLiveRun,
 	waitForCancelled,
 } from "../../src/live-run.ts";
+import { projectSdkToolCallId } from "../../src/tool-call-id.ts";
 
 function dummyExec() {
 	return createSharedToolExec([], async () => ({ content: [], isError: false }), "run-1");
@@ -38,10 +39,12 @@ describe("live-run park-and-yield", () => {
 		liveRunTestUtils.clear();
 		const live = createLiveRun(dummyExec());
 		const parked = waitForParked(live);
-		const execution = parkToolCall(live, "read", { path: "a.ts" }, "call-1");
+		const execution = parkToolCall(live, "read", { path: "a.ts" }, "call-1", "call-1");
 		await parked;
 		const batch = await collectParkedBatch(live);
-		expect(batch.map((call) => call.toolCallId)).toEqual(["call-1"]);
+		expect(batch.map((call) => ({ sdk: call.sdkToolCallId, omp: call.ompToolCallId }))).toEqual([
+			{ sdk: "call-1", omp: "call-1" },
+		]);
 		resumeParked(live, {
 			messages: [toolResult("call-1", "file contents")],
 		} as Context);
@@ -55,7 +58,7 @@ describe("live-run park-and-yield", () => {
 		liveRunTestUtils.clear();
 		const live = createLiveRun(dummyExec());
 		setLiveRun("k", live);
-		const execution = parkToolCall(live, "bash", { command: "pwd" }, "call-2");
+		const execution = parkToolCall(live, "bash", { command: "pwd" }, "call-2", "call-2");
 		await disposeLiveRun("k", "aborted", false);
 		await expect(execution).rejects.toThrow(/aborted/);
 	});
@@ -64,7 +67,7 @@ describe("live-run park-and-yield", () => {
 		liveRunTestUtils.clear();
 		const live = createLiveRun(dummyExec());
 		const send = startSend(live, async () => {
-			const result = parkToolCall(live, "read", { path: "a.ts" }, "call-3");
+			const result = parkToolCall(live, "read", { path: "a.ts" }, "call-3", "call-3");
 			await result;
 			return {
 				supports: () => false,
@@ -101,12 +104,33 @@ describe("live-run park-and-yield", () => {
 	test("cancel during park rejects callbacks and stays bound after streamSimple would return", async () => {
 		liveRunTestUtils.clear();
 		const live = createLiveRun(dummyExec());
-		const execution = parkToolCall(live, "read", { path: "a.ts" }, "call-4");
+		const execution = parkToolCall(live, "read", { path: "a.ts" }, "call-4", "call-4");
 		const controller = new AbortController();
 		bindLiveAbort(live, controller.signal);
 		controller.abort();
 		await expect(execution).rejects.toThrow(/cancelled/);
-		await expect(parkToolCall(live, "read", { path: "b.ts" }, "call-5")).rejects.toThrow(/cancelled/);
+		await expect(parkToolCall(live, "read", { path: "b.ts" }, "call-5", "call-5")).rejects.toThrow(/cancelled/);
 		await cancelLiveRun(live);
+	});
+
+	test("resumes parked calls by OMP ID and ignores the SDK-native ID", async () => {
+		liveRunTestUtils.clear();
+		const live = createLiveRun(dummyExec());
+		const sdkId = `${"x".repeat(64)}${"y".repeat(23)}`;
+		const ompId = projectSdkToolCallId(sdkId);
+		const parked = waitForParked(live);
+		const execution = parkToolCall(live, "read", { path: "a.ts" }, sdkId, ompId);
+		await parked;
+		resumeParked(live, { messages: [toolResult(sdkId, "should not match")] } as Context);
+		await expect(execution).rejects.toThrow(/did not return a tool result/);
+
+		const parkedAgain = waitForParked(live);
+		const executionAgain = parkToolCall(live, "read", { path: "a.ts" }, sdkId, ompId);
+		await parkedAgain;
+		resumeParked(live, { messages: [toolResult(ompId, "file contents")] } as Context);
+		await expect(executionAgain).resolves.toEqual({
+			isError: false,
+			content: [{ type: "text", text: "file contents" }],
+		});
 	});
 });

@@ -396,7 +396,7 @@ describe("provider late events after park and abort", () => {
 		if (aTerminal.type !== "done") throw new Error("expected toolUse");
 		const live = getLiveRun(runtime.runtimeKey());
 		expect(live?.cancelled).toBe(false);
-		expect(live?.parked.map((call) => call.toolCallId)).toEqual(["call-a", "call-b"]);
+		expect(live?.parked.map((call) => call.sdkToolCallId)).toEqual(["call-a", "call-b"]);
 		expect(live?.agent?.agentId).toBe("agent-1");
 		controller.abort();
 		await Promise.allSettled(parks);
