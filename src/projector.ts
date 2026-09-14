@@ -129,17 +129,23 @@ function previewMcpToolCall(
 	const ompId = ompToolCallId(projection, call.callId);
 	const existing = previews.get(ompId);
 	if (existing?.ended) return;
-	if (existing) {
+	let contentIndex = partial.content.findIndex((block) => block.type === "toolCall" && block.id === ompId);
+	if (contentIndex < 0 && existing) {
 		const block = partial.content[existing.contentIndex];
+		if (block?.type === "toolCall") contentIndex = existing.contentIndex;
+	}
+	if (contentIndex >= 0) {
+		const block = partial.content[contentIndex];
 		if (block?.type === "toolCall") {
 			block.name = name;
 			block.arguments = call.args;
 		}
+		previews.set(ompId, { contentIndex, ended: false });
 		return;
 	}
 	endLastOpenBlock(stream, partial);
 	partial.content.push({ type: "toolCall", id: ompId, name, arguments: call.args });
-	const contentIndex = partial.content.length - 1;
+	contentIndex = partial.content.length - 1;
 	previews.set(ompId, { contentIndex, ended: false });
 	stream.push({ type: "toolcall_start", contentIndex, partial });
 }
@@ -186,21 +192,27 @@ export function applyToolCall(
 	const id = projection ? ompToolCallId(projection, toolCall.id) : projectSdkToolCallId(toolCall.id);
 	const preview = projection?.previews?.get(id);
 	if (preview?.ended) return;
-	if (preview) {
+	let contentIndex = partial.content.findIndex((block) => block.type === "toolCall" && block.id === id);
+	if (contentIndex < 0 && preview) {
 		const block = partial.content[preview.contentIndex];
-		if (block?.type === "toolCall") {
-			block.id = id;
-			block.name = toolCall.name;
-			block.arguments = toolCall.arguments;
-			stream.push({ type: "toolcall_delta", contentIndex: preview.contentIndex, delta: JSON.stringify(block.arguments), partial });
-			stream.push({ type: "toolcall_end", contentIndex: preview.contentIndex, toolCall: block, partial });
-			preview.ended = true;
-			return;
+		if (block?.type === "toolCall") contentIndex = preview.contentIndex;
+	}
+	if (contentIndex >= 0) {
+		const block = partial.content[contentIndex];
+		if (block.type !== "toolCall") return;
+		block.id = id;
+		block.name = toolCall.name;
+		block.arguments = toolCall.arguments;
+		stream.push({ type: "toolcall_delta", contentIndex, delta: JSON.stringify(block.arguments), partial });
+		stream.push({ type: "toolcall_end", contentIndex, toolCall: block, partial });
+		if (projection) {
+			(projection.previews ??= new Map()).set(id, { contentIndex, ended: true });
 		}
+		return;
 	}
 	endLastOpenBlock(stream, partial);
 	partial.content.push({ type: "toolCall", id, name: toolCall.name, arguments: toolCall.arguments });
-	const contentIndex = partial.content.length - 1;
+	contentIndex = partial.content.length - 1;
 	const block = partial.content[contentIndex];
 	if (block.type !== "toolCall") return;
 	stream.push({ type: "toolcall_start", contentIndex, partial });
@@ -217,16 +229,31 @@ export function deliverWithoutUnendedPreviews(
 	keepIds: ReadonlySet<string>,
 ): AssistantMessage {
 	const previews = projection.previews;
-	if (!previews) return partial;
+	let content = partial.content;
 	let changed = false;
-	const content = partial.content.filter((block) => {
-		if (block.type !== "toolCall" || keepIds.has(block.id)) return true;
-		const preview = previews.get(block.id);
-		if (!preview || preview.ended) return true;
-		previews.delete(block.id);
+	if (previews) {
+		const filtered = partial.content.filter((block) => {
+			if (block.type !== "toolCall" || keepIds.has(block.id)) return true;
+			const preview = previews.get(block.id);
+			if (!preview || preview.ended) return true;
+			previews.delete(block.id);
+			changed = true;
+			return false;
+		});
+		if (changed) content = filtered;
+	}
+	const lastById = new Map<string, number>();
+	let toolCalls = 0;
+	for (let i = 0; i < content.length; i += 1) {
+		const block = content[i]!;
+		if (block.type !== "toolCall") continue;
+		toolCalls += 1;
+		lastById.set(block.id, i);
+	}
+	if (lastById.size < toolCalls) {
+		content = content.filter((block, index) => block.type !== "toolCall" || lastById.get(block.id) === index);
 		changed = true;
-		return false;
-	});
+	}
 	return changed ? { ...partial, content } : partial;
 }
 

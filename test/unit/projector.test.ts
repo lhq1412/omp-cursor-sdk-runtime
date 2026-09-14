@@ -133,7 +133,7 @@ describe("projector", () => {
 		expect(delivered.content.filter((block) => block.type === "toolCall").map((block) => block.type === "toolCall" ? block.id : "")).toEqual(["call-1"]);
 		expect(delivered).not.toBe(partial);
 		applyToolCall(stream, partial, { id: "orphan", name: "read", arguments: { path: "x.ts" } }, projection);
-		expect(partial.content.filter((block) => block.type === "toolCall").map((block) => block.type === "toolCall" ? block.id : "")).toEqual(["orphan", "call-1", "orphan"]);
+		expect(partial.content.filter((block) => block.type === "toolCall").map((block) => block.type === "toolCall" ? block.id : "")).toEqual(["orphan", "call-1"]);
 	});
 
 	test("does not open executable previews without an explicit park-path allow", () => {
@@ -271,6 +271,67 @@ describe("projector", () => {
 		expect(partial.content.map((block) => block.type === "toolCall" ? block.id : "")).toEqual([ompB, ompA, ompC]);
 		const delivered = deliverWithoutUnendedPreviews(partial, projection, new Set([ompA, ompC]));
 		expect(delivered.content.filter((block) => block.type === "toolCall").map((block) => block.type === "toolCall" ? block.id : "")).toEqual([ompA, ompC]);
+	});
+
+	test("applyToolCall does not record the same ID twice on one assistant message", () => {
+		const model = {
+			id: "composer-2.5",
+			provider: CURSOR_SDK_PROVIDER_ID,
+			api: CURSOR_SDK_API,
+		} as Model<Api>;
+		const stream = createAssistantMessageEventStream();
+		const partial = createEmptyAssistantMessage(model);
+		const projection: RunProjection = { answerText: "", allowToolPreview: true, sdkToOmp: new Map([["read", "read"]]) };
+		applyInteractionUpdate(stream, partial, mcpUpdate("tool-call-started", "call-1", "read", { path: "x.ts" }), projection);
+		const preview = projection.previews?.get("call-1");
+		if (preview) preview.contentIndex = 99;
+		applyToolCall(stream, partial, { id: "call-1", name: "read", arguments: { path: "a.ts" } }, projection);
+		applyToolCall(stream, partial, { id: "call-1", name: "read", arguments: { path: "a.ts" } }, projection);
+		expect(partial.content.filter((block) => block.type === "toolCall")).toEqual([
+			expect.objectContaining({ type: "toolCall", id: "call-1", arguments: { path: "a.ts" } }),
+		]);
+	});
+
+	test("delivery keeps one toolCall when keepIds matches two blocks with the same ID", () => {
+		const model = {
+			id: "composer-2.5",
+			provider: CURSOR_SDK_PROVIDER_ID,
+			api: CURSOR_SDK_API,
+		} as Model<Api>;
+		const partial = createEmptyAssistantMessage(model);
+		partial.content = [
+			{ type: "toolCall", id: "call-1", name: "read", arguments: { path: "preview" } },
+			{ type: "toolCall", id: "call-1", name: "read", arguments: { path: "final" } },
+		];
+		const projection: RunProjection = {
+			answerText: "",
+			previews: new Map([["call-1", { contentIndex: 1, ended: true }]]),
+		};
+		const delivered = deliverWithoutUnendedPreviews(partial, projection, new Set(["call-1"]));
+		expect(delivered.content.filter((block) => block.type === "toolCall")).toEqual([
+			expect.objectContaining({ type: "toolCall", id: "call-1", arguments: { path: "final" } }),
+		]);
+	});
+
+	test("a later assistant message does not replay an already-ended toolCall ID", () => {
+		const model = {
+			id: "composer-2.5",
+			provider: CURSOR_SDK_PROVIDER_ID,
+			api: CURSOR_SDK_API,
+		} as Model<Api>;
+		const stream = createAssistantMessageEventStream();
+		const first = createEmptyAssistantMessage(model);
+		const projection: RunProjection = { answerText: "" };
+		applyToolCall(stream, first, { id: "call-1", name: "read", arguments: { path: "a.ts" } }, projection);
+		expect(first.content.filter((block) => block.type === "toolCall")).toHaveLength(1);
+		const second = createEmptyAssistantMessage(model);
+		applyToolCall(stream, second, { id: "call-1", name: "read", arguments: { path: "a.ts" } }, projection);
+		applyInteractionUpdate(stream, second, mcpUpdate("tool-call-started", "call-1", "read", { path: "a.ts" }), {
+			...projection,
+			allowToolPreview: true,
+			sdkToOmp: new Map([["read", "read"]]),
+		});
+		expect(second.content.filter((block) => block.type === "toolCall")).toHaveLength(0);
 	});
 
 
