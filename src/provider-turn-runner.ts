@@ -20,7 +20,6 @@ import {
 	getLiveRun,
 } from "./live-run.js";
 import { commitTurn, disposeRuntimeForScope, finishLiveKeepAgent, finishTurnFailed, getRuntimeSlot, prepareTurn, runtimeKey, type PreparedTurn, type RuntimeSlot } from "./session-runtime.js";
-import { rememberPortableSummary } from "./session-lifecycle.js";
 import { captureCursorRequestOwner, getCursorSessionCwd, ownerForRequest, withCursorSessionOwner, type CursorSessionOwner } from "./session-scope.js";
 import { withSdkExitSuppressed } from "./sdk-exit-guard.js";
 import { ensureCursorModels, getModelMetadata, buildModelSelection } from "./catalog.js";
@@ -365,17 +364,6 @@ export class ProviderTurnRunner {
 			preparedSlot.agent === settledAgent && live.agent === settledAgent) {
 			if (partial.cursorSdk.summary) partial.cursorSdk.summary.checkpointRootBlobId = occupancy.rootBlobId;
 			partial.cursorSdk.contextOccupancy = occupancy;
-		}
-		const summaryText = partial.cursorSdk.summary?.text;
-		if (summaryText && !live.cancelled) {
-			rememberPortableSummary({
-				text: summaryText,
-				agentId: occupancy?.agentId ?? settledAgent?.agentId ?? live.agent?.agentId ?? "",
-				rootBlobId: occupancy?.rootBlobId ?? partial.cursorSdk.summary?.checkpointRootBlobId ?? "",
-				sourceContextFingerprint: preparedSlot.sendState.contextFingerprint,
-				generation: this.owner?.generation ?? 0,
-				occupancyAfter: occupancy?.usedTokens,
-			}, preparedSlot.scopeKey);
 		}
 		const delivered = deliverWithoutUnendedPreviews(partial, live.projection, new Set());
 		stream.push({ type: "done", reason: "stop", message: delivered });

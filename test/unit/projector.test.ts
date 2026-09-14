@@ -39,8 +39,12 @@ describe("projector", () => {
 		applyInteractionUpdate(stream, partial, { type: "summary-started" });
 		applyInteractionUpdate(stream, partial, { type: "summary", summary: "kept native" });
 		applyInteractionUpdate(stream, partial, { type: "summary-completed" });
-		expect(partial.cursorSdk.summary).toEqual({ count: 1, text: "kept native" });
+		expect(partial.cursorSdk.summary).toEqual({ count: 1, status: "completed", text: "kept native" });
 		expect(partial.content).toEqual([]);
+		applyInteractionUpdate(stream, partial, { type: "summary-started" });
+		expect(partial.cursorSdk.summary).toEqual({ count: 1, status: "running" });
+		applyInteractionUpdate(stream, partial, { type: "summary", summary: "replacement" });
+		expect(partial.cursorSdk.summary).toEqual({ count: 1, status: "running", text: "replacement" });
 	});
 
 	test("streams JSON arguments matching the completed tool call", async () => {

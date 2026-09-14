@@ -109,26 +109,15 @@ function sanitizeSystemPromptForCursor(systemPrompt: string): string {
 
 export function computeContextFingerprint(context: Context): string {
 	const systemHash = hashValue(serializeSystemPrompt(context.systemPrompt));
-	const messageHashes = context.messages.map((message, index) => messageHash(message, index));
+	const messageHashes = context.messages.map((message, index) => {
+		const role = "role" in message && typeof message.role === "string" ? message.role : "unknown";
+		// OMP stamps these after provider commit; neither changes model-visible history.
+		const stable = role === "assistant"
+			? { ...message, completedAt: undefined, contextSnapshot: undefined }
+			: message;
+		return hashValue(`${index}:${role}:${JSON.stringify(stable)}`);
+	});
 	return JSON.stringify({ format: NATIVE_HISTORY_FORMAT, systemHash, messageHashes });
-}
-
-function messageHash(message: unknown, index: number): string {
-	const role = isRecord(message) && typeof message.role === "string" ? message.role : "unknown";
-	const stable = role === "assistant" && isRecord(message)
-		? { ...message, completedAt: undefined, contextSnapshot: undefined }
-		: message;
-	return hashValue(`${index}:${role}:${JSON.stringify(stable)}`);
-}
-
-/** True when `messages` is a prefix of the history captured in `fingerprint` (overlap ok, gap not). */
-export function summaryCoversMessages(fingerprint: string, messages: readonly unknown[]): boolean {
-	const stored = parseFingerprint(fingerprint);
-	if (!stored || messages.length === 0 || messages.length > stored.messageHashes.length) return false;
-	for (let index = 0; index < messages.length; index += 1) {
-		if (stored.messageHashes[index] !== messageHash(messages[index], index)) return false;
-	}
-	return true;
 }
 
 export function emptySendState(): SendState {

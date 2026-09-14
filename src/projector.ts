@@ -27,6 +27,7 @@ export interface CursorAssistantMessage extends AssistantMessage {
 		};
 		summary?: {
 			count: number;
+			status: "running" | "completed";
 			text?: string;
 			checkpointRootBlobId?: string;
 		};
@@ -272,12 +273,22 @@ function hasCursorSdk(partial: AssistantMessage): partial is CursorAssistantMess
 }
 
 function applySummaryUpdate(partial: CursorAssistantMessage, update: InteractionUpdate): void {
-	const summary = partial.cursorSdk.summary ??= { count: 0 };
+	if (update.type === "summary-started") {
+		partial.cursorSdk.summary = {
+			count: partial.cursorSdk.summary?.count ?? 0,
+			status: "running",
+		};
+		return;
+	}
+	const summary = partial.cursorSdk.summary ??= { count: 0, status: "running" };
 	if (update.type === "summary") {
 		summary.text = update.summary;
 		return;
 	}
-	if (update.type === "summary-completed") summary.count += 1;
+	if (update.type === "summary-completed") {
+		summary.count += 1;
+		summary.status = "completed";
+	}
 }
 export function projectRunUsage(
 	partial: CursorAssistantMessage,
