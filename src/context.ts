@@ -11,6 +11,7 @@ import {
 	SDK_TOOL_CONTEXT,
 } from "./constants.js";
 import { CursorRecoveryBudgetError } from "./errors.js";
+import { nativeToolCallId, projectSdkToolCallId } from "./tool-call-id.js";
 
 export type SendMode = "bootstrap" | "incremental";
 
@@ -40,14 +41,8 @@ export interface PreparedSendInput {
 const NATIVE_HISTORY_FORMAT = "native-checkpoint-v1";
 const IMAGE_TOKEN_RESERVE = 4096;
 
-export function nativeToolCallId(id: string): string {
-	return createHash("sha256").update("omp-native-history:tool-call\0").update(id).digest("hex");
-}
-
-export function registerCursorToolCallIds(pi: Pick<ExtensionAPI, "on">): void {
-	pi.on("context", (event, ctx) => {
-		if (ctx.model?.api !== "openai-codex-responses") return;
-
+export function registerLegacyCursorToolCallIdMigration(pi: Pick<ExtensionAPI, "on">): void {
+	pi.on("context", (event) => {
 		const callIds = new Map<string, string>();
 		// OMP may only shallow-copy messages when structuredClone fails on details.
 		// Never mutate event.messages in place; return a new array of new objects.
@@ -59,11 +54,13 @@ export function registerCursorToolCallIds(pi: Pick<ExtensionAPI, "on">): void {
 				const content = message.content.map((block) => {
 					if (block.type !== "toolCall") return block;
 					const id = block.id;
-					if (cursorOrigin && id.length > 64) {
-						const mappedId = nativeToolCallId(id);
-						callIds.set(id, mappedId);
-						contentChanged = true;
-						return { ...block, id: mappedId };
+					if (cursorOrigin) {
+						const mappedId = projectSdkToolCallId(id);
+						if (mappedId !== id) {
+							callIds.set(id, mappedId);
+							contentChanged = true;
+							return { ...block, id: mappedId };
+						}
 					}
 					// A later call with the same raw ID owns subsequent results.
 					callIds.delete(id);

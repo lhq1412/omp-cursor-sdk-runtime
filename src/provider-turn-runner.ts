@@ -271,11 +271,11 @@ export class ProviderTurnRunner {
 			this.assertCurrent();
 			projectRunUsage(partial, live.projection, live.run?.usage);
 			for (const call of batch) {
-				applyToolCall(stream, partial, { id: call.toolCallId, name: call.name, arguments: call.args }, live.projection);
+				applyToolCall(stream, partial, { id: call.sdkToolCallId, name: call.name, arguments: call.args }, live.projection);
 			}
 			live.projection.answerText = "";
 			partial.stopReason = "toolUse";
-			const delivered = deliverWithoutUnendedPreviews(partial, live.projection, new Set(batch.map((call) => call.toolCallId)));
+			const delivered = deliverWithoutUnendedPreviews(partial, live.projection, new Set(batch.map((call) => call.ompToolCallId)));
 			stream.push({ type: "done", reason: "toolUse", message: delivered });
 			stream.end(delivered);
 			return { kind: "yielded" };

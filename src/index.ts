@@ -10,7 +10,7 @@ import { registerCursorSessionLifecycle } from "./session-lifecycle.js";
 import { registerHostToolCatalog } from "./tool-catalog.js";
 import { recordDynamicModelFetch, registerModelControls } from "./model-controls.js";
 import { sanitizeCursorProviderError } from "./errors.js";
-import { registerCursorToolCallIds } from "./context.js";
+import { registerLegacyCursorToolCallIdMigration } from "./context.js";
 import { registerCursorWebSearchTool } from "./web-search-tool.js";
 import { registerCursorUsage } from "./usage-command.js";
 import { cursorSdkUsageProvider } from "./usage-provider.js";
@@ -22,7 +22,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	registerCursorWebSearchTool(pi);
 	registerModelControls(pi);
 	registerCursorUsage(pi);
-	registerCursorToolCallIds(pi);
+	registerLegacyCursorToolCallIdMigration(pi);
 	registerCursorSessionScope(pi);
 	pi.registerProvider(CURSOR_SDK_PROVIDER_ID, {
 		baseUrl: "https://cursor.com",

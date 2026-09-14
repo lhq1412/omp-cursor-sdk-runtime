@@ -123,7 +123,7 @@ function createActor(label: "A" | "B", bridgeRunId: string): Actor {
 			[READ],
 			async (_name, _args, toolCallId) => {
 				hostCount.n += 1;
-				const parked = parkToolCall(live, "read", _args, toolCallId);
+				const parked = parkToolCall(live, "read", _args, toolCallId, toolCallId);
 				entered.get(toolCallId)?.();
 				return parked;
 			},
@@ -291,9 +291,10 @@ async function fire(
 		return;
 	}
 	if (name === "resume-results") {
-		const ids = actor.live.parked.map((call) => call.toolCallId);
-		resumeParked(actor.live, { messages: ids.map((id) => toolResult(id, `ok:${id}`)) } as Context);
-		await Promise.all(ids.map((id) => actor.callbacks.get(id)!.promise));
+		const ompIds = actor.live.parked.map((call) => call.ompToolCallId);
+		const sdkIds = actor.live.parked.map((call) => call.sdkToolCallId);
+		resumeParked(actor.live, { messages: ompIds.map((id) => toolResult(id, `ok:${id}`)) } as Context);
+		await Promise.all(sdkIds.map((id) => actor.callbacks.get(id)!.promise));
 		return;
 	}
 	if (name === "abort") {
@@ -365,7 +366,7 @@ async function parkCall(
 	observers.push(callback);
 	await entered.promise;
 	actor.parkedIds.add(id);
-	if (!actor.live.parked.some((call) => call.toolCallId === id)) boom("park", `${id} missing from parked`);
+	if (!actor.live.parked.some((call) => call.sdkToolCallId === id)) boom("park", `${id} missing from parked`);
 	if (actor.hostCount.n !== before + 1) boom("exec-count", `${id} hostCount ${actor.hostCount.n}`);
 }
 

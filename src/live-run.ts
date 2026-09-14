@@ -9,7 +9,8 @@ import type { RunProjection } from "./projector.js";
 export interface ParkedToolCall {
 	name: string;
 	args: Record<string, unknown>;
-	toolCallId: string;
+	sdkToolCallId: string;
+	ompToolCallId: string;
 	resolve: (result: HostToolResult) => void;
 	reject: (error: Error) => void;
 }
@@ -93,7 +94,13 @@ export function waitForCancelled(live: LiveRun): Promise<void> {
 	});
 }
 
-export function parkToolCall(run: LiveRun, name: string, args: Record<string, unknown>, toolCallId: string): Promise<HostToolResult> {
+export function parkToolCall(
+	run: LiveRun,
+	name: string,
+	args: Record<string, unknown>,
+	sdkToolCallId: string,
+	ompToolCallId: string,
+): Promise<HostToolResult> {
 	if (run.cancelled) {
 		return Promise.reject(new Error("Cursor SDK live run was cancelled"));
 	}
@@ -102,7 +109,7 @@ export function parkToolCall(run: LiveRun, name: string, args: Record<string, un
 			reject(new Error("Cursor SDK live run was cancelled"));
 			return;
 		}
-		run.parked.push({ name, args, toolCallId, resolve, reject });
+		run.parked.push({ name, args, sdkToolCallId, ompToolCallId, resolve, reject });
 		run.onPark?.();
 	});
 }
@@ -176,9 +183,9 @@ export function resumeParked(run: LiveRun, context: Context): void {
 			call.reject(new Error("Cursor SDK live run was cancelled"));
 			continue;
 		}
-		const result = byId.get(call.toolCallId);
+		const result = byId.get(call.ompToolCallId);
 		if (!result) {
-			call.reject(new Error(`OMP did not return a tool result for ${call.name} (${call.toolCallId})`));
+			call.reject(new Error(`OMP did not return a tool result for ${call.name} (${call.ompToolCallId})`));
 			continue;
 		}
 		call.resolve(toolResultToHost(result));

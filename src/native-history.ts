@@ -5,7 +5,7 @@ import type { Context } from "@oh-my-pi/pi-ai";
 import { buildGrpcRequest } from "@oh-my-pi/pi-ai/providers/cursor";
 import { ConversationStateStructureSchema } from "@oh-my-pi/pi-catalog/discovery/cursor-proto";
 import { toBinary } from "@oh-my-pi/pi-catalog/discovery/protobuf";
-import { nativeToolCallId } from "./context.js";
+import { nativeToolCallId } from "./tool-call-id.js";
 
 /** Project history only; the SDK remains responsible for creating and running agents. */
 export async function buildNativeHistory(history: Context["messages"], selection: ModelSelection) {

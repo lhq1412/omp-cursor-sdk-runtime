@@ -11,7 +11,7 @@ export interface SharedToolExec {
 
 /**
  * Grant-only, once-only tool execution. The execution key is
- * `bridgeRunId + toolCallId`; that id maps to one immutable name, arguments, and result.
+ * `bridgeRunId + sdkToolCallId`; that SDK-native id maps to one immutable name, arguments, and result.
  * Same payload returns the first result without reaching the host/park callback again.
  * A conflicting name or arguments throws ToolBridgeError, including while the first call is inflight.
  */

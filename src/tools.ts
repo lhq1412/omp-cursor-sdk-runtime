@@ -54,6 +54,7 @@ export interface ToolCallDedupe {
 	execute(toolCallId: string | undefined, name: string, args: Record<string, unknown>, run: () => Promise<HostToolResult>): Promise<HostToolResult>;
 }
 
+/** Dedupes one SDK custom-tool callback by SDK-native toolCallId, not the OMP projection. */
 export function createToolCallDedupe(bridgeRunId: string): ToolCallDedupe {
 	const inflight = new Map<string, { name: string; argsJson: string; promise: Promise<HostToolResult> }>();
 	const completed = new Map<string, { name: string; argsJson: string; result: HostToolResult }>();
