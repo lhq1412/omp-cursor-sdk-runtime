@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { SDK_TOOL_CONTEXT } from "../../src/constants.ts";
-import { activeUserInput, activeUserText, computeContextFingerprint, emptySendState, planSend, prepareSendInput, registerCursorToolCallIds, type ModelInputLimits } from "../../src/context.ts";
+import { activeUserInput, activeUserText, computeContextFingerprint, emptySendState, planSend, prepareSendInput, registerCursorToolCallIds, summaryCoversMessages, type ModelInputLimits } from "../../src/context.ts";
 import { CursorRecoveryBudgetError } from "../../src/errors.ts";
 import type { Context } from "@oh-my-pi/pi-ai";
 
@@ -690,5 +690,29 @@ describe("Cursor tool call context projection", () => {
 		expect(calls.content[0].id.length).toBeLessThanOrEqual(64);
 		expect(projected.messages[1]).toMatchObject({ toolCallId: calls.content[1].id });
 		expect(projected.messages[2]).toMatchObject({ toolCallId: calls.content[0].id });
+	});
+});
+
+describe("portable summary coverage", () => {
+	test("allows overlap when messagesToSummarize is a fingerprint prefix", () => {
+		const ctx = context([
+			{ role: "user", content: "a", timestamp: 1 } as Context["messages"][number],
+			{ role: "user", content: "b", timestamp: 2 } as Context["messages"][number],
+			{ role: "user", content: "c", timestamp: 3 } as Context["messages"][number],
+		]);
+		const fingerprint = computeContextFingerprint(ctx);
+		expect(summaryCoversMessages(fingerprint, ctx.messages.slice(0, 2))).toBe(true);
+		expect(summaryCoversMessages(fingerprint, ctx.messages)).toBe(true);
+	});
+
+	test("rejects a gap when the dropped prefix is longer than Cursor had", () => {
+		const seen = context([
+			{ role: "user", content: "a", timestamp: 1 } as Context["messages"][number],
+		]);
+		const dropped = context([
+			{ role: "user", content: "a", timestamp: 1 } as Context["messages"][number],
+			{ role: "user", content: "b", timestamp: 2 } as Context["messages"][number],
+		]);
+		expect(summaryCoversMessages(computeContextFingerprint(seen), dropped.messages)).toBe(false);
 	});
 });
