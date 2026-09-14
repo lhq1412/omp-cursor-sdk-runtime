@@ -15,6 +15,7 @@
 
 Preserve these boundaries:
 
+- Never edit Oh My Pi source (`oh-my-pi`, `oh-my-pi-context-mgmt`, or other OMP package trees) from this adapter. Needed host/catalog/session changes go through an upstream OMP PR and a published `@oh-my-pi/*` bump here. This checkout only owns `omp-cursor-sdk-runtime`.
 - Reject cloud `bc-*` agent IDs. Native Cursor executors remain disabled; tools run only through OMP grants. Do not broaden explicit or empty grants. The only native-tool exception is `webSearch` when OMP granted `web_search`.
 - Never set SDK `AgentOptions.systemPrompt`. The backend currently rejects `--system-prompt`; that native system-role option stays unused. Keep SDK `settingSources: []` and `mcpServers: {}`.
 - On a fresh bootstrap, import selected history natively, not as flattened send text. Prepend sanitized OMP system instructions when nonempty to the current-turn send as `System instructions from OMP:\n${sanitized}` (including the first user turn). Incremental sends omit that prefix; the existing agent retains the bootstrap. Sanitize by joining `string | string[]` with newlines; if the text does not start with `<system-conventions>`, trim it. Otherwise drop from `\n# Internal URLs\n` through the following `\n§ Workflow\n` (both markers required, else trim) and join the prefix (`trimEnd`), the literal `OMP host tool catalog and tool policy omitted: Cursor can call only Cursor SDK tools exposed in this run.`, and the Workflow suffix (`trimStart`) with `\n\n`.

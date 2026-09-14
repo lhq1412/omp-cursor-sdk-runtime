@@ -40,6 +40,64 @@ describe("send policy", () => {
 		expect(prepareSendInput(plan, second, modelLimits)).toEqual({ prompt: { text: "again" } });
 	});
 
+	test("bootstraps after a foreign-provider suffix", () => {
+		const cursorAssistant = {
+			role: "assistant",
+			content: [{ type: "text", text: "ok" }],
+			api: "cursor-sdk-agent",
+			provider: "cursor-sdk",
+			model: "composer-2.5",
+			usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+			stopReason: "stop",
+			timestamp: 2,
+		} as Context["messages"][number];
+		const first = context([
+			{ role: "user", content: "hi", timestamp: 1 } as Context["messages"][number],
+			cursorAssistant,
+		]);
+		const second = context([
+			...first.messages,
+			{ role: "user", content: "ask claude", timestamp: 3 } as Context["messages"][number],
+			{
+				role: "assistant",
+				content: [{ type: "text", text: "claude" }],
+				api: "anthropic-messages",
+				provider: "anthropic",
+				model: "claude-sonnet-4-5",
+				usage: { input: 10, output: 4, cacheRead: 0, cacheWrite: 0, totalTokens: 14, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+				stopReason: "stop",
+				timestamp: 4,
+			} as Context["messages"][number],
+			{ role: "user", content: "back to cursor", timestamp: 5 } as Context["messages"][number],
+		]);
+		expect(planSend({ bootstrapped: true, contextFingerprint: computeContextFingerprint(first), incrementalSendCount: 0 }, second)).toEqual({
+			mode: "bootstrap", resetAgent: true, reason: "context_divergence",
+		});
+	});
+
+	test("stays incremental after a cursor-sdk assistant plus current user", () => {
+		const first = context([
+			{ role: "user", content: "hi", timestamp: 1 } as Context["messages"][number],
+			{
+				role: "assistant",
+				content: [{ type: "text", text: "ok" }],
+				api: "cursor-sdk-agent",
+				provider: "cursor-sdk",
+				model: "composer-2.5",
+				usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+				stopReason: "stop",
+				timestamp: 2,
+			} as Context["messages"][number],
+		]);
+		const second = context([
+			...first.messages,
+			{ role: "user", content: "again", timestamp: 3 } as Context["messages"][number],
+		]);
+		expect(planSend({ bootstrapped: true, contextFingerprint: computeContextFingerprint(first), incrementalSendCount: 0 }, second)).toEqual({
+			mode: "incremental", resetAgent: false, reason: "incremental",
+		});
+	});
+
 	test("ignores host completion metadata added after a tool continuation", () => {
 		const toolUse = {
 			role: "assistant",

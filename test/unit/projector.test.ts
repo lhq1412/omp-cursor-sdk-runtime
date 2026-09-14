@@ -28,6 +28,25 @@ describe("projector", () => {
 		expect(partial.content).toEqual([{ type: "text", text: "Hello" }]);
 	});
 
+	test("records SDK summary text without streaming it into content", () => {
+		const model = {
+			id: "composer-2.5",
+			provider: CURSOR_SDK_PROVIDER_ID,
+			api: CURSOR_SDK_API,
+		} as Model<Api>;
+		const stream = createAssistantMessageEventStream();
+		const partial = createEmptyAssistantMessage(model);
+		applyInteractionUpdate(stream, partial, { type: "summary-started" });
+		applyInteractionUpdate(stream, partial, { type: "summary", summary: "kept native" });
+		applyInteractionUpdate(stream, partial, { type: "summary-completed" });
+		expect(partial.cursorSdk.summary).toEqual({ count: 1, status: "completed", text: "kept native" });
+		expect(partial.content).toEqual([]);
+		applyInteractionUpdate(stream, partial, { type: "summary-started" });
+		expect(partial.cursorSdk.summary).toEqual({ count: 1, status: "running" });
+		applyInteractionUpdate(stream, partial, { type: "summary", summary: "replacement" });
+		expect(partial.cursorSdk.summary).toEqual({ count: 1, status: "running", text: "replacement" });
+	});
+
 	test("streams JSON arguments matching the completed tool call", async () => {
 		const model = {
 			id: "composer-2.5",

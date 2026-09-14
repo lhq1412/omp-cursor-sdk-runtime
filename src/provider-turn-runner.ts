@@ -145,7 +145,6 @@ export class ProviderTurnRunner {
 				(this.owner && this.ownerGeneration !== undefined && this.owner.generation !== this.ownerGeneration);
 			if (this.slot) await finishTurnFailed(this.slot, "send failed");
 			delete partial.usage.contextTokens;
-			partial.cursorSdk.contextOccupancy = { status: "unavailable" };
 			partial.stopReason = aborted ? "aborted" : "error";
 			partial.errorMessage = aborted ? "Cancelled" : sanitizeCursorProviderError(error, this.apiKey);
 			stream.push({ type: "error", reason: aborted ? "aborted" : "error", error: partial });
@@ -363,7 +362,7 @@ export class ProviderTurnRunner {
 		this.assertCurrent();
 		if (occupancy && !live.cancelled && getLiveRun(preparedSlot.key) === live &&
 			preparedSlot.agent === settledAgent && live.agent === settledAgent) {
-			partial.usage.contextTokens = occupancy.usedTokens;
+			if (partial.cursorSdk.summary) partial.cursorSdk.summary.checkpointRootBlobId = occupancy.rootBlobId;
 			partial.cursorSdk.contextOccupancy = occupancy;
 		}
 		const delivered = deliverWithoutUnendedPreviews(partial, live.projection, new Set());
