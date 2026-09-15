@@ -37,6 +37,102 @@ export async function buildNativeHistory(history: Context["messages"], selection
 	return { blobs: projection.blobStore, rootBlobId };
 }
 
+export interface NativeSummaryStateProbe {
+	rootBlobId: string;
+	turns: number;
+	turnsOld: number;
+	summaryArchive: number;
+	summaryArchives: number;
+	selfSummaryCount: number;
+	summaryBytes: number;
+	summaryArchiveBytes: number;
+	summaryHash?: string;
+	archivesHash?: string;
+	usedTokens?: number;
+	maxTokens?: number;
+}
+
+export interface SummaryRunEventNote {
+	runId?: string;
+	seq: number;
+	eventType: string;
+	messageCount?: number;
+	messagesToCompact?: number;
+}
+
+export interface SummaryBoundaryObservation {
+	summaryGeneration: number;
+	beforeRoot: string | null;
+	afterRoot: string;
+	before?: NativeSummaryStateProbe;
+	after: NativeSummaryStateProbe;
+	runEvent?: SummaryRunEventNote;
+}
+
+export interface SummaryBoundaryProbe {
+	seed(root: string | null): void;
+	onSummaryStarted(agentId: string): Promise<void>;
+	onSummaryCompleted(): void;
+	onAgentUpdated(agent: {
+		agentId: string;
+		status?: string;
+		activeRunId?: string | null;
+		latestCheckpoint?: { rootBlobId: string } | null;
+	}): void;
+	onRunEvent(event: { runId?: string; eventType: string; payload?: unknown }): void;
+	flush(): Promise<SummaryBoundaryObservation | undefined>;
+}
+
+function shortHash(parts: Uint8Array[]): string {
+	const hash = createHash("sha256");
+	for (const part of parts) hash.update(part);
+	return hash.digest("hex").slice(0, 16);
+}
+
+function summaryProbeFrom(rootBlobId: string, bytes: Uint8Array): NativeSummaryStateProbe {
+	const state = ConversationStateStructureSchema.decode(bytes);
+	const archives = [
+		...(state.summaryArchive?.byteLength ? [state.summaryArchive] : []),
+		...state.summaryArchives,
+	];
+	const summaryBytes = state.summary?.byteLength ?? 0;
+	const summaryArchiveBytes = archives.reduce((n, part) => n + part.byteLength, 0);
+	return {
+		rootBlobId,
+		turns: state.turns.length,
+		turnsOld: state.turnsOld.length,
+		summaryArchive: state.summaryArchive?.byteLength ? 1 : 0,
+		summaryArchives: state.summaryArchives.length,
+		selfSummaryCount: state.selfSummaryCount,
+		summaryBytes,
+		summaryArchiveBytes,
+		...(summaryBytes && state.summary ? { summaryHash: shortHash([state.summary]) } : {}),
+		...(summaryArchiveBytes ? { archivesHash: shortHash(archives) } : {}),
+		...(state.tokenDetails ? { usedTokens: state.tokenDetails.usedTokens, maxTokens: state.tokenDetails.maxTokens } : {}),
+	};
+}
+
+function asCount(value: unknown): number | undefined {
+	return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
+}
+
+function compactCounts(payload: unknown, depth = 0): { messageCount?: number; messagesToCompact?: number } | undefined {
+	if (depth > 2 || payload === null || typeof payload !== "object") return;
+	const record = payload as Record<string, unknown>;
+	const messageCount = asCount(record.message_count ?? record.messageCount);
+	const messagesToCompact = asCount(record.messages_to_compact ?? record.messagesToCompact);
+	if (messageCount !== undefined || messagesToCompact !== undefined) {
+		return {
+			...(messageCount !== undefined ? { messageCount } : {}),
+			...(messagesToCompact !== undefined ? { messagesToCompact } : {}),
+		};
+	}
+	for (const value of Object.values(record)) {
+		const nested = compactCounts(value, depth + 1);
+		if (nested) return nested;
+	}
+}
+
 /** Read opaque checkpoint bytes only through the SDK's public, agent-scoped store. */
 export async function readNativeCheckpoint(store: LocalAgentStore, agentId: string) {
 	const agent = await store.agents.get({ agentId });
@@ -44,7 +140,7 @@ export async function readNativeCheckpoint(store: LocalAgentStore, agentId: stri
 	if (agent.latestCheckpoint && agent.latestCheckpoint.schemaVersion !== 1) throw new Error("Unsupported checkpoint schema");
 	const rootBlobId = agent.latestCheckpoint?.rootBlobId;
 	const bytes = rootBlobId ? await store.checkpoints.get({ agentId, blobId: rootBlobId }) : null;
-	const tokenDetails = bytes ? ConversationStateStructureSchema.decode(bytes).tokenDetails : undefined;
+	const probe = bytes && rootBlobId ? summaryProbeFrom(rootBlobId, bytes) : null;
 	const current = await store.agents.get({ agentId });
 	return {
 		agentId: agent.agentId,
@@ -57,7 +153,118 @@ export async function readNativeCheckpoint(store: LocalAgentStore, agentId: stri
 			current.status === agent.status && current.activeRunId === agent.activeRunId &&
 			current.latestCheckpoint?.rootBlobId === rootBlobId &&
 			current.latestCheckpoint?.schemaVersion === agent.latestCheckpoint?.schemaVersion,
-		tokenDetails: tokenDetails ? { usedTokens: tokenDetails.usedTokens, maxTokens: tokenDetails.maxTokens } : null,
+		tokenDetails: probe && probe.usedTokens !== undefined && probe.maxTokens !== undefined
+			? { usedTokens: probe.usedTokens, maxTokens: probe.maxTokens }
+			: null,
+		probe,
+	};
+}
+
+export async function readCheckpointProbe(store: LocalAgentStore, agentId: string, blobId: string) {
+	try {
+		const bytes = await store.checkpoints.get({ agentId, blobId });
+		return bytes ? summaryProbeFrom(blobId, bytes) : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+export function createSummaryBoundaryProbe(store: LocalAgentStore): SummaryBoundaryProbe {
+	let startSeq = 0;
+	let generation = 0;
+	let waiting = false;
+	let cycleOpen = false;
+	let latestRoot: string | null = null;
+	let beforeRoot: string | null = null;
+	let before: NativeSummaryStateProbe | undefined;
+	let afterRoot: string | undefined;
+	let observation: SummaryBoundaryObservation | undefined;
+	let capturing: Promise<void> | undefined;
+	let beforeCapture: Promise<void> | undefined;
+	let eventSeq = 0;
+	let usedSeq = 0;
+	let latest: SummaryRunEventNote | undefined;
+	let cycleRunEvent: SummaryRunEventNote | undefined;
+
+	async function capture(agentId: string, root: string) {
+		if (beforeCapture) await beforeCapture;
+		const after = await readCheckpointProbe(store, agentId, root);
+		if (!after || afterRoot !== root) return;
+		waiting = false;
+		cycleOpen = false;
+		const attached = cycleRunEvent && cycleRunEvent.seq > usedSeq ? cycleRunEvent : undefined;
+		if (attached) usedSeq = attached.seq;
+		cycleRunEvent = undefined;
+		observation = {
+			summaryGeneration: generation,
+			beforeRoot,
+			afterRoot: root,
+			...(before ? { before } : {}),
+			after,
+			...(attached ? { runEvent: attached } : {}),
+		};
+	}
+
+	return {
+		seed(root) {
+			if (!waiting) latestRoot = root;
+		},
+		onSummaryStarted(agentId) {
+			const token = ++startSeq;
+			waiting = false;
+			if (cycleRunEvent && cycleRunEvent.seq > usedSeq) usedSeq = cycleRunEvent.seq;
+			cycleOpen = true;
+			afterRoot = undefined;
+			observation = undefined;
+			capturing = undefined;
+			beforeRoot = latestRoot;
+			before = undefined;
+			cycleRunEvent = latest && latest.seq > usedSeq ? latest : undefined;
+			beforeCapture = (async () => {
+				const probe = beforeRoot
+					? await readCheckpointProbe(store, agentId, beforeRoot)
+					: (await readNativeCheckpoint(store, agentId).catch(() => undefined))?.probe ?? undefined;
+				if (token !== startSeq) return;
+				before = probe;
+				if (probe) beforeRoot = probe.rootBlobId;
+			})();
+			return beforeCapture;
+		},
+		onSummaryCompleted() {
+			generation += 1;
+			waiting = true;
+			cycleOpen = false;
+		},
+		onAgentUpdated(agent) {
+			const root = agent.latestCheckpoint?.rootBlobId ?? null;
+			if (!waiting) {
+				latestRoot = root;
+				return;
+			}
+			if (agent.status !== "idle" || agent.activeRunId || !root || root === beforeRoot || afterRoot) return;
+			afterRoot = root;
+			capturing = capture(agent.agentId, root);
+		},
+		onRunEvent(event) {
+			const counts = compactCounts(event.payload);
+			const type = event.eventType.toLowerCase();
+			if (!counts && !type.includes("compact") && !type.includes("summar")) return;
+			eventSeq += 1;
+			latest = {
+				seq: eventSeq,
+				eventType: event.eventType,
+				...(event.runId ? { runId: event.runId } : {}),
+				...counts,
+			};
+			if (cycleOpen && latest.seq > usedSeq) cycleRunEvent = latest;
+		},
+		async flush() {
+			if (beforeCapture) await beforeCapture;
+			if (capturing) await capturing;
+			const result = observation;
+			observation = undefined;
+			return result;
+		},
 	};
 }
 
