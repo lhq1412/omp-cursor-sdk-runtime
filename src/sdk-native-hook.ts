@@ -11,7 +11,14 @@ export const NATIVE_OMP_TO_SDK = {
 	grep: "grep",
 	bash: "shell",
 	edit: "edit",
+	glob: "glob",
+	write: "write",
 } as const;
+
+/** Extra SDK allowlist names enabled by an OMP grant. Native ls executes as OMP read. */
+const NATIVE_OMP_EXTRA_SDK: Record<string, readonly string[]> = {
+	read: ["ls"],
+};
 
 const TOKEN_TO_OMP = {
 	readArgs: "read",
@@ -19,7 +26,16 @@ const TOKEN_TO_OMP = {
 	shellArgs: "bash",
 	shellStreamArgs: "bash",
 	writeArgs: "write",
+	globArgs: "glob",
+	GlobToolArgs: "glob",
+	piFindArgs: "glob",
+	lsArgs: "read",
+	piLsArgs: "read",
 } as const;
+
+const GLOB_TOKENS = new Set(["globArgs", "GlobToolArgs", "piFindArgs"]);
+const LS_TOKENS = new Set(["lsArgs", "piLsArgs"]);
+const PI_OUTPUT_TOKENS = new Set(["piFindArgs", "piLsArgs"]);
 
 export type NativeToolExecutor = (name: string, args: Record<string, unknown>, toolCallId: string) => Promise<HostToolResult>;
 export type NativeReadExecutor = (args: Record<string, unknown>, toolCallId: string) => Promise<HostToolResult>;
@@ -38,9 +54,13 @@ export function resourceArgsName(token: object): string | undefined {
 export function nativeSdkToolsFromGrants(names: readonly string[]): string[] {
 	if (!nativeReadHooked) return [];
 	const tools: string[] = [];
+	const add = (sdk: string) => {
+		if (!tools.includes(sdk)) tools.push(sdk);
+	};
 	for (const name of names) {
 		const sdk = NATIVE_OMP_TO_SDK[name as keyof typeof NATIVE_OMP_TO_SDK];
-		if (sdk && !tools.includes(sdk)) tools.push(sdk);
+		if (sdk) add(sdk);
+		for (const extra of NATIVE_OMP_EXTRA_SDK[name] ?? []) add(extra);
 	}
 	return tools;
 }
@@ -72,6 +92,22 @@ function str(args: Record<string, unknown>, ...keys: string[]): string {
 		if (typeof value === "string") return value;
 	}
 	return "";
+}
+
+function joinGlobPath(base: string, pattern: string): string {
+	if (/^(?:\/|[A-Za-z]:[\\/])/.test(pattern)) return pattern;
+	if (!base || base === ".") return pattern;
+	return `${base.replace(/\/+$/, "")}/${pattern.replace(/^\/+/, "")}`;
+}
+
+export function mapGlobArgs(args: Record<string, unknown>): { args: Record<string, unknown> } | { error: string } {
+	const pattern = str(args, "globPattern", "glob_pattern", "pattern");
+	if (!pattern.trim()) return { error: "glob pattern is required (received an empty pattern)." };
+	const dir = str(args, "targetDirectory", "target_directory", "path");
+	const mapped: Record<string, unknown> = { path: joinGlobPath(dir, pattern) };
+	const limit = args.limit;
+	if (typeof limit === "number" && Number.isFinite(limit)) mapped.limit = Math.max(1, Math.floor(limit));
+	return { args: mapped };
 }
 
 export function ompReadToSdkResult(path: string, result: HostToolResult): object {
@@ -163,6 +199,72 @@ export function ompWriteToSdkResult(path: string, result: HostToolResult): objec
 	};
 }
 
+export function ompGlobToSdkResult(token: string, args: Record<string, unknown>, result: HostToolResult): object {
+	const text = textOf(result);
+	if (result.isError) {
+		return { result: { case: "error", value: { error: text || "glob failed" } } };
+	}
+	if (PI_OUTPUT_TOKENS.has(token)) {
+		return { result: { case: "success", value: { output: text } } };
+	}
+	const files = text.split("\n").map((line) => line.trim()).filter(Boolean);
+	const pattern = str(args, "globPattern", "glob_pattern", "pattern");
+	const path = str(args, "targetDirectory", "target_directory", "path") || ".";
+	return {
+		result: {
+			case: "success",
+			value: { pattern, path, files, totalFiles: files.length, clientTruncated: false, ripgrepTruncated: false },
+		},
+	};
+}
+
+export function ompLsToSdkResult(token: string, path: string, result: HostToolResult): object {
+	const text = textOf(result);
+	if (result.isError) {
+		return token === "lsArgs"
+			? { result: { case: "error", value: { path, error: text || "ls failed" } } }
+			: { result: { case: "error", value: { error: text || "ls failed" } } };
+	}
+	if (PI_OUTPUT_TOKENS.has(token)) {
+		return { result: { case: "success", value: { output: text } } };
+	}
+	const dirs: Array<{ absPath: string; childrenDirs: unknown[]; childrenFiles: unknown[]; childrenWereProcessed: boolean; fullSubtreeExtensionCounts: Record<string, number>; numFiles: number }> = [];
+	const files: Array<{ name: string }> = [];
+	for (const line of text.split("\n")) {
+		const name = line.trim().replace(/^\.\//, "");
+		if (!name || name.endsWith(":")) continue;
+		const base = name.replace(/\/+$/, "").split("/").filter(Boolean).pop() ?? name.replace(/\/+$/, "");
+		if (!base) continue;
+		if (name.endsWith("/")) {
+			dirs.push({
+				absPath: joinGlobPath(path, base),
+				childrenDirs: [],
+				childrenFiles: [],
+				childrenWereProcessed: false,
+				fullSubtreeExtensionCounts: {},
+				numFiles: 0,
+			});
+		} else {
+			files.push({ name: base });
+		}
+	}
+	return {
+		result: {
+			case: "success",
+			value: {
+				directoryTreeRoot: {
+					absPath: path,
+					childrenDirs: dirs,
+					childrenFiles: files,
+					childrenWereProcessed: true,
+					fullSubtreeExtensionCounts: {},
+					numFiles: files.length,
+				},
+			},
+		},
+	};
+}
+
 function optionalLine(value: unknown): number | undefined {
 	return typeof value === "number" && value !== 0 ? value : undefined;
 }
@@ -195,10 +297,11 @@ function mapShellArgs(args: Record<string, unknown>): Record<string, unknown> {
 }
 
 function unavailable(token: string, args: Record<string, unknown>): object {
-	const path = str(args, "path");
+	const path = str(args, "path") || str(args, "targetDirectory", "target_directory");
 	const command = str(args, "command");
-	if (token === "readArgs") return { result: { case: "rejected", value: { path, reason: "OMP host unavailable" } } };
-	if (token === "writeArgs") return { result: { case: "rejected", value: { path, reason: "OMP host unavailable" } } };
+	if (token === "readArgs" || token === "writeArgs" || token === "lsArgs") {
+		return { result: { case: "rejected", value: { path, reason: "OMP host unavailable" } } };
+	}
 	if (token === "shellArgs" || token === "shellStreamArgs") {
 		return { result: { case: "rejected", value: { command, workingDirectory: str(args, "workingDirectory", "working_directory"), reason: "OMP host unavailable" } } };
 	}
@@ -231,6 +334,17 @@ async function executeNative(token: string, args: Record<string, unknown>): Prom
 		if (token === "shellArgs" || token === "shellStreamArgs") {
 			return ompShellToSdkResult(args, await run("bash", mapShellArgs(args), execId));
 		}
+		if (GLOB_TOKENS.has(token)) {
+			const prepared = mapGlobArgs(args);
+			if ("error" in prepared) {
+				return ompGlobToSdkResult(token, args, { content: [{ type: "text", text: prepared.error }], isError: true });
+			}
+			return ompGlobToSdkResult(token, args, await run("glob", prepared.args, execId));
+		}
+		if (LS_TOKENS.has(token)) {
+			const path = str(args, "path") || ".";
+			return ompLsToSdkResult(token, path, await run("read", { path }, execId));
+		}
 		const path = str(args, "path");
 		const content = str(args, "fileText", "file_text");
 		return ompWriteToSdkResult(path, await run("write", { path, content }, execId));
@@ -241,9 +355,10 @@ async function executeNative(token: string, args: Record<string, unknown>): Prom
 }
 
 function ompToError(token: string, args: Record<string, unknown>, message: string): object {
-	const path = str(args, "path");
-	if (token === "readArgs") return { result: { case: "error", value: { path, error: message } } };
-	if (token === "writeArgs") return { result: { case: "error", value: { path, error: message } } };
+	const path = str(args, "path") || str(args, "targetDirectory", "target_directory");
+	if (token === "readArgs" || token === "writeArgs" || token === "lsArgs") {
+		return { result: { case: "error", value: { path, error: message } } };
+	}
 	if (token === "shellArgs" || token === "shellStreamArgs") {
 		return ompShellToSdkResult(args, { content: [{ type: "text", text: message }], isError: true });
 	}

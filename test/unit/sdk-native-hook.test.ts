@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mapNativeReadPath, ompGrepToSdkResult, ompReadToSdkResult, ompShellToSdkResult, ompWriteToSdkResult, resourceArgsName } from "../../src/sdk-native-hook.ts";
+import { mapGlobArgs, mapNativeReadPath, nativeSdkToolsFromGrants, ompGlobToSdkResult, ompGrepToSdkResult, ompLsToSdkResult, ompReadToSdkResult, ompShellToSdkResult, ompWriteToSdkResult, resourceArgsName } from "../../src/sdk-native-hook.ts";
 
 describe("resourceArgsName", () => {
 	test("reads the Args name from remoteImplementation source", () => {
@@ -8,6 +8,11 @@ describe("resourceArgsName", () => {
 			remoteImplementation: ($) => new Object($, "readArgs", "readResult"),
 		};
 		expect(resourceArgsName(token)).toBe("readArgs");
+	});
+
+	test("reads GlobToolArgs and piFindArgs names", () => {
+		expect(resourceArgsName({ remoteImplementation: () => "GlobToolArgs" })).toBe("GlobToolArgs");
+		expect(resourceArgsName({ remoteImplementation: () => 'x1("piFindArgs")' })).toBe("piFindArgs");
 	});
 
 	test("ignores tokens without an Args signature", () => {
@@ -141,5 +146,105 @@ describe("ompWriteToSdkResult", () => {
 			content: [{ type: "text", text: "denied" }],
 			isError: true,
 		})).toEqual({ result: { case: "error", value: { path: "/tmp/a.ts", error: "denied" } } });
+	});
+});
+
+describe("mapGlobArgs", () => {
+	test("joins targetDirectory and globPattern onto OMP path", () => {
+		expect(mapGlobArgs({ globPattern: "**/*.ts", targetDirectory: "src" })).toEqual({ args: { path: "src/**/*.ts" } });
+	});
+
+	test("uses a lone pattern as the OMP path", () => {
+		expect(mapGlobArgs({ pattern: "*.md" })).toEqual({ args: { path: "*.md" } });
+	});
+
+	test("rejects an empty pattern", () => {
+		expect(mapGlobArgs({ globPattern: "  ", targetDirectory: "src" })).toEqual({
+			error: "glob pattern is required (received an empty pattern).",
+		});
+	});
+
+	test("clamps a present limit to at least 1", () => {
+		expect(mapGlobArgs({ globPattern: "*", limit: 0 })).toEqual({ args: { path: "*", limit: 1 } });
+	});
+});
+
+describe("ompGlobToSdkResult", () => {
+	test("maps host lines onto GlobToolSuccess files", () => {
+		expect(ompGlobToSdkResult("GlobToolArgs", { globPattern: "*.ts", targetDirectory: "src" }, {
+			content: [{ type: "text", text: "src/a.ts\nsrc/b.ts\n" }],
+			isError: false,
+		})).toEqual({
+			result: {
+				case: "success",
+				value: {
+					pattern: "*.ts",
+					path: "src",
+					files: ["src/a.ts", "src/b.ts"],
+					totalFiles: 2,
+					clientTruncated: false,
+					ripgrepTruncated: false,
+				},
+			},
+		});
+	});
+
+	test("maps piFind onto an output string", () => {
+		expect(ompGlobToSdkResult("piFindArgs", { pattern: "*.ts" }, {
+			content: [{ type: "text", text: "a.ts" }],
+			isError: false,
+		})).toEqual({ result: { case: "success", value: { output: "a.ts" } } });
+	});
+
+	test("maps host errors onto the glob error envelope", () => {
+		expect(ompGlobToSdkResult("GlobToolArgs", { globPattern: "*" }, {
+			content: [{ type: "text", text: "denied" }],
+			isError: true,
+		})).toEqual({ result: { case: "error", value: { error: "denied" } } });
+	});
+});
+
+describe("ompLsToSdkResult", () => {
+	test("maps a directory listing onto a flat tree", () => {
+		expect(ompLsToSdkResult("lsArgs", "src", {
+			content: [{ type: "text", text: "a.ts\nlib/\n" }],
+			isError: false,
+		})).toEqual({
+			result: {
+				case: "success",
+				value: {
+					directoryTreeRoot: {
+						absPath: "src",
+						childrenDirs: [{
+							absPath: "src/lib",
+							childrenDirs: [],
+							childrenFiles: [],
+							childrenWereProcessed: false,
+							fullSubtreeExtensionCounts: {},
+							numFiles: 0,
+						}],
+						childrenFiles: [{ name: "a.ts" }],
+						childrenWereProcessed: true,
+						fullSubtreeExtensionCounts: {},
+						numFiles: 1,
+					},
+				},
+			},
+		});
+	});
+
+	test("maps piLs onto an output string", () => {
+		expect(ompLsToSdkResult("piLsArgs", ".", {
+			content: [{ type: "text", text: "a.ts" }],
+			isError: false,
+		})).toEqual({ result: { case: "success", value: { output: "a.ts" } } });
+	});
+});
+
+describe("nativeSdkToolsFromGrants", () => {
+	test("maps OMP grants onto SDK names and adds ls from read", () => {
+		expect(nativeSdkToolsFromGrants(["read", "glob", "write", "bash"])).toEqual(
+			expect.arrayContaining(["read", "ls", "glob", "write", "shell"]),
+		);
 	});
 });

@@ -4,7 +4,7 @@ Independent [Oh My Pi (OMP)](https://github.com/can1357/oh-my-pi) provider adapt
 
 The extension registers models under **`cursor-sdk/*`**. It does not replace or modify OMP's built-in **`cursor/*`** provider. The sole reuse is its pure local history mapper and protobuf codec; authentication, transport, agent execution, and resume remain on the official Cursor SDK, never the built-in provider's network or executor paths.
 
-OMP owns sessions, permissions, tools, and UI. This package binds a local Cursor SDK agent onto the current OMP session leaf and executes tools only through the OMP host. Native Cursor executors stay disallowed except hooked `read`/`grep`/`shell`/`edit`.
+OMP owns sessions, permissions, tools, and UI. This package binds a local Cursor SDK agent onto the current OMP session leaf and executes tools only through the OMP host. Native Cursor executors stay disallowed except hooked `read`/`grep`/`shell`/`edit`/`glob`/`write`/`ls`.
 
 This is a separate adapter from [lhq1412/omp-cursor-sdk](https://github.com/lhq1412/omp-cursor-sdk). That package keeps Cursor's native agent loop and optional Cloud; this package uses SDK local in-process runtime with a park-and-yield tool loop so stock brew OMP can approve and run tools.
 
@@ -117,7 +117,7 @@ SDK preset variants are valid selections independently of advertised parameter d
 
 ## Tools
 
-On stock brew OMP, `context.tools` plus xd://-mounted tools (including enabled `mcp__*` MCP tools) are mapped to Cursor SDK custom tools. When the native hook installs, granted OMP `read`/`grep`/`bash`/`edit` are advertised as Cursor `read`/`grep`/`shell`/`edit` and intercepted back to the OMP host (`edit` executes as OMP `write`). `glob`, `ls`, `delete`, and `task` stay disallowed. SDK `settingSources` is always `[]`; `mcpServers` is always `{}`.
+On stock brew OMP, `context.tools` plus xd://-mounted tools (including enabled `mcp__*` MCP tools) are mapped to Cursor SDK custom tools. When the native hook installs, granted OMP `read`/`grep`/`bash`/`edit`/`glob`/`write` are advertised as Cursor `read`/`grep`/`shell`/`edit`/`glob`/`write` (and `ls` when `read` is granted) and intercepted back to the OMP host (`edit` executes as OMP `write`; `ls` executes as OMP `read`). `delete` and `task` stay disallowed. SDK `settingSources` is always `[]`; `mcpServers` is always `{}`.
 
 The extension shadows OMP `web_search`. Non-`cursor-sdk` models try an isolated Cursor SDK agent with only `webSearch` (no shell/edit/MCP/session resume), using `/login cursor-sdk` or `CURSOR_API_KEY`. If Cursor is missing, fails, or finishes without calling `webSearch`, it falls back to OMP's native search chain via `ctx.invokeTool`. `cursor-sdk/*` does not bridge that wrapper as a custom tool; when OMP granted `web_search`, the session agent may use native `webSearch` only.
 
@@ -152,7 +152,7 @@ ${sanitized}
 
 followed by the current user/developer input (including a first turn), or an explicit continuation. For bootstrap with nonempty selected history after whole-interaction trimming, `SDK_TOOL_CONTEXT` plus a blank line sits after the sanitized system prefix and before the current input/continuation. Prior history is not flattened into this send. Incremental rounds omit both prefixes; first-user/no-history sends omit only the tool-context cue. Empty or missing system text omits the OMP system prefix. `activeUserInput` selects only the final user/developer message, never an older user request. The reuse fingerprint hashes the original raw joined system text and full messages and requires `native-checkpoint-v1`: raw system changes and old flattened-history bindings force fresh import.
 
-Imported history bypasses the SDK's initial environment block advertising its public `custom-user-tools` namespace. The minimal cue tells the model to discover schemas there for remaining granted tools and that hooked native `read`/`grep`/`shell`/`edit` are available when the interceptor installed; it does not grant tools or copy SDK environment/user rules or schemas. Its full text counts toward the existing bootstrap budget. If optional history trims to empty, the cue is omitted; required recovery still fails if its retained interaction and cue cannot fit. The default SDK system prompt remains native and separate from the sanitized OMP prefix.
+Imported history bypasses the SDK's initial environment block advertising its public `custom-user-tools` namespace. The minimal cue tells the model to discover schemas there for remaining granted tools and that hooked native `read`/`grep`/`shell`/`edit`/`glob`/`write`/`ls` are available when the interceptor installed; it does not grant tools or copy SDK environment/user rules or schemas. Its full text counts toward the existing bootstrap budget. If optional history trims to empty, the cue is omitted; required recovery still fails if its retained interaction and cue cannot fit. The default SDK system prompt remains native and separate from the sanitized OMP prefix.
 
 Sanitizer (`serializeSystemPrompt` joins `string | string[]` with newlines):
 
