@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { resolveMCPToolAlias } from "@oh-my-pi/pi-coding-agent/mcp";
 import { grantedToolsFromContext, trailingToolResults } from "../../src/omp-tools.ts";
 import type { Context, Tool } from "@oh-my-pi/pi-ai";
 
@@ -27,6 +28,40 @@ describe("OMP tools from context", () => {
 			tools: [tool("read"), tool("web_search")],
 		});
 		expect(granted.map((item) => item.name)).toEqual(["read"]);
+	});
+
+	test("preserves exact MCP names and schemas from the authoritative context", () => {
+		const granted = grantedToolsFromContext({
+			messages: [],
+			tools: [
+				tool("mcp__server_tool", {
+					parameters: { type: "object", properties: { legacy: { type: "string" } }, required: ["legacy"] },
+				}),
+				tool("mcp__server__tool", {
+					parameters: { type: "object", properties: { canonical: { type: "number" } }, required: ["canonical"] },
+				}),
+			],
+		});
+		expect(granted.map((item) => item.name)).toEqual(["mcp__server_tool", "mcp__server__tool"]);
+		expect(granted.map((item) => item.inputSchema)).toEqual([
+			{ type: "object", properties: { legacy: { type: "string" } }, required: ["legacy"] },
+			{ type: "object", properties: { canonical: { type: "number" } }, required: ["canonical"] },
+		]);
+	});
+
+	test("matches OMP's exact, unique, ambiguous, and unknown MCP alias resolution", () => {
+		const registered: Record<string, { name: string }> = {
+			mcp__server_tool: { name: "mcp__server_tool" },
+			mcp__foo_bar_foo_bar_baz: { name: "mcp__foo_bar_foo_bar_baz" },
+			mcp__foo_bar_baz: { name: "mcp__foo_bar_baz" },
+		};
+		const resolve = (name: string) =>
+			registered[name] ?? resolveMCPToolAlias(name, (candidate) => registered[candidate]);
+
+		expect(resolve("mcp__server_tool")?.name).toBe("mcp__server_tool");
+		expect(resolve("mcp__server__tool")?.name).toBe("mcp__server_tool");
+		expect(resolve("mcp__foo__bar__foo_bar_baz")).toBeUndefined();
+		expect(resolve("mcp__missing__tool")).toBeUndefined();
 	});
 
 	test("appends OMP tool examples to the custom-tool description", () => {

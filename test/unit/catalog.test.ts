@@ -405,6 +405,10 @@ describe("hydration", () => {
 			{ id: "fast", value: "false" },
 		]);
 		expect(buildModelSelection("model-a", "off")).toEqual({ id: "model-a" });
+		expect(() => buildModelSelection("removed-model", "off", { apiKey: "key-a" })).toThrow(
+			/Cursor SDK model "removed-model" is no longer available in the live catalog/,
+		);
+		expect(buildModelSelection("removed-model", "off", { apiKey: "unknown-key" })).toEqual({ id: "removed-model" });
 	});
 
 	test("composer fallback metadata is available before network", () => {
@@ -412,6 +416,7 @@ describe("hydration", () => {
 		expect(getModelMetadata("composer-2.5")?.supportsReasoning).toBe(false);
 		expect(getModelMetadata("gpt-5.5")).toBeUndefined();
 		expect(buildModelSelection("missing", "high")).toEqual({ id: "missing" });
+		expect(buildModelSelection("missing", "high", { apiKey: "unhydrated-key" })).toEqual({ id: "missing" });
 	});
 });
 

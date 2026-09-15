@@ -30,9 +30,9 @@ Preserve these boundaries:
 ## Key Directories
 
 - `src/`: flat adapter modules; keep provider orchestration, context translation and session persistence separated.
-- `test/unit/`: module-focused behavioral tests; `test/helpers/`: shared host doubles.
-- `scripts/`: import-boundary check and optional live SDK contract probe.
-- `.github/workflows/`: CI verification and manual release automation.
+- `test/unit/`: module-focused behavioral tests; `test/compat/`: real installed OMP host/cache contracts; `test/helpers/`: shared host doubles.
+- `scripts/`: deep-import enforcement, offline OMP and live SDK contract probes, and isolated packed-plugin install smoke.
+- `.github/workflows/`: shared CI verification; manual release must pass the same verification before publishing.
 
 ## Development Commands
 
@@ -41,12 +41,14 @@ npm ci                         # reproducible install from package-lock.json
 npm run typecheck              # tsc --noEmit
 npm test                       # bun test --isolate test
 bun test --isolate test/unit/context.test.ts  # focused test
-npm run check:boundaries        # forbidden imports in src/
+npm run check:boundaries        # approved imports in src/ and scripts/
 npm pack --dry-run              # inspect package contents (also checked by CI)
 omp plugin link .              # load this checkout into OMP
 omp models cursor-sdk          # verify provider discovery
 omp --model cursor-sdk/composer-2.5
 npm run probe:sdk              # live SDK calls; requires CURSOR_API_KEY
+npm run probe:omp              # offline OMP codec/model/tool/package contracts
+npm run smoke:install          # real packed-plugin install in a temporary home
 ```
 
 There is no build, lint, formatter or start script. OMP loads TypeScript directly; do not introduce a `dist/` workflow. Restart OMP after source changes. If linking leaves the model list empty, follow README's `~/.omp/plugins/package.json` file-dependency setup. Authenticate with `/login cursor-sdk` inside OMP or `CURSOR_API_KEY`; built-in Cursor OAuth/Desktop/CLI credentials are not SDK keys.
@@ -58,12 +60,12 @@ There is no build, lint, formatter or start script. OMP loads TypeScript directl
 - Reuse plain functions and typed host contracts rather than adding a DI container. Existing tests inject agents through `__testUtils.setOpenAgent`; runtime state lives in module-level Maps/objects with explicit reset/dispose hooks.
 - Streaming starts through `queueMicrotask`; live execution races completion, parked tools and cancellation. Route aborts through live-run cancellation so pending callbacks are rejected and the SDK run is cancelled, not merely the output stream closed.
 - Use plain `Error` for runtime failures and existing `ToolBridgeError`/`CloudAgentRejectedError` for their domains. Preserve provider error-event and failed-binding cleanup paths. Deduplicate tool execution by `toolCallId`.
-- Only `src/native-history.ts` may reuse these user-authorized pure conversion imports: `buildGrpcRequest` from `@oh-my-pi/pi-ai/providers/cursor`, `ConversationStateStructureSchema` from `@oh-my-pi/pi-catalog/discovery/cursor-proto`, and `toBinary` from `@oh-my-pi/pi-catalog/discovery/protobuf`. Discard `requestBytes`; never invoke built-in provider transport, auth or executors. `src/sdk-native-hook.ts` may import pure Cursor→OMP arg translation from `@oh-my-pi/pi-ai/providers/cursor-pi-args`. Never import `@oh-my-pi/pi-ai/utils` — that entry is `src/utils.ts`, which imports `@oh-my-pi/pi-utils` and OMP's plugin loader cannot resolve it. SDK local-resource result envelopes stay adapter-owned. All other built-in Cursor implementation imports and `@cursor/sdk/dist/internal` remain forbidden; `src/constants.ts` defines the boundary-script rules.
+- Within runtime source, only `src/native-history.ts` may reuse these user-authorized pure conversion imports: `buildGrpcRequest` from `@oh-my-pi/pi-ai/providers/cursor`, `ConversationStateStructureSchema` from `@oh-my-pi/pi-catalog/discovery/cursor-proto`, and `toBinary` from `@oh-my-pi/pi-catalog/discovery/protobuf`. Discard `requestBytes`; never invoke built-in provider transport, auth or executors. `src/sdk-native-hook.ts` may import pure Cursor→OMP arg translation from `@oh-my-pi/pi-ai/providers/cursor-pi-args`. Never import `@oh-my-pi/pi-ai/utils` — that entry is `src/utils.ts`, which imports `@oh-my-pi/pi-utils` and OMP's plugin loader cannot resolve it. SDK local-resource result envelopes stay adapter-owned. `scripts/check-boundaries.ts` denies unapproved OMP deep imports by file and symbol, including explicit ownership for taxonomy, model exports, and the offline contract probe's decoding fixtures. `src/constants.ts` retains the forbidden built-in Cursor and SDK-internal import patterns.
 
 ## Important Files
 
 - `package.json`: scripts, runtime engines, pinned dependencies and `omp.extensions` entry point; `package-lock.json`: canonical dependency resolution.
-- `tsconfig.json`: strict, no-emit checks of `src/` only; tests and scripts are excluded.
+- `tsconfig.json`: strict, no-emit checks of `src/` and `scripts/omp-contract-probe.ts`; tests and other scripts are excluded.
 - `src/provider.ts`, `src/provider-turn-runner.ts`, `src/session-runtime.ts`, `src/live-run.ts`: turn, tool-continuation and cancellation flow.
 - `src/session-resume.ts`, `src/context.ts`, `src/tool-call-id.ts`, `src/native-history.ts`, `src/sdk-session.ts`: persisted binding validity, send planning, SDK↔OMP tool-call IDs, and native checkpoint import; read these before changing agent reuse.
 - `src/model-controls.ts`: `/cursor-fast`, `/cursor-refresh-models`, CLI flags, and session-fold of `cursor-fast-state`.
@@ -74,7 +76,7 @@ There is no build, lint, formatter or start script. OMP loads TypeScript directl
 
 ## Runtime/Tooling Preferences
 
-Use **Bun ≥1.3.14** for OMP/runtime tests; Node alone is not the supported test executor. The manifest also requires **Node ≥22.19.0**. Use **npm** for repository installs and lockfile updates; the npm lockfile is canonical. Current exact runtime pins are `@cursor/sdk` **1.0.31** and `@oh-my-pi/pi-ai`, `@oh-my-pi/pi-catalog`, `@oh-my-pi/pi-coding-agent` **18.1.18**. Treat upgrades as SDK/host contract changes, not routine version bumps.
+Use **Bun ≥1.3.14** for OMP/runtime tests; Node alone is not the supported test executor. The manifest also requires **Node ≥22.19.0**. Use **npm** for repository installs and lockfile updates; the npm lockfile is canonical. Current exact runtime pins are `@cursor/sdk` **1.0.31** and `@oh-my-pi/pi-ai`, `@oh-my-pi/pi-catalog`, `@oh-my-pi/pi-coding-agent`, `@oh-my-pi/pi-utils` **18.2.0**. Treat upgrades as SDK/host contract changes, not routine version bumps.
 
 ## Testing & QA
 
@@ -82,4 +84,4 @@ Tests use `bun:test` (`describe`, `test`, `expect`) in `test/unit/<module>.test.
 
 Prioritize observable contracts: bootstrap versus incremental sends, sanitized system instructions on bootstrap only, committed resume eligibility, branch/cwd/credential invalidation, tool grants and deduplication, parked-call continuation and cancellation, write-time portable tool-call IDs, provider-neutral legacy session ID migration that does not collapse duplicate-corrupted JSONL, parked/host correlation on OMP IDs, SDK callback dedupe remaining on raw SDK IDs, `/cursor-fast` session fold, honest `/cursor-refresh-models` failures, `web_search` sidecar versus native fallback, not bridging `web_search` into Cursor custom tools, `/cursor-usage` using agent totals rather than summing listed turns or pricing `usage.cost`, native `/usage` remaining credential-scoped live agents, and checkpoint occupancy staying out of Run billing. No coverage threshold is configured.
 
-CI runs install, typecheck, unit tests, boundary checks and package dry-run. For SDK-facing changes, the optional `scripts/sdk-contract-probe.ts` checks that native `AgentOptions.systemPrompt` stays omitted, imports a synthetic history token through the production importer, prefixes only its first imported-history send with the provider's shared `SDK_TOOL_CONTEXT`, verifies a single custom-tool callback with `toolCallId`, and checks token retention after `Agent.resume` without another tool execution. After those native checks pass, it spawns isolated `--cancellation-case cancel|dispose` children, records `CAPABILITY` JSON, and treats a child non-zero exit as probe exit 2 without rewriting PASS lines. It is not part of CI; run only with an available SDK key and never record that key in files or output.
+CI runs install, typecheck, unit/host compatibility tests, SDK and offline OMP contract probes, boundary checks, package dry-run, and real packed-plugin installation. `scripts/omp-contract-probe.ts` verifies codec/argument/model/tool contracts and exact OMP package coherence without Cursor network access. `scripts/sdk-contract-probe.ts` checks that native `AgentOptions.systemPrompt` stays omitted, imports a synthetic history token through the production importer, prefixes only its first imported-history send with the provider's shared `SDK_TOOL_CONTEXT`, verifies a single custom-tool callback with `toolCallId`, and checks token retention after `Agent.resume` without another tool execution. After those native checks pass, it spawns isolated `--cancellation-case cancel|dispose` children, records `CAPABILITY` JSON, and treats a child non-zero exit as probe exit 2 without rewriting PASS lines. CI requires a dedicated `CURSOR_API_KEY` Actions secret; missing credentials fail the release gate. Never upload local credentials without authorization or record keys in files/output.

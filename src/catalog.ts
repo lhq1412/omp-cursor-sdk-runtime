@@ -511,8 +511,12 @@ export function buildModelSelection(
 ): ModelSelection {
 	const metadata = lookupMetadata(modelId, options.apiKey);
 	if (!metadata) {
-		if (metadataFor(options.apiKey).values().next().value?.source === "cache") {
+		const source = metadataFor(options.apiKey).values().next().value?.source;
+		if (source === "cache") {
 			throw new Error("Cursor SDK model discovery is unavailable and the selected model has no verified cached configuration.");
+		}
+		if (options.apiKey && source === "sdk") {
+			throw new Error(`Cursor SDK model "${modelId}" is no longer available in the live catalog. Select another cursor-sdk model or run /cursor-refresh-models.`);
 		}
 		return { id: modelId };
 	}

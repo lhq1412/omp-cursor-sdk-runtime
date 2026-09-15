@@ -128,6 +128,57 @@ describe("host tool catalog", () => {
 		expect(granted.map((item) => item.name)).toEqual(["read"]);
 	});
 
+	test.each([
+		["exact canonical", ["mcp__server_tool"], ["mcp__server_tool"], ["read", "mcp__server_tool"]],
+		["unique alias", ["mcp__server_tool"], ["mcp__server__tool"], ["read"]],
+		[
+			"ambiguous alias",
+			["mcp__foo_bar_foo_bar_baz", "mcp__foo_bar_baz"],
+			["mcp__foo__bar__foo_bar_baz"],
+			["read"],
+		],
+		["disabled canonical", ["mcp__server_tool"], [], ["read"]],
+		["enabled canonical", ["mcp__server_tool"], ["mcp__server_tool"], ["read", "mcp__server_tool"]],
+		["unknown alias", ["mcp__server_tool"], ["mcp__other__tool"], ["read"]],
+	] as const)(
+		"%s only grants exact active MCP catalog entries",
+		(_case, catalog, active, expected) => {
+			catalogTestUtils.clear();
+			snapshotHostToolCatalog(catalog);
+			catalogTestUtils.setLiveEnabled(() => active);
+			const fromContext = [{ name: "read", description: "read", inputSchema: { type: "object" } }];
+			expect(mergeGrantedTools(fromContext).map((item) => item.name)).toEqual(expected);
+		},
+	);
+
+	test("uses getAllTools schemas only for enabled canonical MCP extras", () => {
+		catalogTestUtils.clear();
+		snapshotHostToolCatalog([
+			{
+				name: "mcp__server_tool",
+				description: "Canonical MCP tool",
+				parameters: {
+					type: "object",
+					properties: { issue: { type: "number" } },
+					required: ["issue"],
+				},
+			},
+		]);
+		const fromContext = grantedToolsFromContext({ messages: [], tools: [tool("read")] });
+
+		catalogTestUtils.setLiveEnabled(() => ["mcp__server__tool"]);
+		expect(mergeGrantedTools(fromContext).map((item) => item.name)).toEqual(["read"]);
+
+		catalogTestUtils.setLiveEnabled(() => ["mcp__server_tool"]);
+		const granted = mergeGrantedTools(fromContext);
+		expect(granted.map((item) => item.name)).toEqual(["read", "mcp__server_tool"]);
+		expect(granted[1]?.inputSchema).toEqual({
+			type: "object",
+			properties: { issue: { type: "number" } },
+			required: ["issue"],
+		});
+	});
+
 	test("maps long MCP names to unique SDK identifiers", () => {
 		const used = new Set<string>();
 		const first = uniqueSdkToolName("mcp__a_very_long_server_name_and_an_even_longer_tool_name_exceeding_limit", used);

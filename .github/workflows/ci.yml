@@ -3,6 +3,10 @@ name: ci
 on:
   push:
   pull_request:
+  workflow_call:
+    secrets:
+      CURSOR_API_KEY:
+        required: true
 
 permissions:
   contents: read
@@ -26,7 +30,15 @@ jobs:
         run: bun run typecheck
       - name: Unit tests (Bun runtime)
         run: bun run test
+      - name: SDK contract probe (release gate; requires repository secret)
+        env:
+          CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
+        run: bun run probe:sdk
+      - name: Offline OMP contract probe
+        run: bun run probe:omp
       - name: Check import boundaries
         run: bun run check:boundaries
       - name: Verify npm package contents
         run: npm pack --dry-run
+      - name: Install packed extension through OMP plugin manager
+        run: bun run smoke:install

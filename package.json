@@ -24,14 +24,16 @@
     "typecheck": "tsc --noEmit",
     "test": "bun test --isolate test",
     "probe:sdk": "bun scripts/sdk-contract-probe.ts",
+    "probe:omp": "bun scripts/omp-contract-probe.ts",
+    "smoke:install": "bun scripts/omp-install-smoke.ts",
     "check:boundaries": "bun scripts/check-boundaries.ts"
   },
   "dependencies": {
     "@cursor/sdk": "1.0.31",
-    "@oh-my-pi/pi-ai": "18.1.18",
-    "@oh-my-pi/pi-catalog": "18.1.18",
-    "@oh-my-pi/pi-coding-agent": "18.1.18",
-    "@oh-my-pi/pi-utils": "18.1.18"
+    "@oh-my-pi/pi-ai": "18.2.0",
+    "@oh-my-pi/pi-catalog": "18.2.0",
+    "@oh-my-pi/pi-coding-agent": "18.2.0",
+    "@oh-my-pi/pi-utils": "18.2.0"
   },
   "devDependencies": {
     "typescript": "^6.0.3"
