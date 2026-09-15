@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { SDKCustomTool, SDKCustomToolResult } from "@cursor/sdk";
-import { sanitizeSchemaForCursor } from "@oh-my-pi/pi-ai/utils/schema";
+import { sanitizeSchemaForCursor } from "@oh-my-pi/pi-ai";
 import type { GrantedTool, HostToolResult } from "./contracts.js";
 import { toolNameHash } from "./tool-catalog.js";
 
