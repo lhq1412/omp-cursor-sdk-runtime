@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import type { Tool } from "@oh-my-pi/pi-ai";
-import { toolWireSchema } from "@oh-my-pi/pi-ai/utils/schema/wire";
+import { toolWireSchema } from "@oh-my-pi/pi-ai";
 import type { GrantedTool } from "./contracts.js";
 import { getCursorSessionOwner, sessionEvents, type CursorSessionOwner } from "./session-scope.js";
 
