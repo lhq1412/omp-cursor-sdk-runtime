@@ -1,6 +1,7 @@
 import type { LocalAgentStore, SDKAgent, Run, RunResult } from "@cursor/sdk";
 import type { AssistantMessage, AssistantMessageEventStream, Context } from "@oh-my-pi/pi-ai";
 import type { HostToolResult } from "./contracts.js";
+import type { SummaryBoundaryProbe } from "./native-history.js";
 import { toolResultToHost, trailingToolResults } from "./omp-tools.js";
 import { withSdkExitSuppressed } from "./sdk-exit-guard.js";
 import type { SharedToolExec } from "./host-exec.js";
@@ -20,6 +21,7 @@ export interface LiveRun {
 	run?: Run;
 	checkpointStore?: LocalAgentStore;
 	checkpointBaseline?: { rootBlobId: string | null };
+	summaryProbe?: SummaryBoundaryProbe;
 	wait: Promise<RunResult>;
 	starting?: Promise<RunResult>;
 	parked: ParkedToolCall[];

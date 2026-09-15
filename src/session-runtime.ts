@@ -1,5 +1,5 @@
 import { resolve as resolvePath } from "node:path";
-import type { ModelSelection, SDKAgent, SDKCustomTool, SDKUserMessage } from "@cursor/sdk";
+import type { LocalAgentStore, ModelSelection, SDKAgent, SDKCustomTool, SDKUserMessage } from "@cursor/sdk";
 import type { Context } from "@oh-my-pi/pi-ai";
 import { credentialScopeId } from "./auth.js";
 import { DEFAULT_AGENT_INSTANCE_ID } from "./constants.js";
@@ -18,11 +18,12 @@ import {
 } from "./live-run.js";
 import { trailingToolResults } from "./omp-tools.js";
 import { withSdkExitSuppressed } from "./sdk-exit-guard.js";
+import { createSummaryBoundaryProbe, type SummaryBoundaryProbe } from "./native-history.js";
 import { nativeSdkToolsFromGrants, nativeToolsFingerprint, isHookedOmpTool } from "./sdk-native-hook.js";
 import { openAgent, type OpenAgentInput } from "./sdk-session.js";
 import { flushResumeHandleNow, getMatchingResumeHandle, persistResumeHandle, type ResumeStoreIdentity } from "./session-resume.js";
 import { getCursorSessionCwd, getCursorSessionOwner, getCursorSessionScopeKey, withCursorSessionOwner, type CursorSessionOwner } from "./session-scope.js";
-import { openScopedJsonlStore, storeRootForScope } from "./store.js";
+import { observeLocalAgentStore, openScopedJsonlStore, storeRootForScope } from "./store.js";
 import { buildCustomTools, newBridgeRunId } from "./tools.js";
 import { ompToolCallId } from "./projector.js";
 
@@ -40,6 +41,8 @@ export interface RuntimeSlot {
 	sendState: SendState;
 	bindingState: BindingState;
 	storeIdentity: ResumeStoreIdentity;
+	store?: LocalAgentStore;
+	summaryProbe?: SummaryBoundaryProbe;
 	preparation?: AbortController;
 }
 
@@ -192,6 +195,8 @@ async function persistDirtyAndDisposeAgent(slot: RuntimeSlot): Promise<void> {
 	slot.createCwd = undefined;
 	slot.credentialScopeId = undefined;
 	slot.sendState = emptySendState();
+	slot.store = undefined;
+	slot.summaryProbe = undefined;
 	if (agent) await disposeAgent(agent);
 }
 
@@ -293,7 +298,16 @@ export async function prepareTurn(input: OpenRuntimeTurnInput): Promise<Prepared
 		}
 
 		const savedAgentId = slot.agent?.agentId ?? (slot.bindingState === "committed" ? resumeHandle?.agentId : undefined);
-		const store = openScopedJsonlStore(cwd, scopeKey);
+		if (!slot.store || !slot.summaryProbe) {
+			const inner = openScopedJsonlStore(cwd, scopeKey);
+			const summaryProbe = createSummaryBoundaryProbe(inner);
+			slot.summaryProbe = summaryProbe;
+			slot.store = observeLocalAgentStore(inner, (event) => {
+				if (event.kind === "agents.write") summaryProbe.onAgentUpdated(event.agent);
+				else if (event.kind === "runEvents.append") summaryProbe.onRunEvent(event);
+			});
+		}
+		const store = slot.store;
 		slot.storeIdentity = { version: 1, stateRoot: storeRootForScope(cwd, scopeKey) };
 
 		const reuseId = savedAgentId ?? slot.agent?.agentId;
@@ -339,6 +353,7 @@ export async function prepareTurn(input: OpenRuntimeTurnInput): Promise<Prepared
 		}
 		live.agent = slot.agent;
 		live.checkpointStore = store;
+		live.summaryProbe = slot.summaryProbe;
 		setLiveRun(slot.key, live);
 		slot.bindingState = "in-flight";
 		slot.cwd = cwd;
@@ -386,6 +401,8 @@ export function markTurnDirty(slot: RuntimeSlot): void {
 	}
 	slot.agent = undefined;
 	slot.sendState = emptySendState();
+	slot.store = undefined;
+	slot.summaryProbe = undefined;
 }
 
 export async function finishLiveKeepAgent(slot: RuntimeSlot, reason: string): Promise<void> {

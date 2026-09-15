@@ -239,6 +239,7 @@ export class ProviderTurnRunner {
 			} catch {
 				// Unknown previous root: occupancy stays unavailable.
 			}
+			live.summaryProbe?.seed(live.checkpointBaseline?.rootBlobId ?? null);
 			this.assertCurrent();
 		}
 		const starting = startSend(live, () =>
@@ -251,6 +252,8 @@ export class ProviderTurnRunner {
 							const sink = live.sink;
 							if (!sink || live.cancelled || getRuntimeSlot(prepared.slot.key) !== prepared.slot) return;
 							applyInteractionUpdate(sink.stream, sink.partial, update, live.projection);
+							if (update.type === "summary-started") void live.summaryProbe?.onSummaryStarted(agent.agentId);
+							else if (update.type === "summary-completed") live.summaryProbe?.onSummaryCompleted();
 						},
 					});
 				if (!nativeReadHooked) return send();
@@ -364,10 +367,16 @@ export class ProviderTurnRunner {
 			});
 		}
 		this.assertCurrent();
-		if (occupancy && !live.cancelled && getLiveRun(preparedSlot.key) === live &&
+		const observation = !live.cancelled ? await live.summaryProbe?.flush() : undefined;
+		if (!live.cancelled && getLiveRun(preparedSlot.key) === live &&
 			preparedSlot.agent === settledAgent && live.agent === settledAgent) {
-			if (partial.cursorSdk.summary) partial.cursorSdk.summary.checkpointRootBlobId = occupancy.rootBlobId;
-			partial.cursorSdk.contextOccupancy = occupancy;
+			if (occupancy) {
+				if (partial.cursorSdk.summary) partial.cursorSdk.summary.checkpointRootBlobId = occupancy.rootBlobId;
+				partial.cursorSdk.contextOccupancy = occupancy;
+			}
+			if (observation && partial.cursorSdk.summary?.status === "completed") {
+				partial.cursorSdk.summary.probe = observation;
+			}
 		}
 		const delivered = deliverWithoutUnendedPreviews(partial, live.projection, new Set());
 		stream.push({ type: "done", reason: "stop", message: delivered });
