@@ -13,7 +13,8 @@ import { readNativeCheckpoint } from "../src/native-history.ts";
 
 const SELF = fileURLToPath(import.meta.url);
 const SDK_PIN = "1.0.31";
-const WINDOW_MS = 10_000;
+export const WINDOW_MS = 10_000;
+export const SETUP_MS = 60_000;
 const CHILD_MS = 180_000;
 const REUSE_TOKEN = "probe-reuse-token";
 const USAGE = "usage: --cancellation-case cancel|dispose <absolute-temp-root>";
@@ -45,7 +46,7 @@ interface Capability {
 	detail?: unknown;
 }
 
-interface Observer<T> {
+export interface Observer<T> {
 	promise: Promise<T>;
 	state: "pending" | "resolved" | "rejected";
 	value?: T;
@@ -54,8 +55,8 @@ interface Observer<T> {
 
 class SetupFailed extends Error {}
 
-function scrub(text: string, apiKey: string): string {
-	return text.split(apiKey).join("<redacted>");
+export function scrub(text: string, apiKey: string): string {
+	return apiKey ? text.split(apiKey).join("<redacted>") : text;
 }
 
 function formatRun(result: RunResult, apiKey: string): string {
@@ -146,7 +147,7 @@ function emitCapability(apiKey: string, rec: Capability): void {
 	console.log(`CAPABILITY ${JSON.stringify(body)}`);
 }
 
-function observePromise<T>(promise: Promise<T>): Observer<T> {
+export function observePromise<T>(promise: Promise<T>): Observer<T> {
 	const obs: Observer<T> = { promise, state: "pending" };
 	void promise.then(
 		(value) => {
@@ -165,9 +166,27 @@ function sleep(ms: number): Promise<void> {
 	return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function awaitDeadline<T>(obs: Observer<T>): Promise<void> {
+export async function awaitDeadline<T>(obs: Observer<T>, deadline = Date.now() + WINDOW_MS): Promise<void> {
 	if (obs.state !== "pending") return;
-	await Promise.race([obs.promise.then(() => undefined, () => undefined), sleep(WINDOW_MS)]);
+	const remainingMs = deadline - Date.now();
+	if (remainingMs <= 0) return;
+	await Promise.race([obs.promise.then(() => undefined, () => undefined), sleep(remainingMs)]);
+}
+
+export async function awaitPreparation(
+	entered: Observer<void>,
+	run: Observer<unknown>,
+	deadline: number,
+): Promise<"entered" | "finished" | "timeout"> {
+	if (entered.state === "resolved") return "entered";
+	if (run.state !== "pending") return "finished";
+	const remainingMs = deadline - Date.now();
+	if (remainingMs <= 0) return "timeout";
+	return Promise.race([
+		entered.promise.then(() => "entered" as const),
+		run.promise.then(() => "finished" as const, () => "finished" as const),
+		sleep(remainingMs).then(() => "timeout" as const),
+	]);
 }
 
 function attachLate<T>(apiKey: string, obs: Observer<T>, meta: Omit<Capability, "outcome" | "elapsedMs">, startedAt: number, detail?: (obs: Observer<T>) => unknown): void {
@@ -247,6 +266,7 @@ async function boundedCleanup(operation: Promise<unknown>): Promise<void> {
 
 async function runIsolated(kind: CaseKind, root: string, apiKey: string): Promise<void> {
 	const startedAt = Date.now();
+	const setupDeadline = startedAt + SETUP_MS;
 	const store = openJsonlStore(join(root, "store"));
 	const toolGate = Promise.withResolvers<void>();
 	const entered = Promise.withResolvers<void>();
@@ -321,14 +341,14 @@ async function runIsolated(kind: CaseKind, root: string, apiKey: string): Promis
 
 	try {
 		const openObs = observePromise(openAgent(input));
-		await awaitDeadline(openObs);
+		await awaitDeadline(openObs, setupDeadline);
 		if (openObs.state === "pending") failSetup(apiKey, kind, "agent.open", startedAt, { sdk: SDK_PIN, error: { message: "pending-at-deadline" } });
 		if (openObs.state === "rejected") failSetup(apiKey, kind, "agent.open", startedAt, { sdk: SDK_PIN, error: errorDetail(openObs.error) });
 		agent = openObs.value;
 		if (!agent) failSetup(apiKey, kind, "agent.open", startedAt, { sdk: SDK_PIN, error: { message: "missing-agent" } });
 
 		const sendObs = observePromise(agent.send("Call hold exactly once. Do not call any other tool."));
-		await awaitDeadline(sendObs);
+		await awaitDeadline(sendObs, setupDeadline);
 		if (sendObs.state === "pending") failSetup(apiKey, kind, "run.handle", startedAt, { sdk: SDK_PIN, error: { message: "pending-at-deadline" } });
 		if (sendObs.state === "rejected") failSetup(apiKey, kind, "run.handle", startedAt, { sdk: SDK_PIN, error: errorDetail(sendObs.error) });
 		run = sendObs.value;
@@ -338,11 +358,7 @@ async function runIsolated(kind: CaseKind, root: string, apiKey: string): Promis
 		});
 		waitObs = observePromise(run.wait());
 
-		const first = await Promise.race([
-			entered.promise.then(() => "entered" as const),
-			waitObs.promise.then(() => "finished" as const, () => "finished" as const),
-			sleep(WINDOW_MS).then(() => "timeout" as const),
-		]);
+		const first = await awaitPreparation(enteredObs, waitObs, setupDeadline);
 		if (first !== "entered" || enteredObs.state !== "resolved") {
 			failSetup(apiKey, kind, "callback.entered", startedAt, runDetail({
 				reason: first === "finished" ? "finished-before-enter" : first === "timeout" ? "entered-timeout" : "missing-callback",
@@ -738,8 +754,10 @@ async function main(): Promise<void> {
 	}
 }
 
-main().catch((error) => {
-	const message = error instanceof Error ? error.message : String(error);
-	console.error(scrub(message, process.env.CURSOR_API_KEY ?? "<unset>"));
-	process.exitCode = 2;
-});
+if (import.meta.main) {
+	void main().catch((error) => {
+		const message = error instanceof Error ? error.message : String(error);
+		console.error(scrub(message, process.env.CURSOR_API_KEY ?? "<unset>"));
+		process.exitCode = 2;
+	});
+}

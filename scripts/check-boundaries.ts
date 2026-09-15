@@ -1,5 +1,5 @@
 import { readdir, readFile } from "node:fs/promises";
-import { join } from "node:path";
+import { join, relative, resolve } from "node:path";
 import ts from "typescript";
 import { FORBIDDEN_IMPORT_PATTERNS } from "../src/constants.ts";
 
@@ -10,49 +10,103 @@ async function walk(dir: string): Promise<string[]> {
 		const path = join(dir, entry.name);
 		if (entry.isDirectory()) {
 			files.push(...(await walk(path)));
-		} else if (entry.name.endsWith(".ts")) {
+		} else if (/\.[cm]?[jt]sx?$/.test(entry.name)) {
 			files.push(path);
 		}
 	}
 	return files;
 }
 
-// Only these pure conversion exports may cross the built-in Cursor boundary.
-const nativeHistoryImports: Record<string, string> = {
-	"@oh-my-pi/pi-ai/providers/cursor": "buildGrpcRequest",
-	"@oh-my-pi/pi-catalog/discovery/cursor-proto": "ConversationStateStructureSchema",
-	"@oh-my-pi/pi-catalog/discovery/protobuf": "toBinary",
+// Implementation subpaths are denied unless this table owns both the file and every imported symbol.
+const deepImportOwners: Record<string, Record<string, readonly string[]>> = {
+	"@oh-my-pi/pi-ai/providers/cursor": {
+		"src/native-history.ts": ["buildGrpcRequest"],
+	},
+	"@oh-my-pi/pi-ai/providers/cursor-pi-args": {
+		"src/sdk-native-hook.ts": [
+			"omitUndefinedArgs",
+			"piGrepSkip",
+			"piJoinPath",
+			"piLimit",
+			"piLsPath",
+			"piReadPath",
+			"piReadPathHasRange",
+		],
+		"scripts/omp-contract-probe.ts": [
+			"omitUndefinedArgs",
+			"piGrepSkip",
+			"piJoinPath",
+			"piLimit",
+			"piLsPath",
+			"piReadPath",
+			"piReadPathHasRange",
+		],
+	},
+	"@oh-my-pi/pi-catalog/compat/taxonomy": {
+		"src/context.ts": ["classifyModel"],
+	},
+	"@oh-my-pi/pi-catalog/discovery/cursor-proto": {
+		"src/native-history.ts": ["ConversationStateStructureSchema"],
+		"scripts/omp-contract-probe.ts": [
+			"ConversationStateStructureSchema",
+			"ConversationStepSchema",
+			"ConversationTurnStructureSchema",
+			"UserMessageSchema",
+		],
+	},
+	"@oh-my-pi/pi-catalog/discovery/protobuf": {
+		"src/native-history.ts": ["toBinary"],
+		"scripts/omp-contract-probe.ts": ["fromBinary", "toBinary"],
+	},
+	"@oh-my-pi/pi-catalog/models": {
+		"src/catalog.ts": ["getBundledModel"],
+		"scripts/omp-contract-probe.ts": ["getBundledModel"],
+	},
 };
-const root = join(import.meta.dir, "..", "src");
-const files = await walk(root);
+
+function importedNames(node: ts.Node): string[] | undefined {
+	if (!ts.isImportDeclaration(node) || node.importClause?.name) return undefined;
+	const bindings = node.importClause?.namedBindings;
+	if (!bindings || !ts.isNamedImports(bindings)) return undefined;
+	return bindings.elements.map((element) => (element.propertyName ?? element.name).text);
+}
+
+const rootFlag = process.argv.indexOf("--repo-root");
+const rootArgument = rootFlag >= 0 ? process.argv[rootFlag + 1] : undefined;
+if (rootFlag >= 0 && !rootArgument) throw new Error("--repo-root requires a path");
+const repoRoot = rootArgument ? resolve(rootArgument) : join(import.meta.dir, "..");
+const roots = [join(repoRoot, "src"), join(repoRoot, "scripts")];
+const files = (await Promise.all(roots.map(walk))).flat();
 const violations: string[] = [];
 for (const file of files) {
+	const owner = relative(repoRoot, file).replaceAll("\\", "/");
 	const text = await readFile(file, "utf8");
 	const source = ts.createSourceFile(file, text, ts.ScriptTarget.Latest, true);
 	function check(node: ts.Node): void {
-		const specifier = ts.isImportDeclaration(node) || ts.isExportDeclaration(node)
-			? node.moduleSpecifier
-			: ts.isCallExpression(node) && (
-				node.expression.kind === ts.SyntaxKind.ImportKeyword ||
-				(ts.isIdentifier(node.expression) && node.expression.text === "require")
-			)
-				? node.arguments[0]
-				: ts.isImportEqualsDeclaration(node) && ts.isExternalModuleReference(node.moduleReference)
-					? node.moduleReference.expression
-					: undefined;
-		if (specifier && ts.isStringLiteralLike(specifier) && FORBIDDEN_IMPORT_PATTERNS.some((pattern) => {
-			if (pattern === "@oh-my-pi/pi-ai/providers/cursor") {
-				return specifier.text === pattern || specifier.text.startsWith(`${pattern}/`);
-			}
-			return specifier.text.includes(pattern);
-		})) {
-			const bindings = ts.isImportDeclaration(node) && !node.importClause?.name ? node.importClause?.namedBindings : undefined;
-			const allowedName = nativeHistoryImports[specifier.text];
-			const allowed = file === join(root, "native-history.ts") && allowedName &&
-				bindings && ts.isNamedImports(bindings) && bindings.elements.length === 1 &&
-				(bindings.elements[0]!.propertyName ?? bindings.elements[0]!.name).text === allowedName;
-			if (!allowed) {
-				violations.push(`${file}:${source.getLineAndCharacterOfPosition(node.getStart(source)).line + 1}: ${specifier.text}`);
+		const specifier = ts.isImportTypeNode(node) && ts.isLiteralTypeNode(node.argument)
+			? node.argument.literal
+			: ts.isImportDeclaration(node) || ts.isExportDeclaration(node)
+				? node.moduleSpecifier
+				: ts.isCallExpression(node) && (
+					node.expression.kind === ts.SyntaxKind.ImportKeyword ||
+					(ts.isIdentifier(node.expression) && node.expression.text === "require")
+				)
+					? node.arguments[0]
+					: ts.isImportEqualsDeclaration(node) && ts.isExternalModuleReference(node.moduleReference)
+						? node.moduleReference.expression
+						: undefined;
+		if (specifier && ts.isStringLiteralLike(specifier)) {
+			const moduleName = specifier.text;
+			const isOmpDeepImport = /^@oh-my-pi\/[^/]+\/.+/.test(moduleName);
+			const matchesKnownInternal = FORBIDDEN_IMPORT_PATTERNS.some((pattern) => moduleName.includes(pattern));
+			if (isOmpDeepImport || matchesKnownInternal) {
+				const allowedNames = deepImportOwners[moduleName]?.[owner];
+				const names = importedNames(node);
+				const allowed = allowedNames && names?.length && names.every((name) => allowedNames.includes(name));
+				if (!allowed) {
+					const line = source.getLineAndCharacterOfPosition(node.getStart(source)).line + 1;
+					violations.push(`${owner}:${line}: ${moduleName} (owner or imported symbol is not allowlisted)`);
+				}
 			}
 		}
 		ts.forEachChild(node, check);
@@ -61,7 +115,7 @@ for (const file of files) {
 }
 
 if (violations.length > 0) {
-	console.error("Forbidden imports:\n" + violations.join("\n"));
+	console.error("Forbidden implementation imports:\n" + violations.join("\n"));
 	process.exit(1);
 }
-console.log(`OK ${files.length} source files`);
+console.log(`OK ${files.length} source and script files`);

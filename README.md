@@ -2,7 +2,7 @@
 
 Independent [Oh My Pi (OMP)](https://github.com/can1357/oh-my-pi) provider adapter for the official `@cursor/sdk` **local** agent runtime.
 
-The extension registers models under **`cursor-sdk/*`**. It does not replace or modify OMP's built-in **`cursor/*`** provider. The sole reuse is its pure local history mapper and protobuf codec; authentication, transport, agent execution, and resume remain on the official Cursor SDK, never the built-in provider's network or executor paths.
+The extension registers models under **`cursor-sdk/*`**. It does not replace or modify OMP's built-in **`cursor/*`** provider. It reuses the pure local history mapper, protobuf codec, and Cursor-to-OMP tool argument conversions; authentication, transport, agent execution, and resume remain on the official Cursor SDK, never the built-in provider's network or executor paths. `check:boundaries` denies unapproved OMP deep imports and restricts approved symbols to their owning adapter modules.
 
 OMP owns sessions, permissions, tools, and UI. This package binds a local Cursor SDK agent onto the current OMP session leaf and executes tools only through the OMP host. Native Cursor executors stay disallowed except hooked `read`/`grep`/`shell`/`edit`/`glob`/`write`/`ls`.
 
@@ -10,15 +10,15 @@ This is a separate adapter from [lhq1412/omp-cursor-sdk](https://github.com/lhq1
 
 Pinned baselines:
 
-- OMP `18.1.18` (`00085d4`)
+- OMP `18.2.0` (all four direct OMP packages exact-pinned)
 - `@cursor/sdk` `1.0.31`
-- Direct history-codec dependency: `@oh-my-pi/pi-catalog` `18.1.18`
+- Direct history-codec dependency: `@oh-my-pi/pi-catalog` `18.2.0`
 
 Native checkpoint conversion is coupled to these fixed versions, not a promise of compatibility with arbitrary OMP or SDK releases.
 
 ## Requirements
 
-- OMP 18.1.18
+- OMP 18.2.0
 - Bun 1.3.14 or newer (OMP and the extension runtime)
 - Node.js 22.19 or newer (maintenance scripts)
 - a Cursor SDK API key from Cursor Dashboard → API Keys
@@ -89,6 +89,8 @@ omp models refresh
 ```
 
 Models are **canonical IDs only** (`cursor-sdk/composer-2.5`). Fast is a per-send flag, not a catalog alias: there are no `@fast` / slow suffix rows.
+
+OMP's materialized selector cache and the adapter's credential-scoped SDK metadata cache remain separate. The first turn restores SDK selection metadata even when OMP serves a warm cache without discovery. If a successful live catalog no longer contains the selected model, the turn fails with a refresh/reselection error instead of sending an unverified raw ID. A live discovery failure still permits a model with verified private-cache configuration.
 
 The native model browser's input/output prices are **base-mode reference USD per million tokens, not Cursor SDK charges**. The adapter first checks an exact, nonzero OMP bundled Cursor price, then exact IDs in the bundled OpenAI, Anthropic, Google and xAI catalogs. A small explicit map covers Cursor's alternate Claude names; display names, SDK aliases, arbitrary suffixes and Gemini preview variants are not guessed. Prices follow the pinned OMP catalog, not a live price feed; SDK model IDs, capabilities and selection parameters remain authoritative.
 
@@ -194,10 +196,20 @@ Provider errors and diagnostic notifications redact credentials, authorization/c
 npm install
 npm test
 npm run typecheck
+npm run probe:omp
 npm run check:boundaries
+npm run smoke:install
 ```
 
-OMP packages are Bun-targeted, so runtime tests use Bun. GitHub Actions runs `npm ci`, typecheck, tests, `check:boundaries`, and `npm pack --dry-run` on every push and pull request.
+OMP packages are Bun-targeted, so runtime tests use Bun. GitHub Actions runs `npm ci`, typecheck, tests, `probe:sdk`, `probe:omp`, `check:boundaries`, `npm pack --dry-run`, and the real plugin-install smoke. The SDK step requires a dedicated repository `CURSOR_API_KEY` secret; do not upload a developer's local key without authorization. Missing credentials fail the gate, including on fork pull requests where GitHub does not expose secrets. Never use `pull_request_target` to run untrusted code with that secret.
+
+`probe:omp` is offline: it checks the native-history checkpoint codec, Cursor argument conversions, model/tool exports, and agreement of all four exact OMP pins. `smoke:install` packs this checkout, installs its dependencies outside the checkout, and exercises the installed OMP plugin manager and extension loader in a temporary home. It requires package-registry access, but no Cursor credentials.
+
+Real-host tests cover concurrent request owners, abort/retry, same-directory subagents, unscoped auxiliary completions, and tool execution counts. OMP 18.2's stock session transformer suppresses tool speculation, so tests distinguish stock execution from an explicitly transformer-free public Agent configuration that exercises finalized read speculation. Both must execute each SDK call once; write/edit/bash must not speculate. The adapter does not remove the host transformer or change compaction policy.
+
+OMP integration migrations keep the private credential-scoped model cache separate from OMP's selector cache. Freeze contracts before changing the baseline; change runtime behavior only for demonstrated incompatibilities. Do not bundle session-binding or compaction redesigns into a baseline upgrade. The 18.2 release gate also requires real host cache, request-owner, grant, speculation, and lifecycle tests. Target `0.2.5` only if all gates pass with model-consistency-only runtime changes; session/tool/compaction semantic changes require `0.3.0`. A missing or failed live SDK probe is not validated support and blocks release.
+
+The manual release workflow reuses the complete CI workflow before changing the version, pushing a tag, or creating a release. An absent dedicated SDK secret or a failed probe therefore blocks publication; local verification alone does not bypass that gate.
 
 Live SDK probes (requires `CURSOR_API_KEY`):
 
@@ -207,6 +219,8 @@ npm run probe:sdk
 ```
 
 The probe records that native `AgentOptions.systemPrompt` is omitted, imports a synthetic history token through the production importer, prefixes only its first imported-history send with the provider's shared `SDK_TOOL_CONTEXT`, checks one new custom-tool callback and its `toolCallId`, then verifies that `Agent.resume` retains the token without another tool execution. If those PASS, it spawns isolated `--cancellation-case cancel|dispose` children that emit `CAPABILITY` JSON; a child non-zero exit becomes probe exit 2 and does not rewrite PASS lines.
+
+Each cancellation child has one shared 60-second preparation budget for opening the agent, obtaining its run, and entering the blocked tool callback. Remote model/tool-discovery latency does not consume the separate 10-second capability observation windows. The whole-child watchdog remains 180 seconds; preparation failures and child failures still fail CI without automatic retries.
 
 Native-history smoke verification exercised the real provider and official SDK with synthetic OMP lifecycle hooks and session JSONL in isolated scratch, not the full OMP TUI or every model. Eight scenarios passed, covering native history continuation, one actual new-tool side effect, parked-result continuation on the same Agent, persisted resume retaining system/history, raw system-change reimport, cancelled parked Run followed by an isolated branch, compaction reimport, and completed screenshot-result recovery identifying blue/magenta/orange. This separate smoke is not part of the probe command above.
 

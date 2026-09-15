@@ -6,9 +6,10 @@
     "strict": true,
     "esModuleInterop": true,
     "skipLibCheck": true,
-    "rootDir": "src",
+    "rootDir": ".",
+    "allowImportingTsExtensions": true,
     "noEmit": true
   },
-  "include": ["src"],
-  "exclude": ["node_modules", "dist", "test", "scripts"]
+  "include": ["src", "scripts/omp-contract-probe.ts"],
+  "exclude": ["node_modules", "dist", "test"]
 }

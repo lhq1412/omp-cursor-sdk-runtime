@@ -3,7 +3,8 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { describe, expect, test } from "bun:test";
 import type { Context } from "@oh-my-pi/pi-ai";
-import type { SDKAgent } from "@cursor/sdk";
+import type { LocalAgentDocument, LocalAgentStore, SDKAgent } from "@cursor/sdk";
+import { ConversationStateStructureSchema } from "@oh-my-pi/pi-catalog/discovery/cursor-proto";
 import type { GrantedTool } from "../../src/contracts.ts";
 import { credentialScopeId } from "../../src/auth.ts";
 import { computeContextFingerprint } from "../../src/context.ts";
@@ -24,6 +25,17 @@ import { __testUtils as scopeTestUtils, getCursorSessionOwner, ownerForRequest, 
 import { parseResumeEntryData, registerCursorSessionResume, __testUtils as resumeTestUtils } from "../../src/session-resume.ts";
 
 const modelLimits = { contextWindow: 200_000, maxTokens: 20_000 };
+
+function checkpointBlob(turns: number, selfSummaryCount = 0): Uint8Array {
+	return ConversationStateStructureSchema.encode(ConversationStateStructureSchema.create({
+		turns: Array.from({ length: turns }, (_, index) => Uint8Array.of(index + 1)),
+		turnsOld: [],
+		summaryArchives: [],
+		summaryArchive: new Uint8Array(),
+		selfSummaryCount,
+		summary: selfSummaryCount > 0 ? new TextEncoder().encode("private summary") : new Uint8Array(),
+	}));
+}
 
 function fakeAgent(id: string, sends: string[] = []): SDKAgent {
 	return {
@@ -276,6 +288,70 @@ describe("session runtime", () => {
 		expect(newer.slot.agent?.agentId).toBe("agent-2");
 		expect(newer.slot.bindingState).toBe("committed");
 		expect(resumeTestUtils.state.pendingHandle).toEqual(pending);
+	});
+
+	test("runtime store observations produce a completed checkpoint summary boundary", async () => {
+		runtimeTestUtils.clear();
+		liveRunTestUtils.clear();
+		scopeTestUtils.reset();
+		resumeTestUtils.reset();
+		registerResume();
+		let store!: LocalAgentStore;
+		runtimeTestUtils.setOpenAgent(async (input) => {
+			store = input.store;
+			return fakeAgent("agent-summary");
+		});
+		const context = userContext("summarize this turn");
+		const turn = await prepareTurn({
+			modelLimits,
+			cwd: "/tmp/project",
+			agentInstanceId: "main",
+			apiKey: "test-key",
+			modelSelection: { id: "composer-2.5" },
+			context,
+			grantedTools: [],
+		});
+		const before: LocalAgentDocument = {
+			agentId: "agent-summary",
+			cwd: "/tmp/project",
+			status: "idle",
+			createdAt: 1,
+			updatedAt: 1,
+			latestCheckpoint: { schemaVersion: 1, rootBlobId: "before" },
+		};
+		await store.checkpoints.create({ agentId: before.agentId, blobId: "before", data: checkpointBlob(6) });
+		await store.agents.create({ agent: before });
+		turn.live.summaryProbe?.seed("before");
+		await turn.live.summaryProbe?.onSummaryStarted(before.agentId);
+		await store.runEvents.append({
+			runId: "run-summary",
+			eventType: "preCompact",
+			payload: { message_count: 6, messages_to_compact: 4 },
+		});
+		turn.live.summaryProbe?.onSummaryCompleted();
+		await store.checkpoints.create({
+			agentId: before.agentId,
+			blobId: "after",
+			data: checkpointBlob(2, 1),
+		});
+		await store.agents.update({
+			agent: {
+				...before,
+				updatedAt: 2,
+				latestCheckpoint: { schemaVersion: 1, rootBlobId: "after" },
+			},
+		});
+
+		const observation = await turn.live.summaryProbe?.flush();
+		expect(observation).toMatchObject({
+			summaryGeneration: 1,
+			beforeRoot: "before",
+			afterRoot: "after",
+			before: { turns: 6, selfSummaryCount: 0 },
+			after: { turns: 2, selfSummaryCount: 1 },
+			runEvent: { runId: "run-summary", eventType: "preCompact", messageCount: 6, messagesToCompact: 4 },
+		});
+		expect(JSON.stringify(observation)).not.toContain("private summary");
 	});
 
 	test("rejects oversized bootstrap before opening an SDK agent", async () => {
