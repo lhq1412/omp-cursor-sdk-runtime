@@ -220,6 +220,8 @@ npm run probe:sdk
 
 The probe records that native `AgentOptions.systemPrompt` is omitted, imports a synthetic history token through the production importer, prefixes only its first imported-history send with the provider's shared `SDK_TOOL_CONTEXT`, checks one new custom-tool callback and its `toolCallId`, then verifies that `Agent.resume` retains the token without another tool execution. If those PASS, it spawns isolated `--cancellation-case cancel|dispose` children that emit `CAPABILITY` JSON; a child non-zero exit becomes probe exit 2 and does not rewrite PASS lines.
 
+Each cancellation child has one shared 60-second preparation budget for opening the agent, obtaining its run, and entering the blocked tool callback. Remote model/tool-discovery latency does not consume the separate 10-second capability observation windows. The whole-child watchdog remains 180 seconds; preparation failures and child failures still fail CI without automatic retries.
+
 Native-history smoke verification exercised the real provider and official SDK with synthetic OMP lifecycle hooks and session JSONL in isolated scratch, not the full OMP TUI or every model. Eight scenarios passed, covering native history continuation, one actual new-tool side effect, parked-result continuation on the same Agent, persisted resume retaining system/history, raw system-change reimport, cancelled parked Run followed by an isolated branch, compaction reimport, and completed screenshot-result recovery identifying blue/magenta/orange. This separate smoke is not part of the probe command above.
 
 ## Provenance and license
