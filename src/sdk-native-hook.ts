@@ -2,6 +2,15 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { readFileSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
+import {
+	omitUndefinedArgs,
+	piGrepSkip,
+	piJoinPath,
+	piLimit,
+	piLsPath,
+	piReadPath,
+	piReadPathHasRange,
+} from "@oh-my-pi/pi-ai/providers/cursor-pi-args";
 import type { HostToolResult } from "./contracts.js";
 import { projectSdkToolCallId } from "./tool-call-id.js";
 
@@ -84,15 +93,7 @@ export function isHookedOmpTool(name: string, grantedNames?: readonly string[]):
 	return true;
 }
 
-export function mapNativeReadPath(path: string, offset?: number, limit?: number): string | null {
-	if (limit !== undefined && Math.floor(limit) <= 0) return null;
-	const start = offset !== undefined ? Math.max(1, Math.floor(offset)) : undefined;
-	const count = limit !== undefined ? Math.floor(limit) : undefined;
-	if (start === undefined && count === undefined) return path;
-	const base = path.split(":").some((chunk) => chunk.toLowerCase() === "raw") ? path : `${path}:raw`;
-	if (start === undefined) return `${base}:1+${count}`;
-	return count === undefined ? `${base}:${start}-` : `${base}:${start}+${count}`;
-}
+export const mapNativeReadPath = piReadPath;
 
 function textOf(result: HostToolResult): string {
 	return result.content
@@ -109,20 +110,12 @@ function str(args: Record<string, unknown>, ...keys: string[]): string {
 	return "";
 }
 
-function joinGlobPath(base: string, pattern: string): string {
-	if (/^(?:\/|[A-Za-z]:[\\/])/.test(pattern)) return pattern;
-	if (!base || base === ".") return pattern;
-	return `${base.replace(/\/+$/, "")}/${pattern.replace(/^\/+/, "")}`;
-}
-
 export function mapGlobArgs(args: Record<string, unknown>): { args: Record<string, unknown> } | { error: string } {
 	const pattern = str(args, "globPattern", "glob_pattern", "pattern");
 	if (!pattern.trim()) return { error: "glob pattern is required (received an empty pattern)." };
-	const dir = str(args, "targetDirectory", "target_directory", "path");
-	const mapped: Record<string, unknown> = { path: joinGlobPath(dir, pattern) };
-	const limit = args.limit;
-	if (typeof limit === "number" && Number.isFinite(limit)) mapped.limit = Math.max(1, Math.floor(limit));
-	return { args: mapped };
+	const dir = str(args, "targetDirectory", "target_directory", "path") || undefined;
+	const limit = typeof args.limit === "number" && Number.isFinite(args.limit) ? piLimit(args.limit) : undefined;
+	return { args: omitUndefinedArgs({ path: piJoinPath(dir, pattern), limit }) };
 }
 
 export function ompReadToSdkResult(path: string, result: HostToolResult, rangeApplied = false): object {
@@ -255,7 +248,7 @@ export function ompLsToSdkResult(token: string, path: string, result: HostToolRe
 		if (!base) continue;
 		if (name.endsWith("/")) {
 			dirs.push({
-				absPath: joinGlobPath(path, base),
+				absPath: piJoinPath(path, base),
 				childrenDirs: [],
 				childrenFiles: [],
 				childrenWereProcessed: false,
@@ -283,10 +276,6 @@ export function ompLsToSdkResult(token: string, path: string, result: HostToolRe
 	};
 }
 
-function optionalLine(value: unknown): number | undefined {
-	return typeof value === "number" && value !== 0 ? value : undefined;
-}
-
 function mapGrepArgs(args: Record<string, unknown>): { args: Record<string, unknown> } | { error: string } {
 	const pattern = str(args, "pattern");
 	const glob = str(args, "glob");
@@ -294,24 +283,22 @@ function mapGrepArgs(args: Record<string, unknown>): { args: Record<string, unkn
 		return { error: glob ? `grep pattern is required (received an empty pattern). To list files matching "${glob}", pass a non-empty regex (e.g. ".") and set path to that glob, or use the ls/read tool instead.` : "grep pattern is required (received an empty pattern)." };
 	}
 	const path = str(args, "path");
-	const mapped: Record<string, unknown> = { pattern };
-	if (glob) mapped.path = `${path || "."}/${glob}`;
-	else if (path) mapped.path = path;
-	const insensitive = args.caseInsensitive ?? args.case_insensitive;
-	if (insensitive === true) mapped.case = false;
-	else if (insensitive === false) mapped.case = true;
-	return { args: mapped };
+	return {
+		args: omitUndefinedArgs({
+			pattern,
+			path: glob ? piJoinPath(path || ".", glob) : path || ".",
+			case: (args.caseInsensitive ?? args.case_insensitive) === true ? false : undefined,
+			skip: piGrepSkip(typeof args.offset === "number" ? args.offset : undefined),
+		}),
+	};
 }
 
 function mapShellArgs(args: Record<string, unknown>): Record<string, unknown> {
-	const mapped: Record<string, unknown> = { command: str(args, "command") };
-	const cwd = str(args, "workingDirectory", "working_directory");
-	if (cwd) mapped.cwd = cwd;
-	const timeout = args.timeout;
-	if (typeof timeout === "number" && timeout > 0) {
-		mapped.timeout = timeout > 3600 ? Math.ceil(timeout / 1000) : timeout;
-	}
-	return mapped;
+	return omitUndefinedArgs({
+		command: str(args, "command"),
+		cwd: str(args, "workingDirectory", "working_directory") || undefined,
+		timeout: typeof args.timeout === "number" && args.timeout > 0 ? args.timeout : undefined,
+	});
 }
 
 function unavailable(token: string, args: Record<string, unknown>): object {
@@ -334,13 +321,17 @@ async function executeNative(token: string, args: Record<string, unknown>): Prom
 	try {
 		if (token === "readArgs") {
 			const path = str(args, "path");
-			const offset = optionalLine(args.offset);
-			const limit = typeof args.limit === "number" ? Math.floor(args.limit) : undefined;
-			const mapped = mapNativeReadPath(path, offset, limit);
+			const offset = typeof args.offset === "number" ? args.offset : undefined;
+			const limit = typeof args.limit === "number" ? args.limit : undefined;
+			const mapped = piReadPath(path, offset, limit);
 			if (mapped === null) {
 				return ompReadToSdkResult(path, { content: [{ type: "text", text: "" }], isError: false });
 			}
-			return ompReadToSdkResult(path, await run("read", { path: mapped }, execId), mapped !== path);
+			return ompReadToSdkResult(
+				path,
+				await run("read", { path: mapped }, execId),
+				offset !== undefined || limit !== undefined || piReadPathHasRange(mapped),
+			);
 		}
 		if (token === "grepArgs") {
 			const prepared = mapGrepArgs(args);
@@ -358,11 +349,12 @@ async function executeNative(token: string, args: Record<string, unknown>): Prom
 			return ompGlobToSdkResult(token, args, await run("glob", prepared.args, execId));
 		}
 		if (LS_TOKENS.has(token)) {
-			const path = str(args, "path") || ".";
+			const path = piLsPath(str(args, "path") || undefined);
 			return ompLsToSdkResult(token, path, await run("read", { path }, execId));
 		}
 		const path = str(args, "path");
-		const content = str(args, "fileText", "file_text");
+		const content = str(args, "fileText", "file_text")
+			|| (args.fileBytes instanceof Uint8Array ? new TextDecoder().decode(args.fileBytes) : "");
 		return ompWriteToSdkResult(path, await run("write", { path, content }, execId), content);
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);

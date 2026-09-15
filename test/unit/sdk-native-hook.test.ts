@@ -281,4 +281,23 @@ describe("executeNative", () => {
 			},
 		});
 	});
+
+	test("forwards grep offset as OMP skip and joins glob onto path", async () => {
+		const calls: Array<{ name: string; args: Record<string, unknown> }> = [];
+		await runWithNativeTools(async (name, args) => {
+			calls.push({ name, args });
+			return { content: [{ type: "text", text: "src/a.ts:1:ab" }], isError: false };
+		}, () => nativeHookTestUtils.executeNative("grepArgs", {
+			pattern: "ab",
+			path: "src",
+			glob: "*.ts",
+			offset: 3,
+			caseInsensitive: true,
+			toolCallId: "g1",
+		}));
+		expect(calls).toEqual([{
+			name: "grep",
+			args: { pattern: "ab", path: "src/*.ts", case: false, skip: 3 },
+		}]);
+	});
 });
