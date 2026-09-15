@@ -18,6 +18,7 @@ import {
 } from "./live-run.js";
 import { trailingToolResults } from "./omp-tools.js";
 import { withSdkExitSuppressed } from "./sdk-exit-guard.js";
+import { nativeSdkToolsFromGrants, nativeToolsFingerprint, isHookedOmpTool } from "./sdk-native-hook.js";
 import { openAgent, type OpenAgentInput } from "./sdk-session.js";
 import { flushResumeHandleNow, getMatchingResumeHandle, persistResumeHandle, type ResumeStoreIdentity } from "./session-resume.js";
 import { getCursorSessionCwd, getCursorSessionOwner, getCursorSessionScopeKey, withCursorSessionOwner, type CursorSessionOwner } from "./session-scope.js";
@@ -34,6 +35,7 @@ export interface RuntimeSlot {
 	createCwd?: string;
 	credentialScopeId?: string;
 	includeWebSearch?: boolean;
+	nativeTools?: string;
 	agent?: SDKAgent;
 	sendState: SendState;
 	bindingState: BindingState;
@@ -83,6 +85,10 @@ export function agentConfigMismatch(slot: RuntimeSlot, cwd: string, nextCredenti
 export function slotIdentityMismatch(slot: RuntimeSlot, cwd: string, nextCredentialScopeId: string): boolean {
 	if (!slot.createCwd || !slot.credentialScopeId) return true;
 	return normalizeRuntimeCwd(slot.createCwd) !== normalizeRuntimeCwd(cwd) || slot.credentialScopeId !== nextCredentialScopeId;
+}
+
+function grantMismatch(slot: RuntimeSlot, includeWebSearch: boolean | undefined, nativeTools: string): boolean {
+	return Boolean(slot.includeWebSearch) !== Boolean(includeWebSearch) || (slot.nativeTools ?? "") !== nativeTools;
 }
 
 function getOrCreateSlot(scopeKey: string, agentInstanceId: string, cwd: string): RuntimeSlot {
@@ -217,12 +223,15 @@ export async function prepareTurn(input: OpenRuntimeTurnInput): Promise<Prepared
 	const continuing = Boolean(existingLive && trailing.length > 0);
 
 	if (existingLive && continuing) {
-		if (slotIdentityMismatch(slot, cwd, nextCredential) || Boolean(slot.includeWebSearch) !== Boolean(input.includeWebSearch)) {
-			await finishTurnFailed(slot, "webSearch grant or identity changed during parked tool calls");
+		const nextNativeTools = nativeToolsFingerprint(input.grantedTools.map((tool) => tool.name));
+		if (slotIdentityMismatch(slot, cwd, nextCredential) || grantMismatch(slot, input.includeWebSearch, nextNativeTools)) {
+			await finishTurnFailed(slot, "tool grant or identity changed during parked tool calls");
 			throw new Error(
 				slotIdentityMismatch(slot, cwd, nextCredential)
 					? "Cannot continue parked Cursor SDK tool calls after cwd or credentials changed"
-					: "Cannot continue parked Cursor SDK tool calls after webSearch grant changed",
+					: Boolean(slot.includeWebSearch) !== Boolean(input.includeWebSearch)
+						? "Cannot continue parked Cursor SDK tool calls after webSearch grant changed"
+						: "Cannot continue parked Cursor SDK tool calls after native tool grants changed",
 			);
 		}
 		return { slot, live: existingLive, continuing: true, customTools: {}, incremental: true };
@@ -233,8 +242,9 @@ export async function prepareTurn(input: OpenRuntimeTurnInput): Promise<Prepared
 		throw new Error("Cannot open a Cursor SDK agent without a model selection");
 	}
 
+	const nextNativeTools = nativeToolsFingerprint(input.grantedTools.map((tool) => tool.name));
 	const configMismatch = agentConfigMismatch(slot, cwd, nextCredential)
-		|| Boolean(slot.agent) && Boolean(slot.includeWebSearch) !== Boolean(input.includeWebSearch);
+		|| Boolean(slot.agent) && grantMismatch(slot, input.includeWebSearch, nextNativeTools);
 	const unsafeBinding = Boolean(slot.agent) && (slot.bindingState !== "committed" || configMismatch);
 	const resumeHandle = unsafeBinding ? undefined : getMatchingResumeHandle(input.agentInstanceId, nextCredential, cwd);
 	const sendState = unsafeBinding ? emptySendState() : slot.agent ? slot.sendState : resumeHandle?.sendState ?? emptySendState();
@@ -296,7 +306,9 @@ export async function prepareTurn(input: OpenRuntimeTurnInput): Promise<Prepared
 		}, newBridgeRunId()));
 		const toolExec = attachParkExecutor(live, input.grantedTools, input.host);
 		const sdkToOmp = new Map<string, string>();
-		const customTools = buildCustomTools(input.grantedTools, toolExec.execute, toolExec.dedupe, sdkToOmp);
+		const grantedNames = input.grantedTools.map((tool) => tool.name);
+		const customGranted = input.grantedTools.filter((tool) => !isHookedOmpTool(tool.name, grantedNames));
+		const customTools = buildCustomTools(customGranted, toolExec.execute, toolExec.dedupe, sdkToOmp);
 		live.projection.sdkToOmp = sdkToOmp;
 		live.projection.allowToolPreview = !input.host;
 
@@ -309,6 +321,7 @@ export async function prepareTurn(input: OpenRuntimeTurnInput): Promise<Prepared
 					store,
 					customTools,
 					includeWebSearch: input.includeWebSearch,
+					includeNativeTools: nativeSdkToolsFromGrants(grantedNames),
 					savedAgentId,
 					...(!savedAgentId ? { bootstrapHistory: history } : {}),
 					signal,
@@ -322,6 +335,7 @@ export async function prepareTurn(input: OpenRuntimeTurnInput): Promise<Prepared
 			slot.createCwd = cwd;
 			slot.credentialScopeId = nextCredential;
 			slot.includeWebSearch = Boolean(input.includeWebSearch);
+			slot.nativeTools = nextNativeTools;
 		}
 		live.agent = slot.agent;
 		live.checkpointStore = store;
@@ -330,6 +344,7 @@ export async function prepareTurn(input: OpenRuntimeTurnInput): Promise<Prepared
 		slot.cwd = cwd;
 		slot.credentialScopeId = nextCredential;
 		slot.includeWebSearch = Boolean(input.includeWebSearch);
+		slot.nativeTools = nextNativeTools;
 
 		return {
 			slot,

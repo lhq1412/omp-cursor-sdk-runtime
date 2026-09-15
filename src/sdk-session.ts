@@ -1,4 +1,5 @@
 import "./sdk-exit-guard.js";
+import { nativeReadHooked } from "./sdk-native-hook.js";
 import { Agent, JsonlLocalAgentStore, type AgentOptions, type LocalAgentStore, type ModelSelection, type SDKAgent, type SDKCustomTool } from "@cursor/sdk";
 import type { Context } from "@oh-my-pi/pi-ai";
 import { buildNativeHistory } from "./native-history.js";
@@ -20,6 +21,7 @@ export interface OpenAgentInput {
 	store: LocalAgentStore;
 	customTools: Record<string, SDKCustomTool>;
 	includeWebSearch?: boolean;
+	includeNativeTools?: readonly string[];
 	savedAgentId?: string;
 	bootstrapHistory?: Context["messages"];
 	signal?: AbortSignal;
@@ -33,15 +35,21 @@ export function assertLocalAgentId(agentId: string | undefined): void {
 
 export function buildAgentOptions(input: OpenAgentInput): AgentOptions {
 	assertLocalAgentId(input.savedAgentId);
+	const nativeTools = nativeReadHooked ? [...new Set(input.includeNativeTools ?? [])] : [];
 	const tools: NonNullable<AgentOptions["tools"]> = [];
 	if (Object.keys(input.customTools).length > 0) tools.push("mcp");
 	if (input.includeWebSearch) tools.push("webSearch");
+	for (const name of nativeTools) {
+		if (!tools.includes(name as (typeof tools)[number])) tools.push(name as (typeof tools)[number]);
+	}
+	const allowed = new Set(nativeTools);
+	const disallowedTools = SDK_NATIVE_DISALLOWED_TOOLS.filter((name) => !allowed.has(name));
 	// Capability gap: omit systemPrompt. The live CLI rejects `--system-prompt`.
 	return {
 		apiKey: input.apiKey,
 		model: input.model,
 		tools,
-		disallowedTools: [...SDK_NATIVE_DISALLOWED_TOOLS],
+		disallowedTools,
 		mcpServers: {},
 		local: {
 			cwd: input.cwd,

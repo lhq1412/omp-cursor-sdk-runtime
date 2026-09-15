@@ -40,7 +40,12 @@ for (const file of files) {
 				: ts.isImportEqualsDeclaration(node) && ts.isExternalModuleReference(node.moduleReference)
 					? node.moduleReference.expression
 					: undefined;
-		if (specifier && ts.isStringLiteralLike(specifier) && FORBIDDEN_IMPORT_PATTERNS.some((pattern) => specifier.text.includes(pattern))) {
+		if (specifier && ts.isStringLiteralLike(specifier) && FORBIDDEN_IMPORT_PATTERNS.some((pattern) => {
+			if (pattern === "@oh-my-pi/pi-ai/providers/cursor") {
+				return specifier.text === pattern || specifier.text.startsWith(`${pattern}/`);
+			}
+			return specifier.text.includes(pattern);
+		})) {
 			const bindings = ts.isImportDeclaration(node) && !node.importClause?.name ? node.importClause?.namedBindings : undefined;
 			const allowedName = nativeHistoryImports[specifier.text];
 			const allowed = file === join(root, "native-history.ts") && allowedName &&

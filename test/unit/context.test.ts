@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import { SDK_TOOL_CONTEXT } from "../../src/constants.ts";
+import { SDK_TOOL_CONTEXT, SDK_TOOL_CONTEXT_WITH_READ } from "../../src/constants.ts";
+import { nativeReadHooked } from "../../src/sdk-native-hook.ts";
 import { activeUserInput, activeUserText, computeContextFingerprint, emptySendState, planSend, prepareSendInput, registerLegacyCursorToolCallIdMigration, type ModelInputLimits } from "../../src/context.ts";
 import { CursorRecoveryBudgetError } from "../../src/errors.ts";
 import type { ModelSelection } from "@cursor/sdk";
@@ -255,7 +256,7 @@ describe("send policy", () => {
 		);
 		const prepared = bootstrap(ctx);
 		expect(prepared.history).toEqual(ctx.messages.slice(0, -1));
-		expect(prepared.prompt.text).toBe(`System instructions from OMP:\nYou are an OMP agent with extra instructions.\n\n${SDK_TOOL_CONTEXT}\n\ncontinue that edit`);
+		expect(prepared.prompt.text).toBe(`System instructions from OMP:\nYou are an OMP agent with extra instructions.\n\n${nativeReadHooked ? SDK_TOOL_CONTEXT_WITH_READ : SDK_TOOL_CONTEXT}\n\ncontinue that edit`);
 		expect(prepared.prompt.text).not.toContain("/workspace/important.ts");
 		expect(prepareSendInput({ mode: "incremental", resetAgent: false, reason: "incremental" }, ctx, modelLimits)).toEqual({
 			prompt: { text: "continue that edit" },

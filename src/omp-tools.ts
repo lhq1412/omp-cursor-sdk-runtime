@@ -1,11 +1,14 @@
 import type { Context, Tool, ToolResultMessage } from "@oh-my-pi/pi-ai";
 import { toolWireSchema } from "@oh-my-pi/pi-ai/utils/schema/wire";
 import type { GrantedTool, HostToolResult } from "./contracts.js";
+import { isHookedOmpTool } from "./sdk-native-hook.js";
 
 export function grantedToolsFromContext(context: Context): GrantedTool[] {
 	const granted: GrantedTool[] = [];
+	const names = (context.tools ?? []).map((tool) => tool.name);
 	for (const tool of context.tools ?? []) {
-		if (tool.native || tool.name === "web_search") continue;
+		if (tool.name === "web_search") continue;
+		if (tool.native && !isHookedOmpTool(tool.name, names)) continue;
 		granted.push({
 			name: tool.name,
 			description: descriptionFromTool(tool),
@@ -65,5 +68,7 @@ export function toolResultToHost(result: ToolResultMessage): HostToolResult {
 		if (block.type === "text") content.push({ type: "text", text: block.text });
 		if (block.type === "image") content.push({ type: "image", data: block.data, mimeType: block.mimeType });
 	}
-	return { isError: result.isError, content };
+	return result.details === undefined
+		? { isError: result.isError, content }
+		: { isError: result.isError, content, details: result.details };
 }

@@ -26,6 +26,7 @@ export interface HostSnapshotV1 {
 export interface HostToolResult {
 	content: Array<{ type: "text"; text: string } | { type: "image"; data: string; mimeType: string }>;
 	isError: boolean;
+	details?: unknown;
 }
 
 export interface SessionBinding {
