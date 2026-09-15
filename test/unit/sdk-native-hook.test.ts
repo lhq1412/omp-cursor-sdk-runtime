@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import { mapGlobArgs, mapNativeReadPath, nativeSdkToolsFromGrants, ompGlobToSdkResult, ompGrepToSdkResult, ompLsToSdkResult, ompReadToSdkResult, ompShellToSdkResult, ompWriteToSdkResult, resourceArgsName } from "../../src/sdk-native-hook.ts";
+import { mapGlobArgs, mapNativeReadPath, nativeSdkToolsFromGrants, ompGlobToSdkResult, ompGrepToSdkResult, ompLsToSdkResult, ompReadToSdkResult, ompShellToSdkResult, ompWriteToSdkResult, resourceArgsName, runWithNativeTools, __testUtils as nativeHookTestUtils } from "../../src/sdk-native-hook.ts";
+import { projectSdkToolCallId } from "../../src/tool-call-id.ts";
 
 describe("resourceArgsName", () => {
 	test("reads the Args name from remoteImplementation source", () => {
@@ -131,9 +132,9 @@ describe("ompShellToSdkResult", () => {
 describe("ompWriteToSdkResult", () => {
 	test("maps success onto the write envelope", () => {
 		expect(ompWriteToSdkResult("/tmp/a.ts", {
-			content: [{ type: "text", text: "ab\nc" }],
+			content: [{ type: "text", text: "Wrote file" }],
 			isError: false,
-		})).toEqual({
+		}, "ab\nc")).toEqual({
 			result: {
 				case: "success",
 				value: { path: "/tmp/a.ts", linesCreated: 2, fileSize: 4 },
@@ -244,7 +245,40 @@ describe("ompLsToSdkResult", () => {
 describe("nativeSdkToolsFromGrants", () => {
 	test("maps OMP grants onto SDK names and adds ls from read", () => {
 		expect(nativeSdkToolsFromGrants(["read", "glob", "write", "bash"])).toEqual(
-			expect.arrayContaining(["read", "ls", "glob", "write", "shell"]),
+			expect.arrayContaining(["read", "ls", "glob", "write", "edit", "shell"]),
 		);
+	});
+
+	test("does not advertise native edit without an OMP write grant", () => {
+		expect(nativeSdkToolsFromGrants(["edit"])).not.toContain("edit");
+		expect(nativeSdkToolsFromGrants(["write"])).toEqual(expect.arrayContaining(["write", "edit"]));
+	});
+});
+
+describe("executeNative", () => {
+	test("sends ranged reads as an OMP path selector and projects the exec id", async () => {
+		const calls: Array<{ name: string; args: Record<string, unknown>; id: string }> = [];
+		const sdkId = "x".repeat(87);
+		await runWithNativeTools(async (name, args, id) => {
+			calls.push({ name, args, id });
+			return { content: [{ type: "text", text: "line" }], isError: false };
+		}, () => nativeHookTestUtils.executeNative("readArgs", { path: "src/a.ts", offset: 10, limit: 5, toolCallId: sdkId }));
+		expect(calls).toEqual([{
+			name: "read",
+			args: { path: "src/a.ts:raw:10+5" },
+			id: projectSdkToolCallId(`${sdkId}:readArgs`),
+		}]);
+	});
+
+	test("computes write metadata from fileText not the host message", async () => {
+		const result = await runWithNativeTools(async () => {
+			return { content: [{ type: "text", text: "Wrote file" }], isError: false };
+		}, () => nativeHookTestUtils.executeNative("writeArgs", { path: "/tmp/a.ts", fileText: "ab\nc", toolCallId: "call1" }));
+		expect(result).toEqual({
+			result: {
+				case: "success",
+				value: { path: "/tmp/a.ts", linesCreated: 2, fileSize: 4 },
+			},
+		});
 	});
 });

@@ -4,6 +4,7 @@ import { join, resolve } from "node:path";
 import { describe, expect, test } from "bun:test";
 import type { Context } from "@oh-my-pi/pi-ai";
 import type { SDKAgent } from "@cursor/sdk";
+import type { GrantedTool } from "../../src/contracts.ts";
 import { credentialScopeId } from "../../src/auth.ts";
 import { computeContextFingerprint } from "../../src/context.ts";
 import { CURSOR_SESSION_AGENT_RESUME_ENTRY_TYPE } from "../../src/constants.ts";
@@ -63,6 +64,10 @@ function toolResultContext(): Context {
 			},
 		],
 	} as Context;
+}
+
+function granted(...names: string[]): GrantedTool[] {
+	return names.map((name) => ({ name, description: name, inputSchema: { type: "object" } }));
 }
 
 function registerResume(mode: "write" | "swallow" = "write", sessionId = "sess-1"): {
@@ -476,6 +481,45 @@ describe("session runtime", () => {
 		expect(opens).toEqual([true, false]);
 	});
 
+	test("reopens the agent when hooked native tool grants change", async () => {
+		runtimeTestUtils.clear();
+		liveRunTestUtils.clear();
+		scopeTestUtils.reset();
+		resumeTestUtils.reset();
+		registerResume();
+		const opens: Array<string[] | undefined> = [];
+		runtimeTestUtils.setOpenAgent(async (input) => {
+			opens.push(input.includeNativeTools ? [...input.includeNativeTools] : undefined);
+			return fakeAgent(`agent-${opens.length}`);
+		});
+		const firstContext = userContext("first");
+		const first = await prepareTurn({
+			modelLimits, cwd: "/tmp/project", agentInstanceId: "main", apiKey: "test-key",
+			modelSelection: { id: "composer-2.5" }, context: firstContext, grantedTools: granted("read"),
+		});
+		first.slot.bindingState = "committed";
+		first.slot.sendState = {
+			bootstrapped: true,
+			contextFingerprint: computeContextFingerprint(firstContext),
+			incrementalSendCount: 0,
+		};
+		liveRunTestUtils.clear();
+		const secondContext = {
+			messages: [
+				{ role: "user", content: "first", timestamp: 1 } as Context["messages"][number],
+				{ role: "user", content: "second", timestamp: 2 } as Context["messages"][number],
+			],
+		} as Context;
+		await prepareTurn({
+			modelLimits, cwd: "/tmp/project", agentInstanceId: "main", apiKey: "test-key",
+			modelSelection: { id: "composer-2.5" }, context: secondContext, grantedTools: granted("read", "grep"),
+		});
+		expect(opens).toEqual([
+			expect.arrayContaining(["read", "ls"]),
+			expect.arrayContaining(["read", "ls", "grep"]),
+		]);
+	});
+
 	test("creates a new agent and bootstraps history when cwd or credentials change", async () => {
 		runtimeTestUtils.clear();
 		liveRunTestUtils.clear();
@@ -632,6 +676,31 @@ describe("session runtime", () => {
 				modelSelection: { id: "composer-2.5" }, context: toolResultContext(), grantedTools: [], includeWebSearch: false,
 			}),
 		).rejects.toThrow(/webSearch grant changed/);
+		expect(opens).toEqual(["agent-1"]);
+	});
+
+	test("refuses parked continuation after native tool grants change", async () => {
+		runtimeTestUtils.clear();
+		liveRunTestUtils.clear();
+		scopeTestUtils.reset();
+		resumeTestUtils.reset();
+		registerResume();
+		const opens: string[] = [];
+		runtimeTestUtils.setOpenAgent(async () => {
+			const id = `agent-${opens.length + 1}`;
+			opens.push(id);
+			return fakeAgent(id);
+		});
+		await prepareTurn({
+			modelLimits, cwd: "/tmp/project", agentInstanceId: "main", apiKey: "key-a",
+			modelSelection: { id: "composer-2.5" }, context: userContext("first"), grantedTools: granted("read"),
+		});
+		await expect(
+			prepareTurn({
+				modelLimits, cwd: "/tmp/project", agentInstanceId: "main", apiKey: "key-a",
+				modelSelection: { id: "composer-2.5" }, context: toolResultContext(), grantedTools: granted("read", "grep"),
+			}),
+		).rejects.toThrow(/native tool grants changed/);
 		expect(opens).toEqual(["agent-1"]);
 	});
 

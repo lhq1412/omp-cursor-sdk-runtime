@@ -5,9 +5,10 @@ import { isHookedOmpTool } from "./sdk-native-hook.js";
 
 export function grantedToolsFromContext(context: Context): GrantedTool[] {
 	const granted: GrantedTool[] = [];
+	const names = (context.tools ?? []).map((tool) => tool.name);
 	for (const tool of context.tools ?? []) {
 		if (tool.name === "web_search") continue;
-		if (tool.native && !isHookedOmpTool(tool.name)) continue;
+		if (tool.native && !isHookedOmpTool(tool.name, names)) continue;
 		granted.push({
 			name: tool.name,
 			description: descriptionFromTool(tool),

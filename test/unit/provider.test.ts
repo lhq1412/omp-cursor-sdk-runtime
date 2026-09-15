@@ -13,6 +13,7 @@ import { __testUtils as resumeTestUtils } from "../../src/session-resume.ts";
 import { HOST_BRIDGE_OPTION_KEY } from "../../src/host-option.ts";
 import { createFakeHost } from "../helpers/fake-host.ts";
 import { projectSdkToolCallId } from "../../src/tool-call-id.ts";
+import { __testUtils as nativeHookTestUtils } from "../../src/sdk-native-hook.ts";
 
 const COMPOSER: ModelListItem = {
 	id: "composer-2.5",
@@ -148,6 +149,7 @@ function seedCatalog(items: ModelListItem[] = [COMPOSER, GPT], listKeys?: string
 
 describe("streamCursorRuntime model selection", () => {
 	beforeEach(async () => {
+		nativeHookTestUtils.setNativeHooked(false);
 		runtimeTestUtils.clear();
 		liveRunTestUtils.clear();
 		scopeTestUtils.reset();
@@ -159,6 +161,7 @@ describe("streamCursorRuntime model selection", () => {
 	});
 
 	afterEach(() => {
+		nativeHookTestUtils.resetNativeHooked();
 		runtimeTestUtils.clear();
 		liveRunTestUtils.clear();
 		controlsTestUtils.reset();

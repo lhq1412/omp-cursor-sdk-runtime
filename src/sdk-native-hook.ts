@@ -1,11 +1,17 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { readFileSync, writeFileSync } from "node:fs";
+import { createRequire } from "node:module";
+import { dirname, join } from "node:path";
 import type { HostToolResult } from "./contracts.js";
+import { projectSdkToolCallId } from "./tool-call-id.js";
 
 const HOOK = "__cursorSdkNativeToolHook";
-const BUNDLE = new URL("../node_modules/@cursor/sdk/dist/bundled/index.js", import.meta.url);
 
-/** OMP grant name → SDK AgentOptions.tools name. Native edit executes as writeArgs. */
+function resolveSdkBundle(): string {
+	return join(dirname(createRequire(import.meta.url).resolve("@cursor/sdk/package.json")), "dist/bundled/index.js");
+}
+
+/** OMP grant name → SDK AgentOptions.tools name. Native edit is writeArgs and needs OMP write. */
 export const NATIVE_OMP_TO_SDK = {
 	read: "read",
 	grep: "grep",
@@ -18,6 +24,7 @@ export const NATIVE_OMP_TO_SDK = {
 /** Extra SDK allowlist names enabled by an OMP grant. Native ls executes as OMP read. */
 const NATIVE_OMP_EXTRA_SDK: Record<string, readonly string[]> = {
 	read: ["ls"],
+	write: ["edit"],
 };
 
 const TOKEN_TO_OMP = {
@@ -53,11 +60,13 @@ export function resourceArgsName(token: object): string | undefined {
 
 export function nativeSdkToolsFromGrants(names: readonly string[]): string[] {
 	if (!nativeReadHooked) return [];
+	const granted = new Set(names);
 	const tools: string[] = [];
 	const add = (sdk: string) => {
 		if (!tools.includes(sdk)) tools.push(sdk);
 	};
 	for (const name of names) {
+		if (name === "edit" && !granted.has("write")) continue;
 		const sdk = NATIVE_OMP_TO_SDK[name as keyof typeof NATIVE_OMP_TO_SDK];
 		if (sdk) add(sdk);
 		for (const extra of NATIVE_OMP_EXTRA_SDK[name] ?? []) add(extra);
@@ -65,8 +74,14 @@ export function nativeSdkToolsFromGrants(names: readonly string[]): string[] {
 	return tools;
 }
 
-export function isHookedOmpTool(name: string): boolean {
-	return nativeReadHooked && name in NATIVE_OMP_TO_SDK;
+export function nativeToolsFingerprint(names: readonly string[]): string {
+	return nativeSdkToolsFromGrants(names).toSorted().join(",");
+}
+
+export function isHookedOmpTool(name: string, grantedNames?: readonly string[]): boolean {
+	if (!nativeReadHooked || !(name in NATIVE_OMP_TO_SDK)) return false;
+	if (name === "edit") return Boolean(grantedNames?.includes("write"));
+	return true;
 }
 
 export function mapNativeReadPath(path: string, offset?: number, limit?: number): string | null {
@@ -110,7 +125,7 @@ export function mapGlobArgs(args: Record<string, unknown>): { args: Record<strin
 	return { args: mapped };
 }
 
-export function ompReadToSdkResult(path: string, result: HostToolResult): object {
+export function ompReadToSdkResult(path: string, result: HostToolResult, rangeApplied = false): object {
 	const text = textOf(result);
 	if (result.isError) {
 		return { result: { case: "error", value: { path, error: text || "read failed" } } };
@@ -125,7 +140,7 @@ export function ompReadToSdkResult(path: string, result: HostToolResult): object
 				totalLines,
 				fileSize: BigInt(new TextEncoder().encode(text).byteLength),
 				truncated: false,
-				rangeApplied: false,
+				rangeApplied,
 			},
 		},
 	};
@@ -185,16 +200,19 @@ export function ompShellToSdkResult(args: Record<string, unknown>, result: HostT
 	};
 }
 
-export function ompWriteToSdkResult(path: string, result: HostToolResult): object {
+export function ompWriteToSdkResult(path: string, result: HostToolResult, fileText = ""): object {
 	const text = textOf(result);
 	if (result.isError) {
 		return { result: { case: "error", value: { path, error: text || "write failed" } } };
 	}
-	const linesCreated = text === "" ? 0 : text.split("\n").length;
 	return {
 		result: {
 			case: "success",
-			value: { path, linesCreated, fileSize: new TextEncoder().encode(text).byteLength },
+			value: {
+				path,
+				linesCreated: fileText === "" ? 0 : fileText.split("\n").length,
+				fileSize: new TextEncoder().encode(fileText).byteLength,
+			},
 		},
 	};
 }
@@ -312,19 +330,17 @@ async function executeNative(token: string, args: Record<string, unknown>): Prom
 	const run = nativeTools.getStore();
 	if (!run) return unavailable(token, args);
 	const toolCallId = str(args, "toolCallId", "tool_call_id");
-	const execId = toolCallId ? `${toolCallId}:${token}` : toolCallId;
+	const execId = toolCallId ? projectSdkToolCallId(`${toolCallId}:${token}`) : toolCallId;
 	try {
 		if (token === "readArgs") {
 			const path = str(args, "path");
-			if (typeof args.limit === "number" && Math.floor(args.limit) <= 0) {
+			const offset = optionalLine(args.offset);
+			const limit = typeof args.limit === "number" ? Math.floor(args.limit) : undefined;
+			const mapped = mapNativeReadPath(path, offset, limit);
+			if (mapped === null) {
 				return ompReadToSdkResult(path, { content: [{ type: "text", text: "" }], isError: false });
 			}
-			const readArgs: Record<string, unknown> = { path };
-			const offset = optionalLine(args.offset);
-			const limit = optionalLine(args.limit);
-			if (offset !== undefined) readArgs.offset = offset;
-			if (limit !== undefined) readArgs.limit = limit;
-			return ompReadToSdkResult(path, await run("read", readArgs, execId));
+			return ompReadToSdkResult(path, await run("read", { path: mapped }, execId), mapped !== path);
 		}
 		if (token === "grepArgs") {
 			const prepared = mapGrepArgs(args);
@@ -347,7 +363,7 @@ async function executeNative(token: string, args: Record<string, unknown>): Prom
 		}
 		const path = str(args, "path");
 		const content = str(args, "fileText", "file_text");
-		return ompWriteToSdkResult(path, await run("write", { path, content }, execId));
+		return ompWriteToSdkResult(path, await run("write", { path, content }, execId), content);
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
 		return ompToError(token, args, message);
@@ -416,22 +432,35 @@ function asArgs(args: unknown): Record<string, unknown> {
 	return args && typeof args === "object" ? args as Record<string, unknown> : {};
 }
 
-export const nativeReadHooked: boolean = (() => {
-	try {
-		const orig = readFileSync(BUNDLE, "utf8");
-		if (!orig.includes(`globalThis.${HOOK}`)) {
-			const patched = orig
-				.replace("wG8(s,i.customTools);", `wG8(s,i.customTools);globalThis.${HOOK}?.(s);`)
-				.replace("wG8(j,i.customTools),", `wG8(j,i.customTools),globalThis.${HOOK}?.(j),`);
-			if (patched === orig) return false;
-			writeFileSync(BUNDLE, patched);
-		}
-		installHook();
-		return true;
-	} catch {
-		return false;
+let nativeBundlePatched = false;
+export let nativeReadHooked = false;
+try {
+	const bundle = resolveSdkBundle();
+	const orig = readFileSync(bundle, "utf8");
+	if (!orig.includes(`globalThis.${HOOK}`)) {
+		const patched = orig
+			.replace("wG8(s,i.customTools);", `wG8(s,i.customTools);globalThis.${HOOK}?.(s);`)
+			.replace("wG8(j,i.customTools),", `wG8(j,i.customTools),globalThis.${HOOK}?.(j),`);
+		if (patched !== orig) writeFileSync(bundle, patched);
+		else throw new Error("cursor sdk native hook site missing");
 	}
-})();
+	installHook();
+	nativeBundlePatched = true;
+	nativeReadHooked = true;
+} catch {
+	nativeBundlePatched = false;
+	nativeReadHooked = false;
+}
+
+export const __testUtils = {
+	executeNative,
+	setNativeHooked(value: boolean) {
+		nativeReadHooked = value;
+	},
+	resetNativeHooked() {
+		nativeReadHooked = nativeBundlePatched;
+	},
+};
 
 export function runWithNativeTools<T>(execute: NativeToolExecutor, fn: () => T): T {
 	return nativeTools.run(execute, fn);

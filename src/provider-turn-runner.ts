@@ -32,7 +32,6 @@ import {
 	runResultToStopReason,
 	projectRunUsage,
 	reconcileRunResult,
-	ompToolCallId,
 	type CursorAssistantMessage,
 } from "./projector.js";
 import { readSettledCheckpointOccupancy } from "./native-history.js";

@@ -15,6 +15,7 @@ import { parseResumeEntryData, registerCursorSessionResume, __testUtils as resum
 import { disposeRuntimeForScope, __testUtils as runtimeTestUtils } from "../../src/session-runtime.ts";
 import { registerCursorSessionScope, __testUtils as scopeTestUtils } from "../../src/session-scope.ts";
 import { createFakeHost } from "../helpers/fake-host.ts";
+import { __testUtils as nativeHookTestUtils } from "../../src/sdk-native-hook.ts";
 
 const ITEMS: ModelListItem[] = [{ id: "composer-2.5", displayName: "Composer 2.5" }];
 const MODEL = { id: "composer-2.5", provider: CURSOR_SDK_PROVIDER_ID, api: CURSOR_SDK_API, contextWindow: 200_000, maxTokens: 8_192 } as Model<Api>;
@@ -68,6 +69,7 @@ describe("provider session isolation through host hooks", () => {
 	let releases: Array<() => void>;
 
 	beforeEach(async () => {
+		nativeHookTestUtils.setNativeHooked(false);
 		cwd = mkdtempSync(join(tmpdir(), "omp-provider-isolation-"));
 		sessions = [];
 		sends = [];
@@ -88,6 +90,7 @@ describe("provider session isolation through host hooks", () => {
 	});
 
 	afterEach(async () => {
+		nativeHookTestUtils.resetNativeHooked();
 		for (const release of releases) release();
 		for (const host of sessions) await host.emit("session_shutdown");
 		for (const scopeKey of new Set([...runtimeTestUtils.slots.values()].map((slot) => slot.scopeKey))) {
