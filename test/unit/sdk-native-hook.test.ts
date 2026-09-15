@@ -113,6 +113,67 @@ describe("ompGrepToSdkResult", () => {
 		});
 	});
 
+	test("parses OMP hashline grep output into file matches", () => {
+		expect(ompGrepToSdkResult({ pattern: "cursor-sdk", path: "package.json" }, {
+			content: [{ type: "text", text: "[package.json#0FD0]\n 11:    \"cursor\",\n*12:    \"cursor-sdk\"\n 13:  ]," }],
+			isError: false,
+			details: { truncated: false, files: ["package.json"] },
+		})).toMatchObject({
+			result: {
+				case: "success",
+				value: {
+					workspaceResults: {
+						"package.json": {
+							result: {
+								case: "content",
+								value: {
+									matches: [{
+										file: "package.json",
+										matches: [
+											{ lineNumber: 11, content: "    \"cursor\",", isContextLine: true },
+											{ lineNumber: 12, content: "    \"cursor-sdk\"", isContextLine: false },
+											{ lineNumber: 13, content: "  ],", isContextLine: true },
+										],
+									}],
+									totalMatchedLines: 1,
+									clientTruncated: false,
+								},
+							},
+						},
+					},
+				},
+			},
+		});
+	});
+
+	test("parses grouped OMP grep headers into file paths", () => {
+		const result = ompGrepToSdkResult({ pattern: ".", path: "." }, {
+			content: [{ type: "text", text: "# src/\n## auth.ts#50A5\n*1:import { createHash } from \"node:crypto\";" }],
+			isError: false,
+		});
+		expect(result).toMatchObject({
+			result: {
+				case: "success",
+				value: {
+					workspaceResults: {
+						".": {
+							result: {
+								case: "content",
+								value: {
+									matches: [{
+										file: "src/auth.ts",
+										matches: [{ lineNumber: 1, isContextLine: false }],
+									}],
+									totalMatchedLines: 1,
+								},
+							},
+						},
+					},
+				},
+			},
+		});
+	});
+
 	test("maps host errors onto the grep error envelope", () => {
 		expect(ompGrepToSdkResult({ pattern: "x" }, {
 			content: [{ type: "text", text: "bad pattern" }],

@@ -136,9 +136,53 @@ function readFileSizeFromDetails(details: unknown): number | undefined {
 	const fileSize = asDetails(details)?.fileSize;
 	return typeof fileSize === "number" && Number.isSafeInteger(fileSize) && fileSize >= 0 ? fileSize : undefined;
 }
+function parseGrepMatches(text: string, fallbackFile: string): Map<string, Array<{ lineNumber: number; content: string; isContextLine: boolean }>> {
+	const matchMap = new Map<string, Array<{ lineNumber: number; content: string; isContextLine: boolean }>>();
+	let currentFile = fallbackFile;
+	let currentDir = "";
+	const push = (file: string, lineNumber: number, content: string, isContextLine: boolean) => {
+		const list = matchMap.get(file) ?? [];
+		list.push({ lineNumber, content, isContextLine });
+		matchMap.set(file, list);
+	};
+	for (const raw of text.split("\n")) {
+		const line = raw.trimEnd();
+		if (!line || line === "..." || line.toLowerCase().startsWith("no matches")) continue;
+		const hashHeader = /^\[(.+)#[0-9a-fA-F]{4,}\]$/.exec(line);
+		if (hashHeader) {
+			currentFile = hashHeader[1]!;
+			continue;
+		}
+		const grouped = /^(#+)\s+(.*)$/.exec(line);
+		if (grouped) {
+			const rest = grouped[2]!.trimEnd();
+			if (rest.endsWith("/")) {
+				currentDir = rest.slice(0, -1);
+				continue;
+			}
+			const name = rest.replace(/#[0-9a-f]+$/i, "");
+			currentFile = currentDir && name ? `${currentDir}/${name}` : name || currentFile;
+			continue;
+		}
+		const omp = /^(\*| )(\d+)[:|](.*)$/.exec(line);
+		if (omp) {
+			push(currentFile, Number(omp[2]), omp[3]!, omp[1] === " ");
+			continue;
+		}
+		const rgContext = /^(.+?)-(\d+)-\s?(.*)$/.exec(line);
+		if (rgContext) {
+			push(rgContext[1]!, Number(rgContext[2]), rgContext[3]!, true);
+			continue;
+		}
+		const rgMatch = /^(.+?):(\d+):\s?(.*)$/.exec(line);
+		if (rgMatch) push(rgMatch[1]!, Number(rgMatch[2]), rgMatch[3]!, false);
+	}
+	return matchMap;
+}
 
-function grepOutputLines(text: string): string[] {
-	return text.split("\n").map((line) => line.trimEnd()).filter((line) => line.length > 0 && !line.startsWith("[") && !line.toLowerCase().startsWith("no matches"));
+function grepDetailFiles(details: unknown): string[] {
+	const files = asDetails(details)?.files;
+	return Array.isArray(files) ? files.filter((file): file is string => typeof file === "string") : [];
 }
 
 export function mapGlobArgs(args: Record<string, unknown>): { args: Record<string, unknown> } | { error: string } {
@@ -180,16 +224,18 @@ export function ompGrepToSdkResult(args: Record<string, unknown>, result: HostTo
 	const outputMode = str(args, "outputMode", "output_mode") || "content";
 	const clientTruncated = toolResultDetailBoolean(result.details, "truncated");
 	const offsetApplied = typeof args.offset === "number" ? args.offset : undefined;
-	const lines = grepOutputLines(text);
-	const workspaceKey = path;
+	const matchMap = parseGrepMatches(text, path);
+	const parsedFiles = [...matchMap.keys()];
+	const listedFiles = grepDetailFiles(result.details);
+	const files = listedFiles.length > 0 ? listedFiles : parsedFiles;
 	let unionResult: object;
 	if (outputMode === "files_with_matches") {
 		unionResult = {
 			result: {
 				case: "files",
 				value: omitUndefinedArgs({
-					files: lines,
-					totalFiles: lines.length,
+					files,
+					totalFiles: files.length,
 					clientTruncated,
 					ripgrepTruncated: false,
 					offsetApplied,
@@ -197,14 +243,10 @@ export function ompGrepToSdkResult(args: Record<string, unknown>, result: HostTo
 			},
 		};
 	} else if (outputMode === "count") {
-		const counts = lines.flatMap((line) => {
-			const separatorIndex = line.lastIndexOf(":");
-			if (separatorIndex === -1) return [];
-			const file = line.slice(0, separatorIndex);
-			const count = Number.parseInt(line.slice(separatorIndex + 1), 10);
-			if (!file || Number.isNaN(count)) return [];
-			return [{ file, count }];
-		});
+		const counts = files.map((file) => ({
+			file,
+			count: (matchMap.get(file) ?? []).filter((entry) => !entry.isContextLine).length || 1,
+		}));
 		unionResult = {
 			result: {
 				case: "count",
@@ -219,19 +261,6 @@ export function ompGrepToSdkResult(args: Record<string, unknown>, result: HostTo
 			},
 		};
 	} else {
-		const matchMap = new Map<string, Array<{ lineNumber: number; content: string; isContextLine: boolean }>>();
-		let totalMatchedLines = 0;
-		for (const line of lines) {
-			const matchLine = line.match(/^(.+?):(\d+):\s?(.*)$/);
-			const contextLine = line.match(/^(.+?)-(\d+)-\s?(.*)$/);
-			const match = matchLine ?? contextLine;
-			if (!match) continue;
-			const file = match[1]!;
-			const list = matchMap.get(file) ?? [];
-			list.push({ lineNumber: Number(match[2]), content: match[3]!, isContextLine: Boolean(contextLine) });
-			matchMap.set(file, list);
-			if (!contextLine) totalMatchedLines += 1;
-		}
 		const matches = [...matchMap.entries()].map(([file, fileMatches]) => ({
 			file,
 			matches: fileMatches.map((entry) => ({ ...entry, contentTruncated: false })),
@@ -242,7 +271,10 @@ export function ompGrepToSdkResult(args: Record<string, unknown>, result: HostTo
 				value: omitUndefinedArgs({
 					matches,
 					totalLines: matches.reduce((sum, entry) => sum + entry.matches.length, 0),
-					totalMatchedLines,
+					totalMatchedLines: matches.reduce(
+						(sum, entry) => sum + entry.matches.filter((item) => !item.isContextLine).length,
+						0,
+					),
 					clientTruncated,
 					ripgrepTruncated: false,
 					offsetApplied,
@@ -257,12 +289,11 @@ export function ompGrepToSdkResult(args: Record<string, unknown>, result: HostTo
 				pattern,
 				path,
 				outputMode,
-				workspaceResults: { [workspaceKey]: unionResult },
+				workspaceResults: { [path]: unionResult },
 			},
 		},
 	};
 }
-
 export function ompWriteToSdkResult(path: string, result: HostToolResult, fileText = "", returnFileContentAfterWrite = false): object {
 	const text = textOf(result);
 	if (result.isError) {
