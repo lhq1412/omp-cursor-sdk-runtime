@@ -57,6 +57,15 @@ describe("ompReadToSdkResult", () => {
 		});
 	});
 
+	test("does not report window size as totalLines for a ranged read", () => {
+		expect(ompReadToSdkResult("/tmp/a.ts", {
+			content: [{ type: "text", text: "a\nb\nc" }],
+			isError: false,
+		}, true)).toMatchObject({
+			result: { case: "success", value: { totalLines: 0, rangeApplied: true, output: { case: "content", value: "a\nb\nc" } } },
+		});
+	});
+
 	test("maps host errors onto the proto error envelope", () => {
 		expect(ompReadToSdkResult("/tmp/a.ts", {
 			content: [{ type: "text", text: "missing" }],
@@ -68,9 +77,9 @@ describe("ompReadToSdkResult", () => {
 });
 
 describe("ompGrepToSdkResult", () => {
-	test("wraps host text as a content match", () => {
+	test("parses file:line:content matches like the OMP Cursor provider", () => {
 		expect(ompGrepToSdkResult({ pattern: "ab", path: "src" }, {
-			content: [{ type: "text", text: "src/a.ts:1:ab" }],
+			content: [{ type: "text", text: "src/a.ts:1:ab\nsrc/a.ts-2-cd" }],
 			isError: false,
 		})).toEqual({
 			result: {
@@ -84,8 +93,14 @@ describe("ompGrepToSdkResult", () => {
 							result: {
 								case: "content",
 								value: {
-									matches: [{ file: "src", matches: [{ lineNumber: 1, content: "src/a.ts:1:ab", contentTruncated: false, isContextLine: false }] }],
-									totalLines: 1,
+									matches: [{
+										file: "src/a.ts",
+										matches: [
+											{ lineNumber: 1, content: "ab", contentTruncated: false, isContextLine: false },
+											{ lineNumber: 2, content: "cd", contentTruncated: false, isContextLine: true },
+										],
+									}],
+									totalLines: 2,
 									totalMatchedLines: 1,
 									clientTruncated: false,
 									ripgrepTruncated: false,
@@ -139,6 +154,12 @@ describe("ompWriteToSdkResult", () => {
 				case: "success",
 				value: { path: "/tmp/a.ts", linesCreated: 2, fileSize: 4 },
 			},
+		});
+		expect(ompWriteToSdkResult("/tmp/a.ts", {
+			content: [{ type: "text", text: "Wrote file" }],
+			isError: false,
+		}, "ab\nc", true)).toMatchObject({
+			result: { case: "success", value: { fileContentAfterWrite: "ab\nc" } },
 		});
 	});
 
@@ -208,7 +229,7 @@ describe("ompGlobToSdkResult", () => {
 describe("ompLsToSdkResult", () => {
 	test("maps a directory listing onto a flat tree", () => {
 		expect(ompLsToSdkResult("lsArgs", "src", {
-			content: [{ type: "text", text: "a.ts\nlib/\n" }],
+			content: [{ type: "text", text: "a.ts (1.2k)\nlib/\n[3 more]\n" }],
 			isError: false,
 		})).toEqual({
 			result: {

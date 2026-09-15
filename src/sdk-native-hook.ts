@@ -110,6 +110,38 @@ function str(args: Record<string, unknown>, ...keys: string[]): string {
 	return "";
 }
 
+function asDetails(details: unknown): Record<string, unknown> | undefined {
+	return details && typeof details === "object" ? details as Record<string, unknown> : undefined;
+}
+
+function toolResultWasTruncated(details: unknown): boolean {
+	const truncation = asDetails(details)?.truncation;
+	return !!asDetails(truncation)?.truncated;
+}
+
+function toolResultDetailBoolean(details: unknown, key: string): boolean {
+	const value = asDetails(details)?.[key];
+	return typeof value === "boolean" ? value : false;
+}
+
+function readTotalLinesFromDetails(details: unknown): number | undefined {
+	const rec = asDetails(details);
+	if (!rec) return undefined;
+	if (typeof rec.totalLines === "number" && Number.isFinite(rec.totalLines)) return rec.totalLines;
+	const truncation = asDetails(asDetails(rec.meta)?.truncation);
+	const totalLines = truncation?.totalLines;
+	return typeof totalLines === "number" && Number.isFinite(totalLines) ? totalLines : undefined;
+}
+
+function readFileSizeFromDetails(details: unknown): number | undefined {
+	const fileSize = asDetails(details)?.fileSize;
+	return typeof fileSize === "number" && Number.isSafeInteger(fileSize) && fileSize >= 0 ? fileSize : undefined;
+}
+
+function grepOutputLines(text: string): string[] {
+	return text.split("\n").map((line) => line.trimEnd()).filter((line) => line.length > 0 && !line.startsWith("[") && !line.toLowerCase().startsWith("no matches"));
+}
+
 export function mapGlobArgs(args: Record<string, unknown>): { args: Record<string, unknown> } | { error: string } {
 	const pattern = str(args, "globPattern", "glob_pattern", "pattern");
 	if (!pattern.trim()) return { error: "glob pattern is required (received an empty pattern)." };
@@ -123,7 +155,7 @@ export function ompReadToSdkResult(path: string, result: HostToolResult, rangeAp
 	if (result.isError) {
 		return { result: { case: "error", value: { path, error: text || "read failed" } } };
 	}
-	const totalLines = text === "" ? 0 : text.split("\n").length;
+	const totalLines = readTotalLinesFromDetails(result.details) ?? (rangeApplied ? 0 : text ? text.split("\n").length : 0);
 	return {
 		result: {
 			case: "success",
@@ -131,8 +163,8 @@ export function ompReadToSdkResult(path: string, result: HostToolResult, rangeAp
 				path,
 				output: { case: "content", value: text },
 				totalLines,
-				fileSize: BigInt(new TextEncoder().encode(text).byteLength),
-				truncated: false,
+				fileSize: BigInt(readFileSizeFromDetails(result.details) ?? new TextEncoder().encode(text).byteLength),
+				truncated: toolResultWasTruncated(result.details),
 				rangeApplied,
 			},
 		},
@@ -146,28 +178,105 @@ export function ompGrepToSdkResult(args: Record<string, unknown>, result: HostTo
 	if (result.isError) {
 		return { result: { case: "error", value: { error: text || "grep failed" } } };
 	}
-	const lines = text === "" ? 0 : text.split("\n").length;
+	const outputMode = str(args, "outputMode", "output_mode") || "content";
+	const clientTruncated = toolResultDetailBoolean(result.details, "truncated");
+	const offsetApplied = typeof args.offset === "number" ? args.offset : undefined;
+	const lines = grepOutputLines(text);
+	const workspaceKey = path;
+	let unionResult: object;
+	if (outputMode === "files_with_matches") {
+		unionResult = {
+			result: {
+				case: "files",
+				value: omitUndefinedArgs({
+					files: lines,
+					totalFiles: lines.length,
+					clientTruncated,
+					ripgrepTruncated: false,
+					offsetApplied,
+				}),
+			},
+		};
+	} else if (outputMode === "count") {
+		const counts = lines.flatMap((line) => {
+			const separatorIndex = line.lastIndexOf(":");
+			if (separatorIndex === -1) return [];
+			const file = line.slice(0, separatorIndex);
+			const count = Number.parseInt(line.slice(separatorIndex + 1), 10);
+			if (!file || Number.isNaN(count)) return [];
+			return [{ file, count }];
+		});
+		unionResult = {
+			result: {
+				case: "count",
+				value: omitUndefinedArgs({
+					counts,
+					totalFiles: counts.length,
+					totalMatches: counts.reduce((sum, entry) => sum + entry.count, 0),
+					clientTruncated,
+					ripgrepTruncated: false,
+					offsetApplied,
+				}),
+			},
+		};
+	} else {
+		const matchMap = new Map<string, Array<{ lineNumber: number; content: string; isContextLine: boolean }>>();
+		let totalMatchedLines = 0;
+		for (const line of lines) {
+			const matchLine = line.match(/^(.+?):(\d+):\s?(.*)$/);
+			const contextLine = line.match(/^(.+?)-(\d+)-\s?(.*)$/);
+			const match = matchLine ?? contextLine;
+			if (!match) continue;
+			const file = match[1]!;
+			const list = matchMap.get(file) ?? [];
+			list.push({ lineNumber: Number(match[2]), content: match[3]!, isContextLine: Boolean(contextLine) });
+			matchMap.set(file, list);
+			if (!contextLine) totalMatchedLines += 1;
+		}
+		const matches = [...matchMap.entries()].map(([file, fileMatches]) => ({
+			file,
+			matches: fileMatches.map((entry) => ({ ...entry, contentTruncated: false })),
+		}));
+		unionResult = {
+			result: {
+				case: "content",
+				value: omitUndefinedArgs({
+					matches,
+					totalLines: matches.reduce((sum, entry) => sum + entry.matches.length, 0),
+					totalMatchedLines,
+					clientTruncated,
+					ripgrepTruncated: false,
+					offsetApplied,
+				}),
+			},
+		};
+	}
 	return {
 		result: {
 			case: "success",
 			value: {
 				pattern,
 				path,
-				outputMode: "content",
-				workspaceResults: {
-					[path]: {
-						result: {
-							case: "content",
-							value: {
-								matches: [{ file: path, matches: [{ lineNumber: 1, content: text, contentTruncated: false, isContextLine: false }] }],
-								totalLines: lines,
-								totalMatchedLines: lines,
-								clientTruncated: false,
-								ripgrepTruncated: false,
-							},
-						},
-					},
-				},
+				outputMode,
+				workspaceResults: { [workspaceKey]: unionResult },
+			},
+		},
+	};
+}
+
+export function ompWriteToSdkResult(path: string, result: HostToolResult, fileText = "", returnFileContentAfterWrite = false): object {
+	const text = textOf(result);
+	if (result.isError) {
+		return { result: { case: "error", value: { path, error: text || "write failed" } } };
+	}
+	return {
+		result: {
+			case: "success",
+			value: {
+				path,
+				linesCreated: fileText === "" ? 0 : fileText.split("\n").length,
+				fileSize: new TextEncoder().encode(fileText).byteLength,
+				...(returnFileContentAfterWrite ? { fileContentAfterWrite: fileText } : {}),
 			},
 		},
 	};
@@ -193,23 +302,6 @@ export function ompShellToSdkResult(args: Record<string, unknown>, result: HostT
 	};
 }
 
-export function ompWriteToSdkResult(path: string, result: HostToolResult, fileText = ""): object {
-	const text = textOf(result);
-	if (result.isError) {
-		return { result: { case: "error", value: { path, error: text || "write failed" } } };
-	}
-	return {
-		result: {
-			case: "success",
-			value: {
-				path,
-				linesCreated: fileText === "" ? 0 : fileText.split("\n").length,
-				fileSize: new TextEncoder().encode(fileText).byteLength,
-			},
-		},
-	};
-}
-
 export function ompGlobToSdkResult(token: string, args: Record<string, unknown>, result: HostToolResult): object {
 	const text = textOf(result);
 	if (result.isError) {
@@ -218,13 +310,20 @@ export function ompGlobToSdkResult(token: string, args: Record<string, unknown>,
 	if (PI_OUTPUT_TOKENS.has(token)) {
 		return { result: { case: "success", value: { output: text } } };
 	}
-	const files = text.split("\n").map((line) => line.trim()).filter(Boolean);
+	const files = text.split("\n").map((line) => line.trim()).filter((line) => line.length > 0 && !line.startsWith("["));
 	const pattern = str(args, "globPattern", "glob_pattern", "pattern");
 	const path = str(args, "targetDirectory", "target_directory", "path") || ".";
 	return {
 		result: {
 			case: "success",
-			value: { pattern, path, files, totalFiles: files.length, clientTruncated: false, ripgrepTruncated: false },
+			value: {
+				pattern,
+				path,
+				files,
+				totalFiles: files.length,
+				clientTruncated: toolResultDetailBoolean(result.details, "truncated"),
+				ripgrepTruncated: false,
+			},
 		},
 	};
 }
@@ -239,16 +338,15 @@ export function ompLsToSdkResult(token: string, path: string, result: HostToolRe
 	if (PI_OUTPUT_TOKENS.has(token)) {
 		return { result: { case: "success", value: { output: text } } };
 	}
+	const rootPath = path || ".";
 	const dirs: Array<{ absPath: string; childrenDirs: unknown[]; childrenFiles: unknown[]; childrenWereProcessed: boolean; fullSubtreeExtensionCounts: Record<string, number>; numFiles: number }> = [];
 	const files: Array<{ name: string }> = [];
-	for (const line of text.split("\n")) {
-		const name = line.trim().replace(/^\.\//, "");
-		if (!name || name.endsWith(":")) continue;
-		const base = name.replace(/\/+$/, "").split("/").filter(Boolean).pop() ?? name.replace(/\/+$/, "");
-		if (!base) continue;
+	for (const entry of text.split("\n").map((line) => line.trim()).filter((line) => line.length > 0 && !line.startsWith("["))) {
+		const name = entry.split(" (")[0]!;
 		if (name.endsWith("/")) {
+			const dirName = name.slice(0, -1);
 			dirs.push({
-				absPath: piJoinPath(path, base),
+				absPath: `${rootPath.replace(/\/$/, "")}/${dirName}`,
 				childrenDirs: [],
 				childrenFiles: [],
 				childrenWereProcessed: false,
@@ -256,7 +354,7 @@ export function ompLsToSdkResult(token: string, path: string, result: HostToolRe
 				numFiles: 0,
 			});
 		} else {
-			files.push({ name: base });
+			files.push({ name });
 		}
 	}
 	return {
@@ -264,7 +362,7 @@ export function ompLsToSdkResult(token: string, path: string, result: HostToolRe
 			case: "success",
 			value: {
 				directoryTreeRoot: {
-					absPath: path,
+					absPath: rootPath,
 					childrenDirs: dirs,
 					childrenFiles: files,
 					childrenWereProcessed: true,
@@ -355,7 +453,7 @@ async function executeNative(token: string, args: Record<string, unknown>): Prom
 		const path = str(args, "path");
 		const content = str(args, "fileText", "file_text")
 			|| (args.fileBytes instanceof Uint8Array ? new TextDecoder().decode(args.fileBytes) : "");
-		return ompWriteToSdkResult(path, await run("write", { path, content }, execId), content);
+		return ompWriteToSdkResult(path, await run("write", { path, content }, execId), content, args.returnFileContentAfterWrite === true);
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
 		return ompToError(token, args, message);
