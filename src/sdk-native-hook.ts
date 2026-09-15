@@ -20,7 +20,7 @@ function resolveSdkBundle(): string {
 	return join(dirname(createRequire(import.meta.url).resolve("@cursor/sdk/package.json")), "dist/bundled/index.js");
 }
 
-/** OMP grant name → SDK AgentOptions.tools name. Cursor has no `write` tool; OMP write is native `edit`/`writeArgs`. */
+/** OMP grant name → SDK AgentOptions.tools name. Native `edit` requires both `read` and `write`: Cursor StrReplace materializes via readArgs then writeArgs. */
 export const NATIVE_OMP_TO_SDK = {
 	read: "read",
 	grep: "grep",
@@ -74,7 +74,7 @@ export function nativeSdkToolsFromGrants(names: readonly string[]): string[] {
 		if (!tools.includes(sdk)) tools.push(sdk);
 	};
 	for (const name of names) {
-		if (name === "edit" && !granted.has("write")) continue;
+		if ((name === "edit" || name === "write") && !(granted.has("read") && granted.has("write"))) continue;
 		const sdk = NATIVE_OMP_TO_SDK[name as keyof typeof NATIVE_OMP_TO_SDK];
 		if (sdk) add(sdk);
 		for (const extra of NATIVE_OMP_EXTRA_SDK[name] ?? []) add(extra);
@@ -88,7 +88,7 @@ export function nativeToolsFingerprint(names: readonly string[]): string {
 
 export function isHookedOmpTool(name: string, grantedNames?: readonly string[]): boolean {
 	if (!nativeReadHooked || !(name in NATIVE_OMP_TO_SDK)) return false;
-	if (name === "edit") return Boolean(grantedNames?.includes("write"));
+	if (name === "edit" || name === "write") return Boolean(grantedNames?.includes("read") && grantedNames?.includes("write"));
 	return true;
 }
 
