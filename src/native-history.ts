@@ -52,17 +52,35 @@ export interface NativeSummaryStateProbe {
 	maxTokens?: number;
 }
 
+export interface SummaryRunEventNote {
+	runId?: string;
+	seq: number;
+	eventType: string;
+	messageCount?: number;
+	messagesToCompact?: number;
+}
+
 export interface SummaryBoundaryObservation {
 	summaryGeneration: number;
 	beforeRoot: string | null;
 	afterRoot: string;
 	before?: NativeSummaryStateProbe;
 	after: NativeSummaryStateProbe;
-	runEvent?: {
-		eventType: string;
-		messageCount?: number;
-		messagesToCompact?: number;
-	};
+	runEvent?: SummaryRunEventNote;
+}
+
+export interface SummaryBoundaryProbe {
+	seed(root: string | null): void;
+	onSummaryStarted(agentId: string): Promise<void>;
+	onSummaryCompleted(): void;
+	onAgentUpdated(agent: {
+		agentId: string;
+		status?: string;
+		activeRunId?: string | null;
+		latestCheckpoint?: { rootBlobId: string } | null;
+	}): void;
+	onRunEvent(event: { runId?: string; eventType: string; payload?: unknown }): void;
+	flush(): Promise<SummaryBoundaryObservation | undefined>;
 }
 
 function shortHash(parts: Uint8Array[]): string {
@@ -151,61 +169,71 @@ export async function readCheckpointProbe(store: LocalAgentStore, agentId: strin
 	}
 }
 
-export function createSummaryBoundaryProbe(store: LocalAgentStore) {
+export function createSummaryBoundaryProbe(store: LocalAgentStore): SummaryBoundaryProbe {
 	let startSeq = 0;
 	let generation = 0;
 	let waiting = false;
+	let cycleOpen = false;
 	let latestRoot: string | null = null;
 	let beforeRoot: string | null = null;
 	let before: NativeSummaryStateProbe | undefined;
 	let afterRoot: string | undefined;
 	let observation: SummaryBoundaryObservation | undefined;
 	let capturing: Promise<void> | undefined;
-	let runEvent: SummaryBoundaryObservation["runEvent"];
+	let beforeCapture: Promise<void> | undefined;
+	let eventSeq = 0;
+	let usedSeq = 0;
+	let latest: SummaryRunEventNote | undefined;
+	let cycleRunEvent: SummaryRunEventNote | undefined;
 
 	async function capture(agentId: string, root: string) {
+		if (beforeCapture) await beforeCapture;
 		const after = await readCheckpointProbe(store, agentId, root);
 		if (!after || afterRoot !== root) return;
 		waiting = false;
+		cycleOpen = false;
+		const attached = cycleRunEvent && cycleRunEvent.seq > usedSeq ? cycleRunEvent : undefined;
+		if (attached) usedSeq = attached.seq;
+		cycleRunEvent = undefined;
 		observation = {
 			summaryGeneration: generation,
 			beforeRoot,
 			afterRoot: root,
 			...(before ? { before } : {}),
 			after,
-			...(runEvent ? { runEvent } : {}),
+			...(attached ? { runEvent: attached } : {}),
 		};
 	}
 
 	return {
-		seed(root: string | null) {
+		seed(root) {
 			if (!waiting) latestRoot = root;
 		},
-		async onSummaryStarted(agentId: string) {
+		onSummaryStarted(agentId) {
 			const token = ++startSeq;
 			waiting = false;
+			cycleOpen = true;
 			afterRoot = undefined;
 			observation = undefined;
 			capturing = undefined;
 			beforeRoot = latestRoot;
 			before = undefined;
-			const probe = beforeRoot
-				? await readCheckpointProbe(store, agentId, beforeRoot)
-				: (await readNativeCheckpoint(store, agentId).catch(() => undefined))?.probe ?? undefined;
-			if (token !== startSeq) return;
-			before = probe;
-			if (probe) beforeRoot = probe.rootBlobId;
+			cycleRunEvent = latest && latest.seq > usedSeq ? latest : undefined;
+			beforeCapture = (async () => {
+				const probe = beforeRoot
+					? await readCheckpointProbe(store, agentId, beforeRoot)
+					: (await readNativeCheckpoint(store, agentId).catch(() => undefined))?.probe ?? undefined;
+				if (token !== startSeq) return;
+				before = probe;
+				if (probe) beforeRoot = probe.rootBlobId;
+			})();
+			return beforeCapture;
 		},
 		onSummaryCompleted() {
 			generation += 1;
 			waiting = true;
 		},
-		onAgentUpdated(agent: {
-			agentId: string;
-			status?: string;
-			activeRunId?: string | null;
-			latestCheckpoint?: { rootBlobId: string } | null;
-		}) {
+		onAgentUpdated(agent) {
 			const root = agent.latestCheckpoint?.rootBlobId ?? null;
 			if (!waiting) {
 				latestRoot = root;
@@ -215,13 +243,21 @@ export function createSummaryBoundaryProbe(store: LocalAgentStore) {
 			afterRoot = root;
 			capturing = capture(agent.agentId, root);
 		},
-		onRunEvent(event: { eventType: string; payload?: unknown }) {
+		onRunEvent(event) {
 			const counts = compactCounts(event.payload);
 			const type = event.eventType.toLowerCase();
 			if (!counts && !type.includes("compact") && !type.includes("summar")) return;
-			runEvent = { eventType: event.eventType, ...counts };
+			eventSeq += 1;
+			latest = {
+				seq: eventSeq,
+				eventType: event.eventType,
+				...(event.runId ? { runId: event.runId } : {}),
+				...counts,
+			};
+			if (cycleOpen && latest.seq > usedSeq) cycleRunEvent = latest;
 		},
 		async flush() {
+			if (beforeCapture) await beforeCapture;
 			if (capturing) await capturing;
 			const result = observation;
 			observation = undefined;
@@ -229,8 +265,6 @@ export function createSummaryBoundaryProbe(store: LocalAgentStore) {
 		},
 	};
 }
-
-export type SummaryBoundaryProbe = ReturnType<typeof createSummaryBoundaryProbe>;
 
 /** Only a new, idle, stable checkpoint can describe the completed turn's context. */
 export async function readSettledCheckpointOccupancy(store: LocalAgentStore, agentId: string, previousRoot: string | null) {
