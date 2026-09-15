@@ -1,9 +1,13 @@
 import { createHash } from "node:crypto";
-import { normalizeToolCallId } from "@oh-my-pi/pi-ai/utils";
+
+function isPortableToolCallId(id: string): boolean {
+	const sanitized = id.replace(/[^A-Za-z0-9_-]/g, "_");
+	return (sanitized.length > 64 ? sanitized.slice(0, 64) : sanitized) === id;
+}
 
 /** Cursor SDK → OMP portable tool-call ID. Already-portable IDs are kept. */
 export function projectSdkToolCallId(id: string): string {
-	if (normalizeToolCallId(id) === id) return id;
+	if (isPortableToolCallId(id)) return id;
 	return createHash("sha256").update("cursor-sdk:omp-tool-call\0").update(id).digest("hex");
 }
 

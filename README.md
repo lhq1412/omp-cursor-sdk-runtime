@@ -117,7 +117,7 @@ SDK preset variants are valid selections independently of advertised parameter d
 
 ## Tools
 
-On stock brew OMP, `context.tools` plus xd://-mounted tools (including enabled `mcp__*` MCP tools) are mapped to Cursor SDK custom tools. When the native hook installs, granted OMP `read`/`grep`/`bash`/`edit`/`glob`/`write` are advertised as Cursor `read`/`grep`/`shell`/`edit`/`glob`/`write` (and `ls` when `read` is granted) and intercepted back to the OMP host (`edit` executes as OMP `write`; `ls` executes as OMP `read`). `delete` and `task` stay disallowed. SDK `settingSources` is always `[]`; `mcpServers` is always `{}`.
+On stock brew OMP, `context.tools` plus xd://-mounted tools (including enabled `mcp__*` MCP tools) are mapped to Cursor SDK custom tools. When the native hook installs, granted OMP `read`/`grep`/`bash`/`glob` are advertised as Cursor `read`/`grep`/`shell`/`glob` (and `ls` when `read` is granted) and intercepted back to the OMP host (`ls` executes as OMP `read`). Native `edit` is advertised only when both `read` and `write` are granted (`edit`/`writeArgs` executes as OMP `write`); `write` or `edit` alone stay custom tools. Cursor has no `write` tool name. `delete` and `task` stay disallowed. SDK `settingSources` is always `[]`; `mcpServers` is always `{}`.
 
 The extension shadows OMP `web_search`. Non-`cursor-sdk` models try an isolated Cursor SDK agent with only `webSearch` (no shell/edit/MCP/session resume), using `/login cursor-sdk` or `CURSOR_API_KEY`. If Cursor is missing, fails, or finishes without calling `webSearch`, it falls back to OMP's native search chain via `ctx.invokeTool`. `cursor-sdk/*` does not bridge that wrapper as a custom tool; when OMP granted `web_search`, the session agent may use native `webSearch` only.
 

@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mapGlobArgs, mapNativeReadPath, nativeSdkToolsFromGrants, ompGlobToSdkResult, ompGrepToSdkResult, ompLsToSdkResult, ompReadToSdkResult, ompShellToSdkResult, ompWriteToSdkResult, resourceArgsName, runWithNativeTools, __testUtils as nativeHookTestUtils } from "../../src/sdk-native-hook.ts";
+import { isHookedOmpTool, mapGlobArgs, mapNativeReadPath, nativeSdkToolsFromGrants, ompGlobToSdkResult, ompGrepToSdkResult, ompLsToSdkResult, ompReadToSdkResult, ompShellToSdkResult, ompWriteToSdkResult, resourceArgsName, runWithNativeTools, __testUtils as nativeHookTestUtils } from "../../src/sdk-native-hook.ts";
 import { projectSdkToolCallId } from "../../src/tool-call-id.ts";
 
 describe("resourceArgsName", () => {
@@ -104,6 +104,67 @@ describe("ompGrepToSdkResult", () => {
 									totalMatchedLines: 1,
 									clientTruncated: false,
 									ripgrepTruncated: false,
+								},
+							},
+						},
+					},
+				},
+			},
+		});
+	});
+
+	test("parses OMP hashline grep output into file matches", () => {
+		expect(ompGrepToSdkResult({ pattern: "cursor-sdk", path: "package.json" }, {
+			content: [{ type: "text", text: "[package.json#0FD0]\n 11:    \"cursor\",\n*12:    \"cursor-sdk\"\n 13:  ]," }],
+			isError: false,
+			details: { truncated: false, files: ["package.json"] },
+		})).toMatchObject({
+			result: {
+				case: "success",
+				value: {
+					workspaceResults: {
+						"package.json": {
+							result: {
+								case: "content",
+								value: {
+									matches: [{
+										file: "package.json",
+										matches: [
+											{ lineNumber: 11, content: "    \"cursor\",", isContextLine: true },
+											{ lineNumber: 12, content: "    \"cursor-sdk\"", isContextLine: false },
+											{ lineNumber: 13, content: "  ],", isContextLine: true },
+										],
+									}],
+									totalMatchedLines: 1,
+									clientTruncated: false,
+								},
+							},
+						},
+					},
+				},
+			},
+		});
+	});
+
+	test("parses grouped OMP grep headers into file paths", () => {
+		const result = ompGrepToSdkResult({ pattern: ".", path: "." }, {
+			content: [{ type: "text", text: "# src/\n## auth.ts#50A5\n*1:import { createHash } from \"node:crypto\";" }],
+			isError: false,
+		});
+		expect(result).toMatchObject({
+			result: {
+				case: "success",
+				value: {
+					workspaceResults: {
+						".": {
+							result: {
+								case: "content",
+								value: {
+									matches: [{
+										file: "src/auth.ts",
+										matches: [{ lineNumber: 1, isContextLine: false }],
+									}],
+									totalMatchedLines: 1,
 								},
 							},
 						},
@@ -266,13 +327,31 @@ describe("ompLsToSdkResult", () => {
 describe("nativeSdkToolsFromGrants", () => {
 	test("maps OMP grants onto SDK names and adds ls from read", () => {
 		expect(nativeSdkToolsFromGrants(["read", "glob", "write", "bash"])).toEqual(
-			expect.arrayContaining(["read", "ls", "glob", "write", "edit", "shell"]),
+			expect.arrayContaining(["read", "ls", "glob", "edit", "shell"]),
 		);
+		expect(nativeSdkToolsFromGrants(["read", "glob", "write", "bash"])).not.toContain("write");
 	});
 
-	test("does not advertise native edit without an OMP write grant", () => {
-		expect(nativeSdkToolsFromGrants(["edit"])).not.toContain("edit");
-		expect(nativeSdkToolsFromGrants(["write"])).toEqual(expect.arrayContaining(["write", "edit"]));
+	test("advertises native edit only when read and write are both granted", () => {
+		expect(nativeSdkToolsFromGrants(["write"])).toEqual([]);
+		expect(nativeSdkToolsFromGrants(["edit"])).toEqual([]);
+		expect(nativeSdkToolsFromGrants(["read", "write"])).toEqual(["read", "ls", "edit"]);
+		expect(nativeSdkToolsFromGrants(["read", "edit"])).toEqual(["read", "ls"]);
+		expect(nativeSdkToolsFromGrants(["write", "edit"])).toEqual([]);
+		expect(nativeSdkToolsFromGrants(["read", "write", "edit"])).toEqual(["read", "ls", "edit"]);
+	});
+});
+
+describe("isHookedOmpTool", () => {
+	test("keeps write and edit custom unless read and write are both granted", () => {
+		expect(isHookedOmpTool("write", ["write"])).toBe(false);
+		expect(isHookedOmpTool("edit", ["edit"])).toBe(false);
+		expect(isHookedOmpTool("write", ["read", "write"])).toBe(true);
+		expect(isHookedOmpTool("edit", ["read", "edit"])).toBe(false);
+		expect(isHookedOmpTool("write", ["write", "edit"])).toBe(false);
+		expect(isHookedOmpTool("edit", ["write", "edit"])).toBe(false);
+		expect(isHookedOmpTool("write", ["read", "write", "edit"])).toBe(true);
+		expect(isHookedOmpTool("edit", ["read", "write", "edit"])).toBe(true);
 	});
 });
 

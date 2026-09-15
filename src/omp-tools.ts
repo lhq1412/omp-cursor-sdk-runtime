@@ -1,5 +1,5 @@
 import type { Context, Tool, ToolResultMessage } from "@oh-my-pi/pi-ai";
-import { toolWireSchema } from "@oh-my-pi/pi-ai/utils/schema/wire";
+import { toolWireSchema } from "@oh-my-pi/pi-ai";
 import type { GrantedTool, HostToolResult } from "./contracts.js";
 import { isHookedOmpTool } from "./sdk-native-hook.js";
 
