@@ -20,20 +20,19 @@ function resolveSdkBundle(): string {
 	return join(dirname(createRequire(import.meta.url).resolve("@cursor/sdk/package.json")), "dist/bundled/index.js");
 }
 
-/** OMP grant name → SDK AgentOptions.tools name. Native edit is writeArgs and needs OMP write. */
+/** OMP grant name → SDK AgentOptions.tools name. Cursor has no `write` tool; OMP write is native `edit`/`writeArgs`. */
 export const NATIVE_OMP_TO_SDK = {
 	read: "read",
 	grep: "grep",
 	bash: "shell",
 	edit: "edit",
 	glob: "glob",
-	write: "write",
+	write: "edit",
 } as const;
 
 /** Extra SDK allowlist names enabled by an OMP grant. Native ls executes as OMP read. */
 const NATIVE_OMP_EXTRA_SDK: Record<string, readonly string[]> = {
 	read: ["ls"],
-	write: ["edit"],
 };
 
 const TOKEN_TO_OMP = {

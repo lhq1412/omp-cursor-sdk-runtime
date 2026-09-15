@@ -266,13 +266,14 @@ describe("ompLsToSdkResult", () => {
 describe("nativeSdkToolsFromGrants", () => {
 	test("maps OMP grants onto SDK names and adds ls from read", () => {
 		expect(nativeSdkToolsFromGrants(["read", "glob", "write", "bash"])).toEqual(
-			expect.arrayContaining(["read", "ls", "glob", "write", "edit", "shell"]),
+			expect.arrayContaining(["read", "ls", "glob", "edit", "shell"]),
 		);
+		expect(nativeSdkToolsFromGrants(["read", "glob", "write", "bash"])).not.toContain("write");
 	});
 
 	test("does not advertise native edit without an OMP write grant", () => {
 		expect(nativeSdkToolsFromGrants(["edit"])).not.toContain("edit");
-		expect(nativeSdkToolsFromGrants(["write"])).toEqual(expect.arrayContaining(["write", "edit"]));
+		expect(nativeSdkToolsFromGrants(["write"])).toEqual(["edit"]);
 	});
 });
 
