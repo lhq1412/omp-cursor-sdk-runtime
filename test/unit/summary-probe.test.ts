@@ -219,6 +219,37 @@ test("a later summary cycle does not reuse a previous preCompact event", async (
 	expect(second?.runEvent).toBeUndefined();
 });
 
+test("an abandoned cycle consumes its preCompact so the next generation cannot inherit it", async () => {
+	const inner = fake("same", {
+		same: blob({ turns: 8 }),
+		next: blob({ turns: 4, summaryArchives: 1, selfSummaryCount: 1 }),
+	});
+	const probe = createSummaryBoundaryProbe(inner.store);
+	const store = observeLocalAgentStore(inner.store, (event) => {
+		if (event.kind === "agents.write") probe.onAgentUpdated(event.agent);
+		else if (event.kind === "runEvents.append") probe.onRunEvent(event);
+	});
+	await store.runEvents.append({
+		runId: "run-1",
+		eventType: "preCompact",
+		payload: { message_count: 45, messages_to_compact: 30 },
+	});
+	probe.seed("same");
+	await probe.onSummaryStarted("owned");
+	probe.onSummaryCompleted();
+	probe.onAgentUpdated(inner.agent);
+	expect(await probe.flush()).toBeUndefined();
+
+	probe.seed("same");
+	await probe.onSummaryStarted("owned");
+	probe.onSummaryCompleted();
+	inner.set(document("next"));
+	await store.agents.update({ agent: inner.agent });
+	const second = await probe.flush();
+	expect(second).toMatchObject({ summaryGeneration: 2, afterRoot: "next" });
+	expect(second?.runEvent).toBeUndefined();
+});
+
 test("flush waits for a fire-and-forget before checkpoint read", async () => {
 	const gate = Promise.withResolvers<void>();
 	const inner = fake("before", {

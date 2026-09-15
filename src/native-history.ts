@@ -212,6 +212,7 @@ export function createSummaryBoundaryProbe(store: LocalAgentStore): SummaryBound
 		onSummaryStarted(agentId) {
 			const token = ++startSeq;
 			waiting = false;
+			if (cycleRunEvent && cycleRunEvent.seq > usedSeq) usedSeq = cycleRunEvent.seq;
 			cycleOpen = true;
 			afterRoot = undefined;
 			observation = undefined;
@@ -232,6 +233,7 @@ export function createSummaryBoundaryProbe(store: LocalAgentStore): SummaryBound
 		onSummaryCompleted() {
 			generation += 1;
 			waiting = true;
+			cycleOpen = false;
 		},
 		onAgentUpdated(agent) {
 			const root = agent.latestCheckpoint?.rootBlobId ?? null;
