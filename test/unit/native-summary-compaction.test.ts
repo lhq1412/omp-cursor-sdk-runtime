@@ -24,6 +24,7 @@ import {
 	attemptNativeCompactionRebase,
 	commitTurn,
 	disposeRuntimeForScope,
+	finishTurnFailed,
 	prepareTurn,
 	__testUtils as runtimeTestUtils,
 } from "../../src/session-runtime.ts";
@@ -569,6 +570,7 @@ describe("native summary materialization", () => {
 			context,
 			grantedTools: [],
 		}));
+		commitTurn(turn.slot, context, false);
 		const archiveBytes = ConversationSummaryArchiveSchema.encode(ConversationSummaryArchiveSchema.create({
 			summarizedMessages: [1, 2, 3, 4, 5].map((id) => Uint8Array.of(id)),
 			summary: "S1",
@@ -636,6 +638,7 @@ describe("native summary materialization", () => {
 			context,
 			grantedTools: [],
 		}));
+		commitTurn(turn.slot, context, false);
 		const archiveBytes = ConversationSummaryArchiveSchema.encode(ConversationSummaryArchiveSchema.create({
 			summarizedMessages: [1, 2, 3, 4, 5].map((id) => Uint8Array.of(id)),
 			summary: "S1",
@@ -688,4 +691,79 @@ describe("native summary materialization", () => {
 		await expect(staging).resolves.toBeUndefined();
 		expect(compactionTestUtils.getPending(owner.sessionId!)).toBeUndefined();
 	});
+	test("stageCursorCompaction drops publish after cancel mid-await", async () => {
+		const { ctx } = hooks();
+		const owner = ownerForContext(ctx);
+		runtimeTestUtils.setOpenAgent(async () => ({
+			agentId: "agent-x",
+			close() {},
+			async [Symbol.asyncDispose]() {},
+		} as SDKAgent));
+		const messages = conversation(8);
+		const context = { messages } as Context;
+		const turn = await withCursorSessionOwner(owner, () => prepareTurn({
+			cwd: ctx.cwd,
+			agentInstanceId: "main",
+			apiKey: "test-key",
+			modelSelection: { id: "composer-2.5" },
+			modelLimits: { contextWindow: 200_000, maxTokens: 20_000 },
+			context,
+			grantedTools: [],
+		}));
+		commitTurn(turn.slot, context, false);
+		const archiveBytes = ConversationSummaryArchiveSchema.encode(ConversationSummaryArchiveSchema.create({
+			summarizedMessages: [1, 2, 3, 4, 5].map((id) => Uint8Array.of(id)),
+			summary: "S1",
+			windowTail: 3,
+			summaryMessage: new TextEncoder().encode("s1"),
+		}));
+		const afterBytes = ConversationStateStructureSchema.encode(ConversationStateStructureSchema.create({
+			turns: [6, 7, 8].map((id) => Uint8Array.of(id)),
+			turnsOld: [],
+			summaryArchives: [archiveBytes],
+			summaryArchive: new Uint8Array(),
+			selfSummaryCount: 1,
+			summary: new TextEncoder().encode("S1"),
+			tokenDetails: { usedTokens: 40, maxTokens: 100 },
+		}));
+		let release!: (value: Uint8Array | null) => void;
+		const gate = new Promise<Uint8Array | null>((resolve) => { release = resolve; });
+		const store = {
+			checkpoints: {
+				async get() {
+					return gate;
+				},
+			},
+		} as unknown as LocalAgentStore;
+		const request = new AbortController();
+		const staging = withCursorSessionOwner(owner, () => stageCursorCompaction({
+			observation: {
+				summaryGeneration: 1,
+				beforeRoot: null,
+				afterRoot: "after",
+				after: {
+					rootBlobId: "after",
+					turns: 3,
+					turnsOld: 0,
+					summaryArchive: 0,
+					summaryArchives: 1,
+					selfSummaryCount: 1,
+					summaryBytes: 2,
+					summaryArchiveBytes: 1,
+				},
+			},
+			context,
+			contextFingerprint: turn.slot.sendState.contextFingerprint,
+			store,
+			slot: turn.slot,
+			agentId: "agent-x",
+			signal: request.signal,
+		}));
+		request.abort();
+		await finishTurnFailed(turn.slot, "aborted");
+		release(afterBytes);
+		await expect(staging).resolves.toBeUndefined();
+		expect(compactionTestUtils.getPending(owner.sessionId!)).toBeUndefined();
+	});
+
 });

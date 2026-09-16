@@ -402,6 +402,7 @@ export class ProviderTurnRunner {
 						store,
 						slot: preparedSlot,
 						agentId: settledAgent.agentId,
+						...(this.abortSignal ? { signal: this.abortSignal } : {}),
 					});
 				}
 				this.assertCurrent();

@@ -179,6 +179,20 @@ function slotForPending(pending: PendingCursorCompaction): RuntimeSlot | undefin
 	return getRuntimeSlot(runtimeKey(pending.scopeKey, pending.agentInstanceId));
 }
 
+function stagingRequestAlive(input: {
+	signal?: AbortSignal;
+	slot: RuntimeSlot;
+	agentId: string;
+}, sessionId: string, ownerGeneration: number, slotKey: string): boolean {
+	if (input.signal?.aborted || input.slot.preparation?.signal.aborted) return false;
+	const current = getCursorSessionOwner();
+	if (current.sessionId !== sessionId || current.generation !== ownerGeneration) return false;
+	if (getRuntimeSlot(slotKey) !== input.slot) return false;
+	// Successful settle only: cancel/dirty clears agent and leaves binding dirty.
+	if (input.slot.bindingState !== "committed" || input.slot.agent?.agentId !== input.agentId) return false;
+	return true;
+}
+
 export async function stageCursorCompaction(input: {
 	observation: SummaryBoundaryObservation;
 	context: Context;
@@ -186,12 +200,14 @@ export async function stageCursorCompaction(input: {
 	store: LocalAgentStore;
 	slot: RuntimeSlot;
 	agentId: string;
+	signal?: AbortSignal;
 }): Promise<PendingCursorCompaction | undefined> {
 	const owner = getCursorSessionOwner();
 	const sessionId = owner.sessionId;
 	if (!sessionId) return;
 	const ownerGeneration = owner.generation;
 	const slotKey = runtimeKey(input.slot.scopeKey, input.slot.agentInstanceId);
+	if (!stagingRequestAlive(input, sessionId, ownerGeneration, slotKey)) return;
 	const afterBytes = await input.store.checkpoints.get({ agentId: input.agentId, blobId: input.observation.afterRoot });
 	if (!afterBytes) return;
 	const after = decodeCheckpointSummaryState(afterBytes);
@@ -201,14 +217,7 @@ export async function stageCursorCompaction(input: {
 		const beforeBytes = await input.store.checkpoints.get({ agentId: input.agentId, blobId: input.observation.beforeRoot });
 		before = beforeBytes ? decodeCheckpointSummaryState(beforeBytes) : undefined;
 	}
-	const current = getCursorSessionOwner();
-	if (
-		current.sessionId !== sessionId
-		|| current.generation !== ownerGeneration
-		|| getRuntimeSlot(slotKey) !== input.slot
-	) {
-		return;
-	}
+	if (!stagingRequestAlive(input, sessionId, ownerGeneration, slotKey)) return;
 	const sourceUnits = projectSourceHistoryUnits(input.context.messages);
 	const coverage = resolveEffectiveSummaryCoverage(before, after, sourceUnits);
 	const existing = pendingBySession.get(sessionId);
@@ -236,13 +245,7 @@ export async function stageCursorCompaction(input: {
 			: {}),
 		state: "pending",
 	};
-	if (
-		getCursorSessionOwner().sessionId !== sessionId
-		|| getCursorSessionOwner().generation !== ownerGeneration
-		|| getRuntimeSlot(slotKey) !== input.slot
-	) {
-		return;
-	}
+	if (!stagingRequestAlive(input, sessionId, ownerGeneration, slotKey)) return;
 	pendingBySession.set(sessionId, pending);
 	return pending;
 }
