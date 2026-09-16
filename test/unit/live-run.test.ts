@@ -54,6 +54,23 @@ describe("live-run park-and-yield", () => {
 		});
 	});
 
+	test("keeps late parallel calls parked for the next OMP batch", async () => {
+		liveRunTestUtils.clear();
+		const live = createLiveRun(dummyExec());
+		const first = parkToolCall(live, "read", { path: "a.ts" }, "call-first", "call-first");
+		await waitForParked(live);
+		await collectParkedBatch(live);
+		const late = parkToolCall(live, "grep", { pattern: "x" }, "call-late", "call-late");
+
+		resumeParked(live, { messages: [toolResult("call-first", "first")] } as Context);
+		await expect(first).resolves.toMatchObject({ content: [{ type: "text", text: "first" }] });
+		expect(live.parked.map((call) => call.ompToolCallId)).toEqual(["call-late"]);
+
+		await collectParkedBatch(live);
+		resumeParked(live, { messages: [toolResult("call-late", "late")] } as Context);
+		await expect(late).resolves.toMatchObject({ content: [{ type: "text", text: "late" }] });
+	});
+
 	test("cancel rejects parked calls without executing them", async () => {
 		liveRunTestUtils.clear();
 		const live = createLiveRun(dummyExec());
@@ -121,6 +138,7 @@ describe("live-run park-and-yield", () => {
 		const parked = waitForParked(live);
 		const execution = parkToolCall(live, "read", { path: "a.ts" }, sdkId, ompId);
 		await parked;
+		await collectParkedBatch(live);
 		resumeParked(live, { messages: [toolResult(sdkId, "should not match")] } as Context);
 		await expect(execution).rejects.toThrow(/did not return a tool result/);
 

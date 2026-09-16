@@ -12,6 +12,7 @@ export interface ParkedToolCall {
 	args: Record<string, unknown>;
 	sdkToolCallId: string;
 	ompToolCallId: string;
+	yielded: boolean;
 	resolve: (result: HostToolResult) => void;
 	reject: (error: Error) => void;
 }
@@ -111,7 +112,7 @@ export function parkToolCall(
 			reject(new Error("Cursor SDK live run was cancelled"));
 			return;
 		}
-		run.parked.push({ name, args, sdkToolCallId, ompToolCallId, resolve, reject });
+		run.parked.push({ name, args, sdkToolCallId, ompToolCallId, yielded: false, resolve, reject });
 		run.onPark?.();
 	});
 }
@@ -173,7 +174,9 @@ export async function collectParkedBatch(run: LiveRun): Promise<ParkedToolCall[]
 		if (run.cancelled || run.parked.length === count) break;
 		count = run.parked.length;
 	}
-	return [...run.parked];
+	const batch = [...run.parked];
+	for (const call of batch) call.yielded = true;
+	return batch;
 }
 
 export function resumeParked(run: LiveRun, context: Context): void {
@@ -186,11 +189,15 @@ export function resumeParked(run: LiveRun, context: Context): void {
 			continue;
 		}
 		const result = byId.get(call.ompToolCallId);
-		if (!result) {
-			call.reject(new Error(`OMP did not return a tool result for ${call.name} (${call.ompToolCallId})`));
+		if (result) {
+			call.resolve(toolResultToHost(result));
 			continue;
 		}
-		call.resolve(toolResultToHost(result));
+		if (!call.yielded) {
+			run.parked.push(call);
+			continue;
+		}
+		call.reject(new Error(`OMP did not return a tool result for ${call.name} (${call.ompToolCallId})`));
 	}
 }
 

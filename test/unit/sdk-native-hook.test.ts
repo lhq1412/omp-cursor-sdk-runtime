@@ -174,6 +174,128 @@ describe("ompGrepToSdkResult", () => {
 		});
 	});
 
+	test("preserves nested grouped OMP paths", () => {
+		const result = ompGrepToSdkResult({ pattern: "queue", path: "moi-core/catalog/*.go" }, {
+			content: [{
+				type: "text",
+				text: "# moi-core/catalog/pkg/\n\n## agentautomation/\n### service.go#9013\n*828:\tautomation run queued\n\n## api/\n### router.go#BF31\n*4104:\tautomation-runs",
+			}],
+			isError: false,
+		});
+		expect(result).toMatchObject({
+			result: {
+				case: "success",
+				value: {
+					workspaceResults: {
+						"moi-core/catalog/*.go": {
+							result: {
+								case: "content",
+								value: {
+									matches: [
+										{ file: "moi-core/catalog/pkg/agentautomation/service.go" },
+										{ file: "moi-core/catalog/pkg/api/router.go" },
+									],
+								},
+							},
+						},
+					},
+				},
+			},
+		});
+	});
+
+	test("preserves parenthesized grouped OMP paths", () => {
+		const result = ompGrepToSdkResult({ pattern: "legacy", path: "." }, {
+			content: [{ type: "text", text: "# pkg (legacy)/\n## README (old)#ABCD\n*1:legacy" }],
+			isError: false,
+		});
+		expect(result).toMatchObject({
+			result: {
+				case: "success",
+				value: {
+					workspaceResults: {
+						".": {
+							result: {
+								case: "content",
+								value: {
+									matches: [{ file: "pkg (legacy)/README (old)" }],
+								},
+							},
+						},
+					},
+				},
+			},
+		});
+	});
+
+	test("marks only OMP column-truncated grep lines", () => {
+		const truncated = `${"é".repeat(254)}...`;
+		const result = ompGrepToSdkResult({ pattern: "x", path: "a.ts" }, {
+			content: [{ type: "text", text: `[a.ts#ABCD]\n*1:${truncated}\n*2:short...` }],
+			isError: false,
+			details: {
+				truncated: true,
+				linesTruncated: true,
+				meta: { limits: { columnTruncated: { maxColumn: 512 } } },
+			},
+		});
+		expect(result).toMatchObject({
+			result: {
+				case: "success",
+				value: {
+					workspaceResults: {
+						"a.ts": {
+							result: {
+								case: "content",
+								value: {
+									matches: [{
+										file: "a.ts",
+										matches: [
+											{ lineNumber: 1, contentTruncated: true },
+											{ lineNumber: 2, contentTruncated: false },
+										],
+									}],
+								},
+							},
+						},
+					},
+				},
+			},
+		});
+	});
+
+	test("detects context-only OMP column truncation", () => {
+		const truncated = `${"é".repeat(254)}...`;
+		const result = ompGrepToSdkResult({ pattern: "x", path: "a.ts" }, {
+			content: [{ type: "text", text: `[a.ts#ABCD]\n 1:${truncated}\n*2:x` }],
+			isError: false,
+			details: { truncated: false },
+		});
+		expect(result).toMatchObject({
+			result: {
+				case: "success",
+				value: {
+					workspaceResults: {
+						"a.ts": {
+							result: {
+								case: "content",
+								value: {
+									matches: [{
+										file: "a.ts",
+										matches: [
+											{ lineNumber: 1, isContextLine: true, contentTruncated: true },
+											{ lineNumber: 2, isContextLine: false, contentTruncated: false },
+										],
+									}],
+								},
+							},
+						},
+					},
+				},
+			},
+		});
+	});
+
 	test("maps host errors onto the grep error envelope", () => {
 		expect(ompGrepToSdkResult({ pattern: "x" }, {
 			content: [{ type: "text", text: "bad pattern" }],

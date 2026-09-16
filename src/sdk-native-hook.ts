@@ -152,10 +152,14 @@ function readFileSizeFromDetails(details: unknown): number | undefined {
 	const fileSize = asDetails(details)?.fileSize;
 	return typeof fileSize === "number" && Number.isSafeInteger(fileSize) && fileSize >= 0 ? fileSize : undefined;
 }
+const GROUPED_HEADER_RE = /^(#+)\s+(.*)$/;
+const OMP_GREP_MAX_COLUMN_BYTES = 512;
+const HEADER_HASH_TAG_RE = /#[0-9a-f]+$/i;
+
 function parseGrepMatches(text: string, fallbackFile: string): Map<string, Array<{ lineNumber: number; content: string; isContextLine: boolean }>> {
 	const matchMap = new Map<string, Array<{ lineNumber: number; content: string; isContextLine: boolean }>>();
+	const dirAtDepth = new Map<number, string>();
 	let currentFile = fallbackFile;
-	let currentDir = "";
 	const push = (file: string, lineNumber: number, content: string, isContextLine: boolean) => {
 		const list = matchMap.get(file) ?? [];
 		list.push({ lineNumber, content, isContextLine });
@@ -169,15 +173,22 @@ function parseGrepMatches(text: string, fallbackFile: string): Map<string, Array
 			currentFile = hashHeader[1]!;
 			continue;
 		}
-		const grouped = /^(#+)\s+(.*)$/.exec(line);
+		const grouped = GROUPED_HEADER_RE.exec(line);
 		if (grouped) {
+			const depth = grouped[1]!.length;
 			const rest = grouped[2]!.trimEnd();
+			const parent = depth > 1 ? dirAtDepth.get(depth - 1) : undefined;
 			if (rest.endsWith("/")) {
-				currentDir = rest.slice(0, -1);
+				const name = rest.slice(0, -1);
+				const dir = parent ? `${parent}/${name}` : name;
+				for (const key of dirAtDepth.keys()) {
+					if (key >= depth) dirAtDepth.delete(key);
+				}
+				dirAtDepth.set(depth, dir);
 				continue;
 			}
-			const name = rest.replace(/#[0-9a-f]+$/i, "");
-			currentFile = currentDir && name ? `${currentDir}/${name}` : name || currentFile;
+			const name = rest.replace(HEADER_HASH_TAG_RE, "");
+			if (name) currentFile = parent ? `${parent}/${name}` : name;
 			continue;
 		}
 		const omp = /^(\*| )(\d+)[:|](.*)$/.exec(line);
@@ -239,6 +250,12 @@ export function ompGrepToSdkResult(args: Record<string, unknown>, result: HostTo
 	}
 	const outputMode = str(args, "outputMode", "output_mode") || "content";
 	const clientTruncated = toolResultDetailBoolean(result.details, "truncated");
+	const linesTruncated = toolResultDetailBoolean(result.details, "linesTruncated");
+	const columnTruncation = asDetails(asDetails(asDetails(result.details)?.meta)?.limits)?.columnTruncated;
+	const maxColumn = asDetails(columnTruncation)?.maxColumn;
+	const truncatedLineBytes = typeof maxColumn === "number" && Number.isSafeInteger(maxColumn) && maxColumn > 0
+		? maxColumn
+		: OMP_GREP_MAX_COLUMN_BYTES;
 	const offsetApplied = typeof args.offset === "number" ? args.offset : undefined;
 	const matchMap = parseGrepMatches(text, path);
 	const parsedFiles = [...matchMap.keys()];
@@ -279,7 +296,16 @@ export function ompGrepToSdkResult(args: Record<string, unknown>, result: HostTo
 	} else {
 		const matches = [...matchMap.entries()].map(([file, fileMatches]) => ({
 			file,
-			matches: fileMatches.map((entry) => ({ ...entry, contentTruncated: false })),
+			matches: fileMatches.map((entry) => {
+				const contentBytes = Buffer.byteLength(entry.content, "utf8");
+				return {
+					...entry,
+					contentTruncated: (linesTruncated || entry.isContextLine)
+						&& entry.content.endsWith("...")
+						&& contentBytes >= truncatedLineBytes - 3
+						&& contentBytes <= truncatedLineBytes,
+				};
+			}),
 		}));
 		unionResult = {
 			result: {
