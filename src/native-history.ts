@@ -4,8 +4,9 @@ import type { LocalAgentStore, ModelSelection } from "@cursor/sdk";
 import type { Context } from "@oh-my-pi/pi-ai";
 import { buildGrpcRequest } from "@oh-my-pi/pi-ai/providers/cursor";
 import { ConversationStateStructureSchema } from "@oh-my-pi/pi-catalog/discovery/cursor-proto";
-import { toBinary } from "@oh-my-pi/pi-catalog/discovery/protobuf";
+import { pb, toBinary, type ProtoMessage } from "@oh-my-pi/pi-catalog/discovery/protobuf";
 import { nativeToolCallId } from "./tool-call-id.js";
+import type { SourceHistoryUnit } from "./context.js";
 
 /** Project history only; the SDK remains responsible for creating and running agents. */
 export async function buildNativeHistory(history: Context["messages"], selection: ModelSelection) {
@@ -89,12 +90,209 @@ function shortHash(parts: Uint8Array[]): string {
 	return hash.digest("hex").slice(0, 16);
 }
 
+export interface ConversationSummaryArchive extends ProtoMessage {
+	summarizedMessages: Uint8Array[];
+	summary: string;
+	windowTail: number;
+	summaryMessage: Uint8Array;
+}
+
+export const ConversationSummaryArchiveSchema = pb<ConversationSummaryArchive>("agent.v1.ConversationSummaryArchive", [
+	{ no: 1, name: "summarizedMessages", kind: "bytes", repeat: true },
+	{ no: 2, name: "summary", kind: "string" },
+	{ no: 3, name: "windowTail", kind: "uint32" },
+	{ no: 4, name: "summaryMessage", kind: "bytes" },
+]);
+
+export interface DecodedCursorSummaryArchive {
+	summarizedMessages: Uint8Array[];
+	summary: string;
+	windowTail: number;
+	summaryMessage: Uint8Array;
+	archiveHash: string;
+	summaryMessageHash: string;
+}
+
+export type CursorCoverageUnit =
+	| { kind: "history-turn"; sourceUnitOrdinal: number }
+	| { kind: "previous-summary"; summaryGeneration: number; summaryMessageHash: string };
+
+export interface CursorSummaryCoverage {
+	summary: string;
+	summarizedTurnCount: number;
+	windowTail: number;
+	units: CursorCoverageUnit[];
+	includesPreviousSummary: boolean;
+	archiveHash: string;
+	expandedSummarizedTurnCount: number;
+}
+
+export interface NativeCheckpointArchives {
+	turns: number;
+	selfSummaryCount: number;
+	usedTokens?: number;
+	summary?: Uint8Array;
+	archives: DecodedCursorSummaryArchive[];
+}
+
+function bytesEqual(left: Uint8Array, right: Uint8Array): boolean {
+	if (left.byteLength !== right.byteLength) return false;
+	for (let i = 0; i < left.byteLength; i += 1) {
+		if (left[i] !== right[i]) return false;
+	}
+	return true;
+}
+
+export function decodeConversationSummaryArchive(bytes: Uint8Array): DecodedCursorSummaryArchive | undefined {
+	if (!bytes.byteLength) return;
+	try {
+		const decoded = ConversationSummaryArchiveSchema.decode(bytes);
+		return {
+			summarizedMessages: decoded.summarizedMessages,
+			summary: decoded.summary,
+			windowTail: decoded.windowTail,
+			summaryMessage: decoded.summaryMessage,
+			archiveHash: shortHash([bytes]),
+			summaryMessageHash: decoded.summaryMessage.byteLength ? shortHash([decoded.summaryMessage]) : "",
+		};
+	} catch {
+		return;
+	}
+}
+
+function rawArchivesFromState(state: { summaryArchive?: Uint8Array; summaryArchives: Uint8Array[] }): Uint8Array[] {
+	return [
+		...(state.summaryArchive?.byteLength ? [state.summaryArchive] : []),
+		...state.summaryArchives.filter((part) => part.byteLength),
+	];
+}
+
+export function decodeCheckpointSummaryState(bytes: Uint8Array): NativeCheckpointArchives | undefined {
+	try {
+		const state = ConversationStateStructureSchema.decode(bytes);
+		const archives: DecodedCursorSummaryArchive[] = [];
+		for (const part of rawArchivesFromState(state)) {
+			const decoded = decodeConversationSummaryArchive(part);
+			if (!decoded) return;
+			archives.push(decoded);
+		}
+		return {
+			turns: state.turns.length,
+			selfSummaryCount: state.selfSummaryCount,
+			...(state.tokenDetails ? { usedTokens: state.tokenDetails.usedTokens } : {}),
+			...(state.summary?.byteLength ? { summary: state.summary } : {}),
+			archives,
+		};
+	} catch {
+		return;
+	}
+}
+
+function previousSummaryIndex(archives: DecodedCursorSummaryArchive[], message: Uint8Array, before: number): number {
+	for (let index = 0; index < before; index += 1) {
+		if (archives[index] && bytesEqual(archives[index].summaryMessage, message)) return index;
+	}
+	return -1;
+}
+
+function expandedHistoryTurns(archives: DecodedCursorSummaryArchive[], index: number, seen: Set<number>): number {
+	if (seen.has(index)) return 0;
+	seen.add(index);
+	const archive = archives[index];
+	if (!archive) return 0;
+	let count = 0;
+	for (const message of archive.summarizedMessages) {
+		const previous = previousSummaryIndex(archives, message, index);
+		count += previous >= 0 ? expandedHistoryTurns(archives, previous, seen) : 1;
+	}
+	return count;
+}
+
+/**
+ * Frozen alignment against current OMP source turns:
+ *   expandedSummarizedTurnCount + windowTail === source turn units
+ *   after.turns === windowTail
+ * Previous-summary identity is byte-equal summary_message in a later archive.
+ * If OMP already materialized that previous summary, treat it as the baseline
+ * (consume the compaction-summary unit, do not expand into deleted turns).
+ * Otherwise expand through the archive tree into still-present history turns.
+ * Any conversation that fails the equality is inapplicable (stale), including
+ * continueOnly extra native turns and merged developer sequences.
+ */
+export function resolveEffectiveSummaryCoverage(
+	before: NativeCheckpointArchives | undefined,
+	after: NativeCheckpointArchives,
+	sourceUnits: SourceHistoryUnit[],
+): CursorSummaryCoverage | undefined {
+	if (!after.archives.length) return;
+	const archives = after.archives;
+	const latestIndex = archives.length - 1;
+	const latest = archives[latestIndex]!;
+	if (!latest.summary) return;
+	const units: CursorCoverageUnit[] = [];
+	let sourceCursor = 0;
+	let turnCursor = 0;
+	let includesPreviousSummary = false;
+	for (const message of latest.summarizedMessages) {
+		const previous = previousSummaryIndex(archives, message, latestIndex);
+		if (previous >= 0) {
+			includesPreviousSummary = true;
+			units.push({
+				kind: "previous-summary",
+				summaryGeneration: previous + 1,
+				summaryMessageHash: archives[previous]!.summaryMessageHash,
+			});
+			if (sourceUnits[sourceCursor]?.kind === "compaction-summary") {
+				sourceCursor += 1;
+				continue;
+			}
+			let remaining = expandedHistoryTurns(archives, previous, new Set());
+			while (remaining > 0) {
+				const source = sourceUnits[sourceCursor];
+				if (!source) return;
+				sourceCursor += 1;
+				if (source.kind !== "turn") continue;
+				turnCursor += 1;
+				remaining -= 1;
+			}
+			continue;
+		}
+		while (sourceUnits[sourceCursor]?.kind === "compaction-summary") sourceCursor += 1;
+		const source = sourceUnits[sourceCursor];
+		if (!source || source.kind !== "turn") return;
+		units.push({ kind: "history-turn", sourceUnitOrdinal: source.ordinal });
+		sourceCursor += 1;
+		turnCursor += 1;
+	}
+	const summarizedTurnCount = units.filter((unit) => unit.kind === "history-turn").length;
+	return {
+		summary: latest.summary,
+		summarizedTurnCount,
+		windowTail: latest.windowTail,
+		units,
+		includesPreviousSummary,
+		archiveHash: latest.archiveHash,
+		expandedSummarizedTurnCount: turnCursor,
+	};
+}
+
+export function validateNativeTurnAlignment(
+	coverage: CursorSummaryCoverage,
+	sourceUnits: SourceHistoryUnit[],
+	afterTurns: number,
+	beforeTurns?: number,
+): boolean {
+	const turnUnits = sourceUnits.filter((unit) => unit.kind === "turn");
+	if (coverage.windowTail !== afterTurns) return false;
+	if (coverage.expandedSummarizedTurnCount + coverage.windowTail !== turnUnits.length) return false;
+	if (!coverage.includesPreviousSummary && beforeTurns !== undefined && beforeTurns !== turnUnits.length) return false;
+	return true;
+}
+
+
 function summaryProbeFrom(rootBlobId: string, bytes: Uint8Array): NativeSummaryStateProbe {
 	const state = ConversationStateStructureSchema.decode(bytes);
-	const archives = [
-		...(state.summaryArchive?.byteLength ? [state.summaryArchive] : []),
-		...state.summaryArchives,
-	];
+	const archives = rawArchivesFromState(state);
 	const summaryBytes = state.summary?.byteLength ?? 0;
 	const summaryArchiveBytes = archives.reduce((n, part) => n + part.byteLength, 0);
 	return {

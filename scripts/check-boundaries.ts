@@ -55,7 +55,7 @@ const deepImportOwners: Record<string, Record<string, readonly string[]>> = {
 		],
 	},
 	"@oh-my-pi/pi-catalog/discovery/protobuf": {
-		"src/native-history.ts": ["toBinary"],
+		"src/native-history.ts": ["toBinary", "pb", "ProtoMessage"],
 		"scripts/omp-contract-probe.ts": ["fromBinary", "toBinary"],
 	},
 	"@oh-my-pi/pi-catalog/models": {
