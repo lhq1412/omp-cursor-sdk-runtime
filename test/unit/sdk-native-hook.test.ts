@@ -204,8 +204,32 @@ describe("ompGrepToSdkResult", () => {
 		});
 	});
 
+	test("preserves parenthesized grouped OMP paths", () => {
+		const result = ompGrepToSdkResult({ pattern: "legacy", path: "." }, {
+			content: [{ type: "text", text: "# pkg (legacy)/\n## README (old)#ABCD\n*1:legacy" }],
+			isError: false,
+		});
+		expect(result).toMatchObject({
+			result: {
+				case: "success",
+				value: {
+					workspaceResults: {
+						".": {
+							result: {
+								case: "content",
+								value: {
+									matches: [{ file: "pkg (legacy)/README (old)" }],
+								},
+							},
+						},
+					},
+				},
+			},
+		});
+	});
+
 	test("marks only OMP column-truncated grep lines", () => {
-		const truncated = `${"x".repeat(509)}...`;
+		const truncated = `${"é".repeat(254)}...`;
 		const result = ompGrepToSdkResult({ pattern: "x", path: "a.ts" }, {
 			content: [{ type: "text", text: `[a.ts#ABCD]\n*1:${truncated}\n*2:short...` }],
 			isError: false,
@@ -229,6 +253,38 @@ describe("ompGrepToSdkResult", () => {
 										matches: [
 											{ lineNumber: 1, contentTruncated: true },
 											{ lineNumber: 2, contentTruncated: false },
+										],
+									}],
+								},
+							},
+						},
+					},
+				},
+			},
+		});
+	});
+
+	test("detects context-only OMP column truncation", () => {
+		const truncated = `${"é".repeat(254)}...`;
+		const result = ompGrepToSdkResult({ pattern: "x", path: "a.ts" }, {
+			content: [{ type: "text", text: `[a.ts#ABCD]\n 1:${truncated}\n*2:x` }],
+			isError: false,
+			details: { truncated: false },
+		});
+		expect(result).toMatchObject({
+			result: {
+				case: "success",
+				value: {
+					workspaceResults: {
+						"a.ts": {
+							result: {
+								case: "content",
+								value: {
+									matches: [{
+										file: "a.ts",
+										matches: [
+											{ lineNumber: 1, isContextLine: true, contentTruncated: true },
+											{ lineNumber: 2, isContextLine: false, contentTruncated: false },
 										],
 									}],
 								},

@@ -153,7 +153,7 @@ function readFileSizeFromDetails(details: unknown): number | undefined {
 	return typeof fileSize === "number" && Number.isSafeInteger(fileSize) && fileSize >= 0 ? fileSize : undefined;
 }
 const GROUPED_HEADER_RE = /^(#+)\s+(.*)$/;
-const HEADER_SUFFIX_RE = /\s+\([^)]*\)\s*$/;
+const OMP_GREP_MAX_COLUMN_BYTES = 512;
 const HEADER_HASH_TAG_RE = /#[0-9a-f]+$/i;
 
 function parseGrepMatches(text: string, fallbackFile: string): Map<string, Array<{ lineNumber: number; content: string; isContextLine: boolean }>> {
@@ -179,7 +179,7 @@ function parseGrepMatches(text: string, fallbackFile: string): Map<string, Array
 			const rest = grouped[2]!.trimEnd();
 			const parent = depth > 1 ? dirAtDepth.get(depth - 1) : undefined;
 			if (rest.endsWith("/")) {
-				const name = rest.slice(0, -1).replace(HEADER_SUFFIX_RE, "");
+				const name = rest.slice(0, -1);
 				const dir = parent ? `${parent}/${name}` : name;
 				for (const key of dirAtDepth.keys()) {
 					if (key >= depth) dirAtDepth.delete(key);
@@ -187,7 +187,7 @@ function parseGrepMatches(text: string, fallbackFile: string): Map<string, Array
 				dirAtDepth.set(depth, dir);
 				continue;
 			}
-			const name = rest.replace(HEADER_SUFFIX_RE, "").replace(HEADER_HASH_TAG_RE, "");
+			const name = rest.replace(HEADER_HASH_TAG_RE, "");
 			if (name) currentFile = parent ? `${parent}/${name}` : name;
 			continue;
 		}
@@ -255,7 +255,7 @@ export function ompGrepToSdkResult(args: Record<string, unknown>, result: HostTo
 	const maxColumn = asDetails(columnTruncation)?.maxColumn;
 	const truncatedLineBytes = typeof maxColumn === "number" && Number.isSafeInteger(maxColumn) && maxColumn > 0
 		? maxColumn
-		: undefined;
+		: OMP_GREP_MAX_COLUMN_BYTES;
 	const offsetApplied = typeof args.offset === "number" ? args.offset : undefined;
 	const matchMap = parseGrepMatches(text, path);
 	const parsedFiles = [...matchMap.keys()];
@@ -296,13 +296,16 @@ export function ompGrepToSdkResult(args: Record<string, unknown>, result: HostTo
 	} else {
 		const matches = [...matchMap.entries()].map(([file, fileMatches]) => ({
 			file,
-			matches: fileMatches.map((entry) => ({
-				...entry,
-				contentTruncated: linesTruncated
-					&& truncatedLineBytes !== undefined
-					&& Buffer.byteLength(entry.content, "utf8") === truncatedLineBytes
-					&& entry.content.endsWith("..."),
-			})),
+			matches: fileMatches.map((entry) => {
+				const contentBytes = Buffer.byteLength(entry.content, "utf8");
+				return {
+					...entry,
+					contentTruncated: (linesTruncated || entry.isContextLine)
+						&& entry.content.endsWith("...")
+						&& contentBytes >= truncatedLineBytes - 3
+						&& contentBytes <= truncatedLineBytes,
+				};
+			}),
 		}));
 		unionResult = {
 			result: {
