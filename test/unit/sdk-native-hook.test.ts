@@ -370,6 +370,29 @@ describe("executeNative", () => {
 		}]);
 	});
 
+	test("correlates raw edit inner IDs independently of envelope and model IDs", async () => {
+		const calls: Array<{ name: string; args: Record<string, unknown> }> = [];
+		await runWithNativeTools(async (name, args) => {
+			calls.push({ name, args });
+			return { content: [{ type: "text", text: "source" }], isError: false };
+		}, async () => {
+			nativeHookTestUtils.rememberNativeEditToolCall({
+				callId: "edit-envelope",
+				modelCallId: "model-call",
+				toolCall: {
+					toolCallId: "edit-inner",
+					tool: { case: "editToolCall", value: { args: { path: "src/a.ts" } } },
+				},
+			});
+			await nativeHookTestUtils.executeNative("readArgs", { path: "src/model.ts", toolCallId: "model-call" });
+			await nativeHookTestUtils.executeNative("readArgs", { path: "src/a.ts", toolCallId: "edit-inner" });
+		});
+		expect(calls).toEqual([
+			{ name: "read", args: { path: "src/model.ts" } },
+			{ name: "read", args: { path: "src/a.ts:raw" } },
+		]);
+	});
+
 	test("computes write metadata from fileText not the host message", async () => {
 		const result = await runWithNativeTools(async () => {
 			return { content: [{ type: "text", text: "Wrote file" }], isError: false };
@@ -380,6 +403,19 @@ describe("executeNative", () => {
 				value: { path: "/tmp/a.ts", linesCreated: 2, fileSize: 4 },
 			},
 		});
+	});
+
+	test("converts SDK shell timeout milliseconds to OMP seconds", async () => {
+		const calls: Array<{ name: string; args: Record<string, unknown> }> = [];
+		await runWithNativeTools(async (name, args) => {
+			calls.push({ name, args });
+			return { content: [{ type: "text", text: "" }], isError: false };
+		}, () => nativeHookTestUtils.executeNative("shellArgs", {
+			command: "sleep 1",
+			timeout: 30_001,
+			toolCallId: "shell1",
+		}));
+		expect(calls).toEqual([{ name: "bash", args: { command: "sleep 1", timeout: 31 } }]);
 	});
 
 	test("forwards grep offset as OMP skip and joins glob onto path", async () => {
