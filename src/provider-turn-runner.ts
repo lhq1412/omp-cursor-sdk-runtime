@@ -30,6 +30,7 @@ import {
 	closeOpenBlocks,
 	deliverWithoutUnendedPreviews,
 	runResultToStopReason,
+	projectRunSummary,
 	projectRunUsage,
 	reconcileRunResult,
 	type CursorAssistantMessage,
@@ -209,6 +210,7 @@ export class ProviderTurnRunner {
 		this.slot = prepared.slot;
 		this.assertCurrent();
 		prepared.live.sink = { stream, partial };
+		projectRunSummary(partial, prepared.live.projection);
 		if (prepared.live.projection.previews) {
 			for (const [id, preview] of prepared.live.projection.previews) {
 				if (!preview.ended) prepared.live.projection.previews.delete(id);
@@ -388,11 +390,18 @@ export class ProviderTurnRunner {
 		if (!live.cancelled && settledAgent && getLiveRun(preparedSlot.key) === live &&
 			preparedSlot.agent === settledAgent && live.agent === settledAgent) {
 			if (occupancy) {
-				if (partial.cursorSdk.summary) partial.cursorSdk.summary.checkpointRootBlobId = occupancy.rootBlobId;
 				partial.cursorSdk.contextOccupancy = occupancy;
 			}
-			if (observation && partial.cursorSdk.summary?.status === "completed") {
-				partial.cursorSdk.summary.probe = observation;
+			const summary = live.projection.summary ?? partial.cursorSdk.summary;
+			if (summary) {
+				live.projection.summary = {
+					...summary,
+					...(occupancy ? { checkpointRootBlobId: occupancy.rootBlobId } : {}),
+					...(observation ? { probe: observation } : {}),
+				};
+				projectRunSummary(partial, live.projection);
+			}
+			if (observation) {
 				const store = live.checkpointStore ?? preparedSlot.store;
 				if (store) {
 					await stageCursorCompaction({

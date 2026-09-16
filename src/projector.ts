@@ -5,6 +5,14 @@ import type { InteractionUpdate, RunResult, TokenUsage } from "@cursor/sdk";
 import type { SummaryBoundaryObservation } from "./native-history.js";
 import { projectSdkToolCallId } from "./tool-call-id.js";
 
+export interface CursorSdkSummary {
+	count: number;
+	status: "running" | "completed";
+	text?: string;
+	checkpointRootBlobId?: string;
+	probe?: SummaryBoundaryObservation;
+}
+
 export interface RunProjection {
 	answerText: string;
 	stepId?: number;
@@ -14,6 +22,7 @@ export interface RunProjection {
 	previews?: Map<string, { contentIndex: number; ended: boolean }>;
 	/** SDK-native tool-call ID → OMP-portable ID for this run. */
 	toolCallIds?: Map<string, string>;
+	summary?: CursorSdkSummary;
 }
 
 export interface CursorAssistantMessage extends AssistantMessage {
@@ -29,13 +38,7 @@ export interface CursorAssistantMessage extends AssistantMessage {
 			usedTokens: number;
 			maxTokens: number;
 		};
-		summary?: {
-			count: number;
-			status: "running" | "completed";
-			text?: string;
-			checkpointRootBlobId?: string;
-			probe?: SummaryBoundaryObservation;
-		};
+		summary?: CursorSdkSummary;
 	};
 }
 
@@ -178,7 +181,7 @@ export function applyInteractionUpdate(
 		return;
 	}
 	if (update.type === "summary-started" || update.type === "summary" || update.type === "summary-completed") {
-		if (hasCursorSdk(partial)) applySummaryUpdate(partial, update);
+		if (hasCursorSdk(partial)) applySummaryUpdate(partial, update, projection);
 		return;
 	}
 	previewMcpToolCall(stream, partial, update, projection);
@@ -316,24 +319,32 @@ function hasCursorSdk(partial: AssistantMessage): partial is CursorAssistantMess
 	return "cursorSdk" in partial;
 }
 
-function applySummaryUpdate(partial: CursorAssistantMessage, update: InteractionUpdate): void {
-	if (update.type === "summary-started") {
-		partial.cursorSdk.summary = {
-			count: partial.cursorSdk.summary?.count ?? 0,
-			status: "running",
-		};
-		return;
-	}
-	const summary = partial.cursorSdk.summary ??= { count: 0, status: "running" };
-	if (update.type === "summary") {
-		summary.text = update.summary;
-		return;
-	}
-	if (update.type === "summary-completed") {
-		summary.count += 1;
-		summary.status = "completed";
-	}
+export function projectRunSummary(partial: AssistantMessage, projection: Pick<RunProjection, "summary">): void {
+	if (!projection.summary || !hasCursorSdk(partial)) return;
+	partial.cursorSdk.summary = { ...projection.summary };
 }
+
+function applySummaryUpdate(
+	partial: CursorAssistantMessage,
+	update: InteractionUpdate,
+	projection?: RunProjection,
+): void {
+	const current = projection?.summary ?? partial.cursorSdk.summary;
+	let next: CursorSdkSummary;
+	if (update.type === "summary-started") {
+		next = { count: current?.count ?? 0, status: "running" };
+	} else if (update.type === "summary") {
+		next = { ...(current ?? { count: 0, status: "running" }), text: update.summary };
+	} else if (update.type === "summary-completed") {
+		const base = current ?? { count: 0, status: "running" };
+		next = { ...base, count: base.count + 1, status: "completed" };
+	} else {
+		return;
+	}
+	if (projection) projection.summary = next;
+	partial.cursorSdk.summary = { ...next };
+}
+
 export function projectRunUsage(
 	partial: CursorAssistantMessage,
 	projection: RunProjection,

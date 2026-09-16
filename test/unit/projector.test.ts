@@ -8,7 +8,7 @@ import { EditTool } from "@oh-my-pi/pi-coding-agent/edit";
 import { getEditStore } from "@oh-my-pi/pi-coding-agent/edit/store";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { createAssistantMessageEventStream } from "@oh-my-pi/pi-ai";
-import { applyInteractionUpdate, applyToolCall, createEmptyAssistantMessage, deliverWithoutUnendedPreviews, projectRunUsage, reconcileRunResult, type RunProjection } from "../../src/projector.ts";
+import { applyInteractionUpdate, applyToolCall, createEmptyAssistantMessage, deliverWithoutUnendedPreviews, projectRunSummary, projectRunUsage, reconcileRunResult, type RunProjection } from "../../src/projector.ts";
 import type { InteractionUpdate, RunResult, TokenUsage } from "@cursor/sdk";
 import { CURSOR_SDK_API, CURSOR_SDK_PROVIDER_ID } from "../../src/constants.ts";
 import { projectSdkToolCallId } from "../../src/tool-call-id.ts";
@@ -46,6 +46,30 @@ describe("projector", () => {
 		expect(partial.cursorSdk.summary).toEqual({ count: 1, status: "running" });
 		applyInteractionUpdate(stream, partial, { type: "summary", summary: "replacement" });
 		expect(partial.cursorSdk.summary).toEqual({ count: 1, status: "running", text: "replacement" });
+	});
+
+	test("keeps a completed summary snapshot when a later partial on the same run starts another summary", () => {
+		const model = {
+			id: "composer-2.5",
+			provider: CURSOR_SDK_PROVIDER_ID,
+			api: CURSOR_SDK_API,
+		} as Model<Api>;
+		const stream = createAssistantMessageEventStream();
+		const projection: RunProjection = { answerText: "" };
+		const first = createEmptyAssistantMessage(model);
+		applyInteractionUpdate(stream, first, { type: "summary-started" }, projection);
+		applyInteractionUpdate(stream, first, { type: "summary", summary: "kept native" }, projection);
+		applyInteractionUpdate(stream, first, { type: "summary-completed" }, projection);
+		expect(first.cursorSdk.summary).toEqual({ count: 1, status: "completed", text: "kept native" });
+
+		const second = createEmptyAssistantMessage(model);
+		projectRunSummary(second, projection);
+		expect(second.cursorSdk.summary).toEqual({ count: 1, status: "completed", text: "kept native" });
+
+		applyInteractionUpdate(stream, second, { type: "summary-started" }, projection);
+		applyInteractionUpdate(stream, second, { type: "summary", summary: "replacement" }, projection);
+		expect(first.cursorSdk.summary).toEqual({ count: 1, status: "completed", text: "kept native" });
+		expect(second.cursorSdk.summary).toEqual({ count: 1, status: "running", text: "replacement" });
 	});
 
 	test("streams JSON arguments matching the completed tool call", async () => {

@@ -1,19 +1,26 @@
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, test, beforeEach, afterEach } from "bun:test";
 import type { Context, Model, SimpleStreamOptions, Tool } from "@oh-my-pi/pi-ai";
 import { Effort, type Api } from "@oh-my-pi/pi-ai";
 import type { ModelListItem, ModelSelection, Run, RunResult, SDKAgent, SendOptions, TokenUsage } from "@cursor/sdk";
+import { ConversationStateStructureSchema } from "@oh-my-pi/pi-catalog/discovery/cursor-proto";
 import { CURSOR_API_KEY_ENV_VAR, CURSOR_SDK_API, CURSOR_SDK_PROVIDER_ID } from "../../src/constants.ts";
+import { ConversationSummaryArchiveSchema } from "../../src/native-history.ts";
+import { __testUtils as compactionTestUtils } from "../../src/native-summary-compaction.ts";
 import { streamCursorRuntime } from "../../src/provider.ts";
 import { buildModelSelection, ensureCursorModels, getModelMetadata, __testUtils as catalogTestUtils } from "../../src/catalog.ts";
 import { __testUtils as controlsTestUtils } from "../../src/model-controls.ts";
 import { disposeRuntimeForScope, __testUtils as runtimeTestUtils } from "../../src/session-runtime.ts";
 import { __testUtils as liveRunTestUtils } from "../../src/live-run.ts";
-import { __testUtils as scopeTestUtils } from "../../src/session-scope.ts";
+import { getCursorSessionScopeKey, __testUtils as scopeTestUtils } from "../../src/session-scope.ts";
 import { __testUtils as resumeTestUtils } from "../../src/session-resume.ts";
 import { HOST_BRIDGE_OPTION_KEY } from "../../src/host-option.ts";
 import { createFakeHost } from "../helpers/fake-host.ts";
 import { projectSdkToolCallId } from "../../src/tool-call-id.ts";
 import { __testUtils as nativeHookTestUtils } from "../../src/sdk-native-hook.ts";
+import { storeRootForScope } from "../../src/store.ts";
 
 const COMPOSER: ModelListItem = {
 	id: "composer-2.5",
@@ -148,6 +155,7 @@ function seedCatalog(items: ModelListItem[] = [COMPOSER, GPT], listKeys?: string
 }
 
 describe("streamCursorRuntime model selection", () => {
+	const temporaryPaths: string[] = [];
 	beforeEach(async () => {
 		nativeHookTestUtils.setNativeHooked(false);
 		runtimeTestUtils.clear();
@@ -166,6 +174,8 @@ describe("streamCursorRuntime model selection", () => {
 		liveRunTestUtils.clear();
 		controlsTestUtils.reset();
 		catalogTestUtils.resetCatalog();
+		compactionTestUtils.clear();
+		for (const path of temporaryPaths.splice(0)) rmSync(path, { recursive: true, force: true });
 	});
 
 	test("checkpoint occupancy stays unavailable while parked and settles separately from billing", async () => {
@@ -216,6 +226,132 @@ describe("streamCursorRuntime model selection", () => {
 		} });
 		if (settled?.type !== "done") throw new Error("Expected settled turn");
 		expect(settled.message.usage.contextTokens).toBeUndefined();
+	});
+
+	test("preserves a native summary across parked continuation and stages compaction from the checkpoint probe", async () => {
+		const directory = mkdtempSync(join(tmpdir(), "cursor-summary-provider-"));
+		scopeTestUtils.set("/tmp/project", join(directory, "session.jsonl"), "sess-1");
+		temporaryPaths.push(directory, storeRootForScope("/tmp/project", getCursorSessionScopeKey()));
+		const agentId = "agent-summary-park";
+		const beforeBytes = ConversationStateStructureSchema.encode(ConversationStateStructureSchema.create({
+			turns: Array.from({ length: 8 }, (_, index) => Uint8Array.of(index + 1)),
+			turnsOld: [],
+			summaryArchives: [],
+			summaryArchive: new Uint8Array(),
+			selfSummaryCount: 0,
+			summary: new Uint8Array(),
+			tokenDetails: { usedTokens: 80, maxTokens: 100 },
+		}));
+		const afterBytes = ConversationStateStructureSchema.encode(ConversationStateStructureSchema.create({
+			turns: [6, 7, 8].map((id) => Uint8Array.of(id)),
+			turnsOld: [],
+			summaryArchives: [ConversationSummaryArchiveSchema.encode(ConversationSummaryArchiveSchema.create({
+				summarizedMessages: [1, 2, 3, 4, 5].map((id) => Uint8Array.of(id)),
+				summary: "kept native",
+				windowTail: 3,
+				summaryMessage: new TextEncoder().encode("s1"),
+			}))],
+			summaryArchive: new Uint8Array(),
+			selfSummaryCount: 1,
+			summary: new TextEncoder().encode("private summary"),
+			tokenDetails: { usedTokens: 40, maxTokens: 100 },
+		}));
+		runtimeTestUtils.setOpenAgent(async (input) => {
+			const document = {
+				agentId, cwd: input.cwd, status: "idle" as const, createdAt: 1, updatedAt: 1,
+				latestCheckpoint: { schemaVersion: 1 as const, rootBlobId: "before" },
+			};
+			await input.store.checkpoints.create({ agentId, blobId: "before", data: beforeBytes });
+			await input.store.agents.create({ agent: document });
+			return {
+				agentId, close() {}, async [Symbol.asyncDispose]() {},
+				async send(_message, options) {
+					await options?.onDelta?.({ update: { type: "summary-started" } });
+					await options?.onDelta?.({ update: { type: "summary", summary: "kept native" } });
+					await input.store.runEvents.append({
+						runId: "run-summary-park",
+						eventType: "preCompact",
+						payload: { message_count: 8, messages_to_compact: 5 },
+					});
+					await options?.onDelta?.({ update: { type: "summary-completed" } });
+					await input.store.checkpoints.create({ agentId, blobId: "after", data: afterBytes });
+					await input.store.agents.update({
+						agent: { ...document, updatedAt: 2, latestCheckpoint: { schemaVersion: 1, rootBlobId: "after" } },
+					});
+					const tool = options?.local?.customTools?.read;
+					if (!tool) throw new Error("read tool missing");
+					const pending = tool.execute({ path: "a.ts" }, { toolCallId: "call-summary" });
+					return {
+						id: "run-summary-park", agentId, supports: () => false,
+						wait: async () => {
+							await pending;
+							return { id: "run-summary-park", status: "finished", result: "done" } as RunResult;
+						},
+					} as unknown as Run;
+				},
+			} as SDKAgent;
+		});
+		const messages: Context["messages"] = [];
+		for (let index = 0; index < 7; index += 1) {
+			messages.push({ role: "user", content: `u${index}`, timestamp: (index + 1) * 10 } as Context["messages"][number]);
+			messages.push({
+				role: "assistant",
+				content: [{ type: "text", text: `a${index}` }],
+				api: CURSOR_SDK_API,
+				provider: CURSOR_SDK_PROVIDER_ID,
+				model: "composer-2.5",
+				usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+				stopReason: "stop",
+				timestamp: (index + 1) * 10 + 1,
+			} as Context["messages"][number]);
+		}
+		messages.push({ role: "user", content: "inspect", timestamp: 80 } as Context["messages"][number]);
+		const context = { messages, tools: [readTool()] } as Context;
+		const parked = (await drain(cursorModel("composer-2.5", 200_000), context, { apiKey: "test-key" })).at(-1);
+		expect(parked).toMatchObject({
+			type: "done",
+			reason: "toolUse",
+			message: { cursorSdk: { summary: { count: 1, status: "completed", text: "kept native" } } },
+		});
+		if (parked?.type !== "done") throw new Error("Expected parked turn");
+		const settled = (await drain(cursorModel("composer-2.5", 200_000), {
+			...context,
+			messages: [
+				...context.messages,
+				parked.message,
+				{ role: "toolResult", toolCallId: "call-summary", toolName: "read", content: [{ type: "text", text: "ok" }], isError: false, timestamp: 81 },
+			],
+		}, { apiKey: "test-key" })).at(-1);
+		expect(settled).toMatchObject({
+			type: "done",
+			message: {
+				content: [{ type: "text", text: "done" }],
+				cursorSdk: {
+					summary: {
+						count: 1,
+						status: "completed",
+						text: "kept native",
+						checkpointRootBlobId: "after",
+						probe: {
+							summaryGeneration: 1,
+							beforeRoot: "before",
+							afterRoot: "after",
+							before: { turns: 8, selfSummaryCount: 0 },
+							after: { turns: 3, selfSummaryCount: 1 },
+						},
+					},
+					contextOccupancy: { status: "actual", source: "checkpoint", rootBlobId: "after" },
+				},
+			},
+		});
+		if (settled?.type !== "done") throw new Error("Expected settled turn");
+		expect(JSON.stringify(settled.message.cursorSdk.summary)).not.toContain("private summary");
+		expect(compactionTestUtils.getPending("sess-1")).toMatchObject({
+			state: "pending",
+			summary: "kept native",
+			checkpointRootBlobId: "after",
+			summaryGeneration: 1,
+		});
 	});
 
 	test.each(["abort", "navigation"] as const)("%s during optional checkpoint read cannot publish stale occupancy", async (change) => {
