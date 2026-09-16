@@ -98,6 +98,62 @@ describe("identity mapping", () => {
 		expect(getModelMetadata("opaque@max")?.contextWindow).toBe(200_000);
 	});
 
+	test("family floors raise unlabeled and opaque windows; parseable SDK tiers stay authoritative", () => {
+		__testUtils.registerModelItems([
+			item({ id: "grok-4.5", variants: defaultVariant([]) }),
+			item({ id: "grok-4.6", variants: defaultVariant([]) }),
+			item({ id: "grok-4.20", variants: defaultVariant([]) }),
+			item({
+				id: "grok-4.5-max",
+				parameters: [param("context", ["256k", "1m"])],
+				variants: defaultVariant([{ id: "context", value: "1m" }]),
+			}),
+			item({ id: "default", variants: defaultVariant([]) }),
+			item({ id: "auto", variants: defaultVariant([]) }),
+			item({ id: "kimi-k2.7-code", variants: defaultVariant([]) }),
+			item({ id: "gpt-5.6", variants: defaultVariant([]) }),
+			item({
+				id: "gpt-5.6-luna",
+				parameters: [param("context", ["128k"])],
+				variants: defaultVariant([{ id: "context", value: "128k" }]),
+			}),
+			item({
+				id: "gpt-5.6-opaque",
+				parameters: [param("context", ["max"])],
+				variants: defaultVariant([{ id: "context", value: "max" }]),
+			}),
+			item({
+				id: "gpt-5.6-max",
+				parameters: [param("context", ["272k", "1m"])],
+				variants: defaultVariant([{ id: "context", value: "1m" }]),
+			}),
+			item({ id: "claude-opus-5", variants: defaultVariant([]) }),
+			item({ id: "claude-fable-5", variants: defaultVariant([]) }),
+			item({ id: "claude-opus-4-8", variants: defaultVariant([]) }),
+			item({ id: "k3", variants: defaultVariant([]) }),
+			item({ id: "composer-2.5", variants: defaultVariant([]) }),
+		]);
+		expect(getModelMetadata("grok-4.5")?.contextWindow).toBe(256_000);
+		expect(getModelMetadata("grok-4.6")?.contextWindow).toBe(256_000);
+		expect(getModelMetadata("grok-4.20")?.contextWindow).toBe(200_000);
+		expect(getModelMetadata("grok-4.5-max")?.contextWindow).toBe(1_000_000);
+		expect(getModelMetadata("grok-4.5-max")?.extendedContext?.standardContextWindow).toBe(256_000);
+		expect(getModelMetadata("default")?.contextWindow).toBe(256_000);
+		expect(getModelMetadata("auto")?.contextWindow).toBe(256_000);
+		expect(getModelMetadata("kimi-k2.7-code")?.contextWindow).toBe(262_000);
+		expect(getModelMetadata("gpt-5.6")?.contextWindow).toBe(272_000);
+		expect(getModelMetadata("gpt-5.6-luna")?.contextWindow).toBe(128_000);
+		expect(getModelMetadata("gpt-5.6-opaque")?.contextWindow).toBe(272_000);
+		expect(getModelMetadata("gpt-5.6-max")?.contextWindow).toBe(1_000_000);
+		expect(getModelMetadata("gpt-5.6-max")?.extendedContext?.standardContextWindow).toBe(272_000);
+		expect(getModelMetadata("claude-opus-5")?.contextWindow).toBe(300_000);
+		expect(getModelMetadata("claude-fable-5")?.contextWindow).toBe(300_000);
+		expect(getModelMetadata("claude-opus-4-8")?.contextWindow).toBe(200_000);
+		expect(getModelMetadata("k3")?.contextWindow).toBe(1_000_000);
+		expect(getModelMetadata("composer-2.5")?.contextWindow).toBe(200_000);
+		expect(buildModelSelection("gpt-5.6-luna", "off").params).toEqual([{ id: "context", value: "128k" }]);
+	});
+
 	test("aliases and duplicate ids never become extra rows", () => {
 		const models = __testUtils.registerModelItems([
 			item({

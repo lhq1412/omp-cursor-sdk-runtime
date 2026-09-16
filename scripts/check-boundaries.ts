@@ -42,7 +42,11 @@ const deepImportOwners: Record<string, Record<string, readonly string[]>> = {
 			"piReadPathHasRange",
 		],
 	},
+	"@oh-my-pi/pi-catalog/compat/revision": {
+		"src/catalog.ts": ["parseRevision", "parseRevisionConstraint", "revisionSatisfies"],
+	},
 	"@oh-my-pi/pi-catalog/compat/taxonomy": {
+		"src/catalog.ts": ["classifyModel"],
 		"src/context.ts": ["classifyModel"],
 	},
 	"@oh-my-pi/pi-catalog/discovery/cursor-proto": {

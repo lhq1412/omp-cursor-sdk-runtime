@@ -36,6 +36,7 @@
     "@oh-my-pi/pi-utils": "18.2.0"
   },
   "devDependencies": {
+    "@types/node": "^22.20.3",
     "typescript": "^6.0.3"
   },
   "omp": {

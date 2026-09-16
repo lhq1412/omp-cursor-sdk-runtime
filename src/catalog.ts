@@ -6,6 +6,8 @@ import {
 	type ModelSelection,
 } from "@cursor/sdk";
 import { Effort, type ModelCost } from "@oh-my-pi/pi-ai";
+import { parseRevision, parseRevisionConstraint, revisionSatisfies } from "@oh-my-pi/pi-catalog/compat/revision";
+import { classifyModel } from "@oh-my-pi/pi-catalog/compat/taxonomy";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import type { ProviderModelConfig } from "@oh-my-pi/pi-coding-agent";
 import { credentialScopeId } from "./auth.js";
@@ -125,6 +127,45 @@ export function parseCursorContextWindowValue(value: string): number | undefined
 	const unit = match[2]?.toLowerCase();
 	if (!Number.isFinite(amount) || amount <= 0) return undefined;
 	return Math.round(amount * (unit === "m" ? 1_000_000 : 1_000));
+}
+
+function revisionMatches(revision: string | undefined, constraint: string): boolean {
+	if (!revision) return false;
+	const parsed = parseRevision(revision);
+	const terms = parseRevisionConstraint(constraint);
+	return parsed !== undefined && terms !== undefined && revisionSatisfies(parsed, terms);
+}
+
+/** OMP 18.2.1 `providers/cursor.kdl` context-window-floor; `auto` is Cursor Auto. */
+function cursorContextWindowFloor(modelId: string): number | undefined {
+	const slash = modelId.lastIndexOf("/");
+	const bare = (slash === -1 ? modelId : modelId.slice(slash + 1)).trim().toLowerCase();
+	if (bare === "default" || bare === "auto") return 256_000;
+	if (bare === "k3") return 1_000_000;
+
+	const identity = classifyModel("cursor", modelId, { lenient: true });
+	if (identity.class === "kimi" && identity.family === "k3") return 1_000_000;
+	if (identity.class === "kimi" && identity.family === "k2.7-code") return 262_000;
+	if (identity.class === "anthropic" && identity.family === "fable") return 300_000;
+	if (identity.class === "anthropic" && identity.family === "opus" && revisionMatches(identity.revision, ">=5 <6")) {
+		return 300_000;
+	}
+	if (identity.class === "xai" && identity.family === "grok" && revisionMatches(identity.revision, ">=4.5 <4.7")) {
+		return 256_000;
+	}
+	if (identity.class === "openai" && revisionMatches(identity.revision, ">=5.6 <5.7")) return 272_000;
+	return undefined;
+}
+
+function advertisedContextWindow(
+	modelId: string,
+	context: string | undefined,
+	twoTierExtended?: number,
+): number {
+	if (twoTierExtended !== undefined) return twoTierExtended;
+	const parsed = context ? parseCursorContextWindowValue(context) : undefined;
+	if (parsed !== undefined) return parsed;
+	return cursorContextWindowFloor(modelId) ?? FALLBACK_CONTEXT_WINDOW;
 }
 
 function normalizeParamValue(value: string): string {
@@ -313,10 +354,6 @@ function deleteParam(params: ModelParameterValue[], id: string): void {
 	if (index >= 0) params.splice(index, 1);
 }
 
-function contextWindowFor(context: string | undefined, fallback: number): number {
-	return (context ? parseCursorContextWindowValue(context) : undefined) ?? fallback;
-}
-
 function toMetadata(identity: SelectionIdentity, defaultParams: ModelParameterValue[]): CursorModelMetadata {
 	const { model, context, contextTiers, piModelId } = identity;
 	const thinkingLevelMap = getThinkingLevelMap(model);
@@ -338,7 +375,7 @@ function toMetadata(identity: SelectionIdentity, defaultParams: ModelParameterVa
 		defaultParams: cloneParams(defaultParams),
 		...(context ? { context } : {}),
 		...(extendedContext ? { extendedContext } : {}),
-		contextWindow: contextTiers?.extended.contextWindow ?? contextWindowFor(effectiveContext, FALLBACK_CONTEXT_WINDOW),
+		contextWindow: advertisedContextWindow(model.id, effectiveContext, contextTiers?.extended.contextWindow),
 		supportsFast: getParameter(model, "fast") !== undefined,
 		defaultFast: fastValue === "true",
 		supportsReasoning: supportedThinkingEfforts.length > 0,
