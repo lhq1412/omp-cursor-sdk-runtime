@@ -394,11 +394,32 @@ describe("ompGlobToSdkResult", () => {
 		});
 	});
 
-	test("maps piFind onto an output string", () => {
+	test("uses the shared Pi find codec for truncation and limits", () => {
 		expect(ompGlobToSdkResult("piFindArgs", { pattern: "*.ts" }, {
 			content: [{ type: "text", text: "a.ts" }],
 			isError: false,
-		})).toEqual({ result: { case: "success", value: { output: "a.ts" } } });
+			details: {
+				resultLimitReached: 20,
+				truncation: {
+					truncated: true,
+					truncatedBy: "bytes",
+					totalLines: 4,
+					outputLines: 1,
+					outputBytes: 4,
+				},
+			},
+		})).toMatchObject({
+			$typeName: "agent.v1.PiFindExecResult",
+			result: {
+				case: "success",
+				value: {
+					$typeName: "agent.v1.PiFindExecSuccess",
+					output: "a.ts",
+					resultLimitReached: 20,
+					truncation: { truncated: true, truncatedBy: "bytes", totalLines: 4, outputLines: 1, outputBytes: 4 },
+				},
+			},
+		});
 	});
 
 	test("maps host errors onto the glob error envelope", () => {
@@ -438,11 +459,22 @@ describe("ompLsToSdkResult", () => {
 		});
 	});
 
-	test("maps piLs onto an output string", () => {
+	test("uses the shared Pi ls codec for entry limits", () => {
 		expect(ompLsToSdkResult("piLsArgs", ".", {
 			content: [{ type: "text", text: "a.ts" }],
 			isError: false,
-		})).toEqual({ result: { case: "success", value: { output: "a.ts" } } });
+			details: { meta: { limits: { resultLimit: { reached: 12 } } } },
+		})).toMatchObject({
+			$typeName: "agent.v1.PiLsExecResult",
+			result: {
+				case: "success",
+				value: {
+					$typeName: "agent.v1.PiLsExecSuccess",
+					output: "a.ts",
+					entryLimitReached: 12,
+				},
+			},
+		});
 	});
 });
 

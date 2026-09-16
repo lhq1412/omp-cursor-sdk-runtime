@@ -2,6 +2,8 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { readFileSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
+import type { ToolResultMessage } from "@oh-my-pi/pi-ai";
+import { buildPiFindResult, buildPiLsResult } from "@oh-my-pi/pi-ai/providers/cursor/exec-modern";
 import {
 	cursorEditOwnedReadPath,
 	omitUndefinedArgs,
@@ -53,7 +55,6 @@ const TOKEN_TO_OMP = {
 
 const GLOB_TOKENS = new Set(["globArgs", "GlobToolArgs", "piFindArgs"]);
 const LS_TOKENS = new Set(["lsArgs", "piLsArgs"]);
-const PI_OUTPUT_TOKENS = new Set(["piFindArgs", "piLsArgs"]);
 
 export type NativeToolExecutor = (name: string, args: Record<string, unknown>, toolCallId: string) => Promise<HostToolResult>;
 export type NativeReadExecutor = (args: Record<string, unknown>, toolCallId: string) => Promise<HostToolResult>;
@@ -105,6 +106,18 @@ function textOf(result: HostToolResult): string {
 		.filter((block): block is { type: "text"; text: string } => block.type === "text")
 		.map((block) => block.text)
 		.join("");
+}
+
+function asToolResult(result: HostToolResult, toolName: string, toolCallId: string): ToolResultMessage {
+	return {
+		role: "toolResult",
+		toolCallId,
+		toolName,
+		content: result.content,
+		isError: result.isError,
+		details: result.details,
+		timestamp: Date.now(),
+	};
 }
 
 function str(args: Record<string, unknown>, ...keys: string[]): string {
@@ -374,13 +387,16 @@ export function ompShellToSdkResult(args: Record<string, unknown>, result: HostT
 	};
 }
 
-export function ompGlobToSdkResult(token: string, args: Record<string, unknown>, result: HostToolResult): object {
+export function ompGlobToSdkResult(
+	token: string,
+	args: Record<string, unknown>,
+	result: HostToolResult,
+	toolCallId = "",
+): object {
+	if (token === "piFindArgs") return buildPiFindResult(asToolResult(result, "glob", toolCallId));
 	const text = textOf(result);
 	if (result.isError) {
 		return { result: { case: "error", value: { error: text || "glob failed" } } };
-	}
-	if (PI_OUTPUT_TOKENS.has(token)) {
-		return { result: { case: "success", value: { output: text } } };
 	}
 	const files = text.split("\n").map((line) => line.trim()).filter((line) => line.length > 0 && !line.startsWith("["));
 	const pattern = str(args, "globPattern", "glob_pattern", "pattern");
@@ -400,15 +416,11 @@ export function ompGlobToSdkResult(token: string, args: Record<string, unknown>,
 	};
 }
 
-export function ompLsToSdkResult(token: string, path: string, result: HostToolResult): object {
+export function ompLsToSdkResult(token: string, path: string, result: HostToolResult, toolCallId = ""): object {
+	if (token === "piLsArgs") return buildPiLsResult(asToolResult(result, "read", toolCallId));
 	const text = textOf(result);
 	if (result.isError) {
-		return token === "lsArgs"
-			? { result: { case: "error", value: { path, error: text || "ls failed" } } }
-			: { result: { case: "error", value: { error: text || "ls failed" } } };
-	}
-	if (PI_OUTPUT_TOKENS.has(token)) {
-		return { result: { case: "success", value: { output: text } } };
+		return { result: { case: "error", value: { path, error: text || "ls failed" } } };
 	}
 	const rootPath = path || ".";
 	const dirs: Array<{ absPath: string; childrenDirs: unknown[]; childrenFiles: unknown[]; childrenWereProcessed: boolean; fullSubtreeExtensionCounts: Record<string, number>; numFiles: number }> = [];
@@ -475,6 +487,9 @@ function mapShellArgs(args: Record<string, unknown>): Record<string, unknown> {
 function unavailable(token: string, args: Record<string, unknown>): object {
 	const path = str(args, "path") || str(args, "targetDirectory", "target_directory");
 	const command = str(args, "command");
+	const result = { content: [{ type: "text" as const, text: "OMP host unavailable" }], isError: true };
+	if (token === "piFindArgs") return ompGlobToSdkResult(token, args, result);
+	if (token === "piLsArgs") return ompLsToSdkResult(token, path, result);
 	if (token === "readArgs" || token === "writeArgs" || token === "lsArgs") {
 		return { result: { case: "rejected", value: { path, reason: "OMP host unavailable" } } };
 	}
@@ -518,13 +533,13 @@ async function executeNative(token: string, args: Record<string, unknown>): Prom
 		if (GLOB_TOKENS.has(token)) {
 			const prepared = mapGlobArgs(args);
 			if ("error" in prepared) {
-				return ompGlobToSdkResult(token, args, { content: [{ type: "text", text: prepared.error }], isError: true });
+				return ompGlobToSdkResult(token, args, { content: [{ type: "text", text: prepared.error }], isError: true }, execId);
 			}
-			return ompGlobToSdkResult(token, args, await run("glob", prepared.args, execId));
+			return ompGlobToSdkResult(token, args, await run("glob", prepared.args, execId), execId);
 		}
 		if (LS_TOKENS.has(token)) {
 			const path = piLsPath(str(args, "path") || undefined);
-			return ompLsToSdkResult(token, path, await run("read", { path }, execId));
+			return ompLsToSdkResult(token, path, await run("read", { path }, execId), execId);
 		}
 		const path = str(args, "path");
 		const content = str(args, "fileText", "file_text")
@@ -538,11 +553,14 @@ async function executeNative(token: string, args: Record<string, unknown>): Prom
 
 function ompToError(token: string, args: Record<string, unknown>, message: string): object {
 	const path = str(args, "path") || str(args, "targetDirectory", "target_directory");
+	const result = { content: [{ type: "text" as const, text: message }], isError: true };
+	if (token === "piFindArgs") return ompGlobToSdkResult(token, args, result);
+	if (token === "piLsArgs") return ompLsToSdkResult(token, path, result);
 	if (token === "readArgs" || token === "writeArgs" || token === "lsArgs") {
 		return { result: { case: "error", value: { path, error: message } } };
 	}
 	if (token === "shellArgs" || token === "shellStreamArgs") {
-		return ompShellToSdkResult(args, { content: [{ type: "text", text: message }], isError: true });
+		return ompShellToSdkResult(args, result);
 	}
 	return { result: { case: "error", value: { error: message } } };
 }
