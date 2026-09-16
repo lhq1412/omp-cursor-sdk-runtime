@@ -4,7 +4,7 @@ import type { Context } from "@oh-my-pi/pi-ai";
 import { credentialScopeId } from "./auth.js";
 import { DEFAULT_AGENT_INSTANCE_ID } from "./constants.js";
 import type { BindingState, GrantedTool, OmpHostBridgeV1 } from "./contracts.js";
-import { computeContextFingerprint, emptySendState, planSend, prepareSendInput, type ModelInputLimits, type SendState } from "./context.js";
+import { computeContextFingerprint, emptySendState, locatorFor, locatorsMatch, planSend, prepareSendInput, type MessageLocator, type ModelInputLimits, type SendState } from "./context.js";
 import { createSharedToolExec, type SharedToolExec } from "./host-exec.js";
 import {
 	createLiveRun,
@@ -44,6 +44,23 @@ export interface RuntimeSlot {
 	store?: LocalAgentStore;
 	summaryProbe?: SummaryBoundaryProbe;
 	preparation?: AbortController;
+	committedContextTail?: MessageLocator;
+	pendingNativeRebase?: PendingNativeRebase;
+}
+
+export interface PendingNativeRebase {
+	materializationId: string;
+	compactionEntryId: string;
+	compactionTimestamp: number;
+	checkpointRootBlobId: string;
+	summaryGeneration: number;
+	archiveHash: string;
+	knownTailLocator?: MessageLocator;
+}
+
+export interface NativeRebaseResult {
+	compactionEntryId: string;
+	effectiveHistoryDigest: string;
 }
 
 const slots = new Map<string, RuntimeSlot>();
@@ -135,6 +152,7 @@ export interface PreparedTurn {
 	customTools: Record<string, SDKCustomTool>;
 	prompt?: SDKUserMessage;
 	incremental: boolean;
+	nativeRebase?: NativeRebaseResult;
 }
 
 function attachParkExecutor(live: LiveRun, grantedTools: readonly GrantedTool[], host?: OmpHostBridgeV1): SharedToolExec {
@@ -197,6 +215,8 @@ async function persistDirtyAndDisposeAgent(slot: RuntimeSlot): Promise<void> {
 	slot.sendState = emptySendState();
 	slot.store = undefined;
 	slot.summaryProbe = undefined;
+	slot.committedContextTail = undefined;
+	slot.pendingNativeRebase = undefined;
 	if (agent) await disposeAgent(agent);
 }
 
@@ -215,6 +235,67 @@ function invalidateBindingBeforeSend(slot: RuntimeSlot, agentId: string): void {
 		...(slot.credentialScopeId ? { credentialScopeId: slot.credentialScopeId } : {}),
 	}));
 	slot.bindingState = "in-flight";
+}
+
+export function markPersistedHandleDirtyPreservingAgent(slot: RuntimeSlot): void {
+	if (slots.get(slot.key) !== slot) return;
+	const dirty = resumePending(slot, "dirty");
+	if (dirty) persistDirtyHandle(slot, dirty);
+}
+
+function findUniqueMessageIndex(messages: Context["messages"], locator: MessageLocator): number | undefined {
+	const matches: number[] = [];
+	for (let index = 0; index < messages.length; index += 1) {
+		if (locatorsMatch(locatorFor(messages[index]), locator)) matches.push(index);
+	}
+	return matches.length === 1 ? matches[0] : undefined;
+}
+
+export function attemptNativeCompactionRebase(slot: RuntimeSlot, context: Context): NativeRebaseResult | undefined {
+	const pending = slot.pendingNativeRebase;
+	if (!pending) return;
+	const summaryIndex = context.messages.findIndex((message) => (
+		message.role === "user"
+		&& "historyRewriteAt" in message
+		&& message.historyRewriteAt === pending.compactionTimestamp
+	));
+	if (summaryIndex < 0 || !pending.knownTailLocator) {
+		slot.pendingNativeRebase = undefined;
+		return;
+	}
+	const knownTailIndex = findUniqueMessageIndex(context.messages, pending.knownTailLocator);
+	if (knownTailIndex === undefined || knownTailIndex < summaryIndex) {
+		slot.pendingNativeRebase = undefined;
+		return;
+	}
+	const rebasedPrefix = { ...context, messages: context.messages.slice(0, knownTailIndex + 1) };
+	const rebasedFingerprint = computeContextFingerprint(rebasedPrefix);
+	// Refuse rebase when system prompt changed — keep old sendState so planSend bootstraps.
+	try {
+		const previous = JSON.parse(slot.sendState.contextFingerprint) as { systemHash?: unknown };
+		const next = JSON.parse(rebasedFingerprint) as { systemHash?: unknown };
+		if (
+			typeof previous.systemHash === "string"
+			&& typeof next.systemHash === "string"
+			&& previous.systemHash !== next.systemHash
+		) {
+			slot.pendingNativeRebase = undefined;
+			return;
+		}
+	} catch {
+		slot.pendingNativeRebase = undefined;
+		return;
+	}
+	slot.sendState = {
+		bootstrapped: true,
+		contextFingerprint: rebasedFingerprint,
+		incrementalSendCount: 0,
+	};
+	slot.pendingNativeRebase = undefined;
+	return {
+		compactionEntryId: pending.compactionEntryId,
+		effectiveHistoryDigest: slot.sendState.contextFingerprint,
+	};
 }
 
 export async function prepareTurn(input: OpenRuntimeTurnInput): Promise<PreparedTurn> {
@@ -253,9 +334,13 @@ export async function prepareTurn(input: OpenRuntimeTurnInput): Promise<Prepared
 	const unsafeBinding = Boolean(slot.agent) && (slot.bindingState !== "committed" || configMismatch);
 	const resumeHandle = unsafeBinding ? undefined : getMatchingResumeHandle(input.agentInstanceId, nextCredential, cwd);
 	const sendState = unsafeBinding ? emptySendState() : slot.agent ? slot.sendState : resumeHandle?.sendState ?? emptySendState();
+	if (!unsafeBinding) slot.sendState = sendState;
+	const nativeRebase = !unsafeBinding && trailing.length === 0 && slot.pendingNativeRebase
+		? attemptNativeCompactionRebase(slot, input.context)
+		: undefined;
 	const plan = trailing.length > 0
 		? { mode: "bootstrap" as const, resetAgent: true, reason: "context_divergence" as const }
-		: planSend(sendState, input.context);
+		: planSend(unsafeBinding ? sendState : slot.sendState, input.context);
 	const { prompt, history } = prepareSendInput(plan, input.context, input.modelLimits, modelSelection.id);
 
 	slot.preparation?.abort();
@@ -368,6 +453,7 @@ export async function prepareTurn(input: OpenRuntimeTurnInput): Promise<Prepared
 			customTools,
 			prompt,
 			incremental: plan.mode === "incremental",
+			...(nativeRebase ? { nativeRebase } : {}),
 		};
 	} catch (error) {
 		if (slots.get(slot.key) === slot) await persistDirtyAndDisposeAgent(slot);
@@ -382,6 +468,8 @@ export function commitTurn(slot: RuntimeSlot, context: Context, incremental: boo
 		contextFingerprint: computeContextFingerprint(context),
 		incrementalSendCount: incremental ? slot.sendState.incrementalSendCount + 1 : 0,
 	};
+	const last = context.messages.at(-1);
+	slot.committedContextTail = last ? locatorFor(last) : undefined;
 	slot.bindingState = "committed";
 	const pending = resumePending(slot, "committed");
 	if (pending) withCursorSessionOwner(slot.owner, () => persistResumeHandle(pending));
@@ -403,6 +491,8 @@ export function markTurnDirty(slot: RuntimeSlot): void {
 	slot.sendState = emptySendState();
 	slot.store = undefined;
 	slot.summaryProbe = undefined;
+	slot.committedContextTail = undefined;
+	slot.pendingNativeRebase = undefined;
 }
 
 export async function finishLiveKeepAgent(slot: RuntimeSlot, reason: string): Promise<void> {

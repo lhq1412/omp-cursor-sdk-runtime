@@ -40,6 +40,22 @@ export interface PreparedSendInput {
 	history?: Context["messages"];
 }
 
+export interface MessageLocator {
+	role: string;
+	timestamp?: number;
+	digest: string;
+}
+
+export interface SourceHistoryUnit {
+	ordinal: number;
+	startMessageIndex: number;
+	endMessageIndex: number;
+	firstMessage: MessageLocator;
+	lastMessage: MessageLocator;
+	kind: "turn" | "compaction-summary";
+	historyRewriteAt?: number;
+}
+
 const NATIVE_HISTORY_FORMAT = "native-checkpoint-v1";
 const IMAGE_TOKEN_RESERVE = 4096;
 
@@ -89,6 +105,46 @@ function hashValue(value: string): string {
 	return createHash("sha256").update(value).digest("hex").slice(0, 16);
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return Boolean(value && typeof value === "object" && !Array.isArray(value));
+}
+
+function stableMessageParts(message: unknown): { role: string; json: string } {
+	const role = isRecord(message) && typeof message.role === "string" ? message.role : "unknown";
+	const stable = role === "assistant" && isRecord(message)
+		? { ...message, completedAt: undefined, contextSnapshot: undefined }
+		: message;
+	return { role, json: JSON.stringify(stable) };
+}
+
+/** Identity hash for a model-visible message. Omits array index so locators survive compaction. */
+export function stableMessageDigest(message: unknown): string {
+	const { role, json } = stableMessageParts(message);
+	return hashValue(`${role}:${json}`);
+}
+
+export function locatorFor(message: unknown): MessageLocator {
+	const { role } = stableMessageParts(message);
+	const timestamp = isRecord(message) && typeof message.timestamp === "number" ? message.timestamp : undefined;
+	return {
+		role,
+		digest: stableMessageDigest(message),
+		...(timestamp !== undefined ? { timestamp } : {}),
+	};
+}
+
+export function locatorsMatch(left: MessageLocator, right: MessageLocator): boolean {
+	if (left.role !== right.role || left.digest !== right.digest) return false;
+	if (left.timestamp !== undefined && right.timestamp !== undefined) return left.timestamp === right.timestamp;
+	return true;
+}
+
+function historyRewriteAt(message: unknown): number | undefined {
+	if (!isRecord(message) || message.role !== "user" || typeof message.historyRewriteAt !== "number") return;
+	if (!Number.isFinite(message.historyRewriteAt)) return;
+	return message.historyRewriteAt;
+}
+
 function serializeSystemPrompt(systemPrompt: string | readonly string[] | undefined): string {
 	return typeof systemPrompt === "string" ? systemPrompt : systemPrompt?.join("\n") ?? "";
 }
@@ -109,12 +165,8 @@ function sanitizeSystemPromptForCursor(systemPrompt: string): string {
 export function computeContextFingerprint(context: Context): string {
 	const systemHash = hashValue(serializeSystemPrompt(context.systemPrompt));
 	const messageHashes = context.messages.map((message, index) => {
-		const role = "role" in message && typeof message.role === "string" ? message.role : "unknown";
-		// OMP stamps these after provider commit; neither changes model-visible history.
-		const stable = role === "assistant"
-			? { ...message, completedAt: undefined, contextSnapshot: undefined }
-			: message;
-		return hashValue(`${index}:${role}:${JSON.stringify(stable)}`);
+		const { role, json } = stableMessageParts(message);
+		return hashValue(`${index}:${role}:${json}`);
 	});
 	return JSON.stringify({ format: NATIVE_HISTORY_FORMAT, systemHash, messageHashes });
 }
@@ -189,10 +241,6 @@ function suffixRequiresBootstrap(messages: Context["messages"], fromIndex: numbe
 	return false;
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return Boolean(value && typeof value === "object" && !Array.isArray(value));
-}
-
 function currentInputMessage(context: Context, continueOnly = false): Record<string, unknown> | undefined {
 	const message: unknown = context.messages.at(-1);
 	return !continueOnly && isRecord(message) && (message.role === "user" || message.role === "developer") ? message : undefined;
@@ -252,6 +300,28 @@ function historyUnits(messages: Context["messages"], recoveryStart?: number): Co
 	}
 	if (unit.length > 0) units.push(unit);
 	return units;
+}
+
+export function projectSourceHistoryUnits(messages: Context["messages"]): SourceHistoryUnit[] {
+	const grouped = historyUnits(messages);
+	let start = 0;
+	return grouped.map((unit, ordinal) => {
+		const startMessageIndex = start;
+		const endMessageIndex = start + unit.length - 1;
+		start += unit.length;
+		const first = unit[0]!;
+		const last = unit[unit.length - 1]!;
+		const rewriteAt = historyRewriteAt(first);
+		return {
+			ordinal,
+			startMessageIndex,
+			endMessageIndex,
+			firstMessage: locatorFor(first),
+			lastMessage: locatorFor(last),
+			kind: rewriteAt !== undefined ? "compaction-summary" : "turn",
+			...(rewriteAt !== undefined ? { historyRewriteAt: rewriteAt } : {}),
+		};
+	});
 }
 
 function canReplayNativeThinking(message: { api?: unknown; provider?: unknown; model?: unknown }, targetModelId: string | undefined): boolean {

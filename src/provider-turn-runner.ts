@@ -35,6 +35,7 @@ import {
 	type CursorAssistantMessage,
 } from "./projector.js";
 import { readSettledCheckpointOccupancy } from "./native-history.js";
+import { stageCursorCompaction } from "./native-summary-compaction.js";
 import { openJsonlStore } from "./sdk-session.js";
 import { nativeReadHooked, runWithNativeTools } from "./sdk-native-hook.js";
 
@@ -230,6 +231,22 @@ export class ProviderTurnRunner {
 		if (!modelSelection) {
 			throw new Error("Cannot send a Cursor SDK turn without a model selection");
 		}
+		if (prepared.nativeRebase && prepared.host) {
+			await prepared.host.commitBinding({
+				version: 1,
+				ompSessionId: prepared.snapshot?.sessionId ?? prepared.slot.scopeKey,
+				agentInstanceId: prepared.agentInstanceId,
+				branchEpoch: prepared.snapshot?.branchEpoch ?? 0,
+				sdkAgentId: agent.agentId,
+				workspaceIdentity: prepared.cwd,
+				credentialScopeId: prepared.slot.credentialScopeId ?? "cursor-sdk",
+				configFingerprint: prepared.snapshot?.configFingerprint ?? "",
+				committedLeafId: prepared.nativeRebase.compactionEntryId,
+				effectiveHistoryDigest: prepared.nativeRebase.effectiveHistoryDigest,
+				state: "committed",
+			});
+			this.assertCurrent();
+		}
 		if (live.checkpointStore) {
 			try {
 				const baseline = await live.checkpointStore.agents.get({ agentId: agent.agentId });
@@ -368,7 +385,7 @@ export class ProviderTurnRunner {
 		}
 		this.assertCurrent();
 		const observation = !live.cancelled ? await live.summaryProbe?.flush() : undefined;
-		if (!live.cancelled && getLiveRun(preparedSlot.key) === live &&
+		if (!live.cancelled && settledAgent && getLiveRun(preparedSlot.key) === live &&
 			preparedSlot.agent === settledAgent && live.agent === settledAgent) {
 			if (occupancy) {
 				if (partial.cursorSdk.summary) partial.cursorSdk.summary.checkpointRootBlobId = occupancy.rootBlobId;
@@ -376,8 +393,21 @@ export class ProviderTurnRunner {
 			}
 			if (observation && partial.cursorSdk.summary?.status === "completed") {
 				partial.cursorSdk.summary.probe = observation;
+				const store = live.checkpointStore ?? preparedSlot.store;
+				if (store) {
+					await stageCursorCompaction({
+						observation,
+						context: this.context,
+						contextFingerprint: preparedSlot.sendState.contextFingerprint,
+						store,
+						slot: preparedSlot,
+						agentId: settledAgent.agentId,
+					});
+				}
+				this.assertCurrent();
 			}
 		}
+		this.assertCurrent();
 		const delivered = deliverWithoutUnendedPreviews(partial, live.projection, new Set());
 		stream.push({ type: "done", reason: "stop", message: delivered });
 		stream.end(delivered);
