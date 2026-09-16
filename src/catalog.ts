@@ -157,9 +157,15 @@ function cursorContextWindowFloor(modelId: string): number | undefined {
 	return undefined;
 }
 
-function applyCursorContextWindowFloor(modelId: string, window: number): number {
-	const floor = cursorContextWindowFloor(modelId);
-	return floor === undefined ? window : Math.max(window, floor);
+function advertisedContextWindow(
+	modelId: string,
+	context: string | undefined,
+	twoTierExtended?: number,
+): number {
+	if (twoTierExtended !== undefined) return twoTierExtended;
+	const parsed = context ? parseCursorContextWindowValue(context) : undefined;
+	if (parsed !== undefined) return parsed;
+	return cursorContextWindowFloor(modelId) ?? FALLBACK_CONTEXT_WINDOW;
 }
 
 function normalizeParamValue(value: string): string {
@@ -348,10 +354,6 @@ function deleteParam(params: ModelParameterValue[], id: string): void {
 	if (index >= 0) params.splice(index, 1);
 }
 
-function contextWindowFor(context: string | undefined, fallback: number): number {
-	return (context ? parseCursorContextWindowValue(context) : undefined) ?? fallback;
-}
-
 function toMetadata(identity: SelectionIdentity, defaultParams: ModelParameterValue[]): CursorModelMetadata {
 	const { model, context, contextTiers, piModelId } = identity;
 	const thinkingLevelMap = getThinkingLevelMap(model);
@@ -373,10 +375,7 @@ function toMetadata(identity: SelectionIdentity, defaultParams: ModelParameterVa
 		defaultParams: cloneParams(defaultParams),
 		...(context ? { context } : {}),
 		...(extendedContext ? { extendedContext } : {}),
-		contextWindow: applyCursorContextWindowFloor(
-			model.id,
-			contextTiers?.extended.contextWindow ?? contextWindowFor(effectiveContext, FALLBACK_CONTEXT_WINDOW),
-		),
+		contextWindow: advertisedContextWindow(model.id, effectiveContext, contextTiers?.extended.contextWindow),
 		supportsFast: getParameter(model, "fast") !== undefined,
 		defaultFast: fastValue === "true",
 		supportsReasoning: supportedThinkingEfforts.length > 0,

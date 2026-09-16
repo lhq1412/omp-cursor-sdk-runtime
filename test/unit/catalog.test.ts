@@ -98,7 +98,7 @@ describe("identity mapping", () => {
 		expect(getModelMetadata("opaque@max")?.contextWindow).toBe(200_000);
 	});
 
-	test("family floors raise unlabeled windows and keep SDK 1M", () => {
+	test("family floors raise unlabeled and opaque windows; parseable SDK tiers stay authoritative", () => {
 		__testUtils.registerModelItems([
 			item({ id: "grok-4.5", variants: defaultVariant([]) }),
 			item({ id: "grok-4.6", variants: defaultVariant([]) }),
@@ -112,6 +112,16 @@ describe("identity mapping", () => {
 			item({ id: "auto", variants: defaultVariant([]) }),
 			item({ id: "kimi-k2.7-code", variants: defaultVariant([]) }),
 			item({ id: "gpt-5.6", variants: defaultVariant([]) }),
+			item({
+				id: "gpt-5.6-luna",
+				parameters: [param("context", ["128k"])],
+				variants: defaultVariant([{ id: "context", value: "128k" }]),
+			}),
+			item({
+				id: "gpt-5.6-opaque",
+				parameters: [param("context", ["max"])],
+				variants: defaultVariant([{ id: "context", value: "max" }]),
+			}),
 			item({
 				id: "gpt-5.6-max",
 				parameters: [param("context", ["272k", "1m"])],
@@ -132,6 +142,8 @@ describe("identity mapping", () => {
 		expect(getModelMetadata("auto")?.contextWindow).toBe(256_000);
 		expect(getModelMetadata("kimi-k2.7-code")?.contextWindow).toBe(262_000);
 		expect(getModelMetadata("gpt-5.6")?.contextWindow).toBe(272_000);
+		expect(getModelMetadata("gpt-5.6-luna")?.contextWindow).toBe(128_000);
+		expect(getModelMetadata("gpt-5.6-opaque")?.contextWindow).toBe(272_000);
 		expect(getModelMetadata("gpt-5.6-max")?.contextWindow).toBe(1_000_000);
 		expect(getModelMetadata("gpt-5.6-max")?.extendedContext?.standardContextWindow).toBe(272_000);
 		expect(getModelMetadata("claude-opus-5")?.contextWindow).toBe(300_000);
@@ -139,6 +151,7 @@ describe("identity mapping", () => {
 		expect(getModelMetadata("claude-opus-4-8")?.contextWindow).toBe(200_000);
 		expect(getModelMetadata("k3")?.contextWindow).toBe(1_000_000);
 		expect(getModelMetadata("composer-2.5")?.contextWindow).toBe(200_000);
+		expect(buildModelSelection("gpt-5.6-luna", "off").params).toEqual([{ id: "context", value: "128k" }]);
 	});
 
 	test("aliases and duplicate ids never become extra rows", () => {
@@ -245,7 +258,7 @@ describe("reference pricing", () => {
 		});
 		const standardOnly = models.find((model) => model.id === "gpt-5.6-luna");
 		expect(standardOnly?.cost).toEqual({ input: 0.2, output: 1.2, cacheRead: 0.02, cacheWrite: 0.25 });
-		expect(standardOnly?.contextWindow).toBe(272_000);
+		expect(standardOnly?.contextWindow).toBe(128_000);
 		expect(buildModelSelection("gpt-5.6-luna", "off", { apiKey: "threshold-key", extendedContextEnabled: true })).toEqual({
 			id: "gpt-5.6-luna", params: [{ id: "context", value: "128k" }],
 		});
