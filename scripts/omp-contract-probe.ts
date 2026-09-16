@@ -2,7 +2,7 @@ import { deepStrictEqual, strictEqual } from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import type { ModelSelection } from "@cursor/sdk";
-import { Effort, toolWireSchema, type Context, type Tool } from "@oh-my-pi/pi-ai";
+import { Effort, toolWireSchema, type Context, type Tool, type ToolResultMessage } from "@oh-my-pi/pi-ai";
 import {
 	omitUndefinedArgs,
 	piGrepSkip,
@@ -12,6 +12,7 @@ import {
 	piReadPath,
 	piReadPathHasRange,
 } from "@oh-my-pi/pi-ai/providers/cursor-pi-args";
+import { buildPiFindResult, buildPiLsResult } from "@oh-my-pi/pi-ai/providers/cursor/exec-modern";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import {
 	ConversationStateStructureSchema,
@@ -79,6 +80,58 @@ same([
 	piJoinPath("src", "/absolute/*.ts"),
 ], ["*.ts", "*.ts", "src/nested/*.ts", "/absolute/*.ts"], "piJoinPath fixtures changed");
 same(omitUndefinedArgs({ absent: undefined, zero: 0, no: false, empty: "", nil: null }), { zero: 0, no: false, empty: "", nil: null }, "omitUndefinedArgs fixtures changed");
+
+const piFindResult = buildPiFindResult({
+	role: "toolResult",
+	toolCallId: "find-fixture",
+	toolName: "glob",
+	content: [{ type: "text", text: "src/a.ts" }],
+	isError: false,
+	details: {
+		resultLimitReached: 25,
+		truncation: {
+			truncated: true,
+			truncatedBy: "bytes",
+			totalLines: 3,
+			outputLines: 1,
+			outputBytes: 8,
+		},
+	},
+	timestamp: 1,
+} satisfies ToolResultMessage);
+invariant(piFindResult.result.case === "success", "buildPiFindResult success case changed");
+same([
+	piFindResult.result.value.output,
+	piFindResult.result.value.resultLimitReached,
+	piFindResult.result.value.truncation?.truncated,
+	piFindResult.result.value.truncation?.truncatedBy,
+], ["src/a.ts", 25, true, "bytes"], "buildPiFindResult metadata changed");
+
+const piLsResult = buildPiLsResult({
+	role: "toolResult",
+	toolCallId: "ls-fixture",
+	toolName: "read",
+	content: [{ type: "text", text: "src/" }],
+	isError: false,
+	details: { meta: { limits: { resultLimit: { reached: 10 } } } },
+	timestamp: 1,
+} satisfies ToolResultMessage);
+invariant(piLsResult.result.case === "success", "buildPiLsResult success case changed");
+same([
+	piLsResult.result.value.output,
+	piLsResult.result.value.entryLimitReached,
+], ["src/", 10], "buildPiLsResult metadata changed");
+
+const piFindError = buildPiFindResult({
+	role: "toolResult",
+	toolCallId: "find-error-fixture",
+	toolName: "glob",
+	content: [{ type: "text", text: "denied" }],
+	isError: true,
+	timestamp: 1,
+} satisfies ToolResultMessage);
+invariant(piFindError.result.case === "error", "buildPiFindResult error case changed");
+strictEqual(piFindError.result.value.error, "denied", label("buildPiFindResult error text changed"));
 
 const bundledModel = getBundledModel("anthropic", "claude-sonnet-4-5");
 invariant(bundledModel?.id === "claude-sonnet-4-5", "getBundledModel must return the requested bundled model");
