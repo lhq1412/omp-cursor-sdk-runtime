@@ -97,7 +97,41 @@ describe("ConversationSummaryArchive", () => {
 		expect(validateNativeTurnAlignment(coverage!, sourceUnits, after!.turns, before!.turns)).toBe(true);
 	});
 
-	test("expands a second archive through previous summary_message identity", () => {
+	test("aligns a second archive against already-materialized OMP context", () => {
+		const s1Message = new TextEncoder().encode("s1-envelope");
+		const archive1 = archive({
+			summarized: [turnBytes(1), turnBytes(2), turnBytes(3), turnBytes(4), turnBytes(5)],
+			summary: "S1",
+			windowTail: 3,
+			summaryMessage: s1Message,
+		});
+		const archive2 = archive({
+			summarized: [s1Message, turnBytes(6), turnBytes(7)],
+			summary: "S2",
+			windowTail: 1,
+			summaryMessage: new TextEncoder().encode("s2-envelope"),
+		});
+		const after = decodeCheckpointSummaryState(state(1, [archive1, archive2]));
+		const original = conversation(8);
+		const compacted: Context["messages"] = [
+			{ role: "user", content: "S1", timestamp: 1000, historyRewriteAt: 1000 } as Context["messages"][number],
+			...original.slice(10),
+		];
+		const sourceUnits = projectSourceHistoryUnits(compacted);
+		const coverage = resolveEffectiveSummaryCoverage(undefined, after!, sourceUnits);
+		expect(coverage).toMatchObject({
+			summary: "S2",
+			summarizedTurnCount: 2,
+			windowTail: 1,
+			includesPreviousSummary: true,
+			expandedSummarizedTurnCount: 2,
+		});
+		expect(coverage?.units[0]).toMatchObject({ kind: "previous-summary", summaryGeneration: 1 });
+		expect(coverage?.units.filter((unit) => unit.kind === "history-turn").map((unit) => unit.sourceUnitOrdinal)).toEqual([1, 2]);
+		expect(validateNativeTurnAlignment(coverage!, sourceUnits, after!.turns)).toBe(true);
+	});
+
+	test("expands a second archive into full history when previous summary was not materialized", () => {
 		const s1Message = new TextEncoder().encode("s1-envelope");
 		const archive1 = archive({
 			summarized: [turnBytes(1), turnBytes(2), turnBytes(3), turnBytes(4), turnBytes(5)],

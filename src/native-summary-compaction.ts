@@ -187,8 +187,11 @@ export async function stageCursorCompaction(input: {
 	slot: RuntimeSlot;
 	agentId: string;
 }): Promise<PendingCursorCompaction | undefined> {
-	const sessionId = getCursorSessionOwner().sessionId;
+	const owner = getCursorSessionOwner();
+	const sessionId = owner.sessionId;
 	if (!sessionId) return;
+	const ownerGeneration = owner.generation;
+	const slotKey = runtimeKey(input.slot.scopeKey, input.slot.agentInstanceId);
 	const afterBytes = await input.store.checkpoints.get({ agentId: input.agentId, blobId: input.observation.afterRoot });
 	if (!afterBytes) return;
 	const after = decodeCheckpointSummaryState(afterBytes);
@@ -197,6 +200,14 @@ export async function stageCursorCompaction(input: {
 	if (input.observation.beforeRoot) {
 		const beforeBytes = await input.store.checkpoints.get({ agentId: input.agentId, blobId: input.observation.beforeRoot });
 		before = beforeBytes ? decodeCheckpointSummaryState(beforeBytes) : undefined;
+	}
+	const current = getCursorSessionOwner();
+	if (
+		current.sessionId !== sessionId
+		|| current.generation !== ownerGeneration
+		|| getRuntimeSlot(slotKey) !== input.slot
+	) {
+		return;
 	}
 	const sourceUnits = projectSourceHistoryUnits(input.context.messages);
 	const coverage = resolveEffectiveSummaryCoverage(before, after, sourceUnits);
@@ -225,6 +236,13 @@ export async function stageCursorCompaction(input: {
 			: {}),
 		state: "pending",
 	};
+	if (
+		getCursorSessionOwner().sessionId !== sessionId
+		|| getCursorSessionOwner().generation !== ownerGeneration
+		|| getRuntimeSlot(slotKey) !== input.slot
+	) {
+		return;
+	}
 	pendingBySession.set(sessionId, pending);
 	return pending;
 }

@@ -404,8 +404,10 @@ export class ProviderTurnRunner {
 						agentId: settledAgent.agentId,
 					});
 				}
+				this.assertCurrent();
 			}
 		}
+		this.assertCurrent();
 		const delivered = deliverWithoutUnendedPreviews(partial, live.projection, new Set());
 		stream.push({ type: "done", reason: "stop", message: delivered });
 		stream.end(delivered);

@@ -4,14 +4,21 @@ import type { CompactionEntry, ExtensionAPI, ExtensionContext, SessionEntry } fr
 import { CURSOR_SDK_PROVIDER_ID } from "../../src/constants.ts";
 import { locatorFor, projectSourceHistoryUnits, stableMessageDigest } from "../../src/context.ts";
 import {
+	clearCoordinator,
 	commitOwnMaterialization,
 	noteMainSessionStop,
 	onAgentEnd,
 	onSessionBeforeCompact,
 	resolveMaterializationBoundary,
+	stageCursorCompaction,
 	__testUtils as compactionTestUtils,
 	type PendingCursorCompaction,
 } from "../../src/native-summary-compaction.ts";
+import { ConversationStateStructureSchema } from "@oh-my-pi/pi-catalog/discovery/cursor-proto";
+import {
+	ConversationSummaryArchiveSchema,
+} from "../../src/native-history.ts";
+import type { LocalAgentStore } from "@cursor/sdk";
 import { registerCursorSessionLifecycle } from "../../src/session-lifecycle.ts";
 import {
 	attemptNativeCompactionRebase,
@@ -208,6 +215,45 @@ describe("native summary materialization", () => {
 		});
 		expect(resolveMaterializationBoundary(item, entries)).toBeUndefined();
 		expect(item.state).toBe("stale");
+	});
+
+	test("second materialization retains from compacted source turns after previous summary", () => {
+		const original = conversation(8);
+		const compacted = [
+			{ role: "user", content: "S1", timestamp: 1000, historyRewriteAt: 1000 } as Context["messages"][number],
+			...original.slice(10),
+		];
+		const summaryEntry = {
+			type: "compaction",
+			id: "cmp-1",
+			parentId: null,
+			timestamp: new Date(1000).toISOString(),
+			summary: "S1",
+			firstKeptEntryId: "e10",
+			tokensBefore: 80,
+			details: { from: "extension", extensionName: "cursor-sdk", kind: "cursor-sdk-native-summary" },
+		} as CompactionEntry;
+		const retained = compacted.slice(1).map((message, index) =>
+			messageEntry(`e${10 + index}`, message, index === 0 ? "cmp-1" : `e${9 + index}`),
+		);
+		const entries: SessionEntry[] = [summaryEntry, ...retained];
+		const item = pending({
+			sourceUnits: projectSourceHistoryUnits(compacted),
+			coverage: coverage(2, {
+				includesPreviousSummary: true,
+				summarizedTurnCount: 2,
+				expandedSummarizedTurnCount: 2,
+				windowTail: 1,
+				units: [
+					{ kind: "previous-summary", summaryGeneration: 1, summaryMessageHash: "s1" },
+					{ kind: "history-turn", sourceUnitOrdinal: 1 },
+					{ kind: "history-turn", sourceUnitOrdinal: 2 },
+				],
+			}),
+		});
+		// turnUnits = [F,G,H]; covered=2 → retained H = compacted[5] = original message index 14 → e14
+		expect(resolveMaterializationBoundary(item, entries)?.firstKeptEntryId).toBe("e14");
+		expect(item.state).toBe("pending");
 	});
 
 	test("marks pending stale when a previous compaction exists without previous-summary coverage", () => {
@@ -452,5 +498,194 @@ describe("native summary materialization", () => {
 			resetAgent: true,
 			reason: "context_divergence",
 		});
+	});
+
+	test("lazy rebase refuses system prompt change so planSend bootstraps", async () => {
+		const { ctx } = hooks();
+		const owner = ownerForContext(ctx);
+		runtimeTestUtils.setOpenAgent(async () => ({
+			agentId: "agent-x",
+			close() {},
+			async [Symbol.asyncDispose]() {},
+		} as SDKAgent));
+		const original = conversation(5);
+		const first = { systemPrompt: ["old-policy"], messages: original } as Context;
+		const turn = await withCursorSessionOwner(owner, () => prepareTurn({
+			cwd: ctx.cwd,
+			agentInstanceId: "main",
+			apiKey: "test-key",
+			modelSelection: { id: "composer-2.5" },
+			modelLimits: { contextWindow: 200_000, maxTokens: 20_000 },
+			context: first,
+			grantedTools: [],
+		}));
+		commitTurn(turn.slot, first, false);
+		const beforeFingerprint = turn.slot.sendState.contextFingerprint;
+		turn.slot.pendingNativeRebase = {
+			materializationId: "attempt-1",
+			compactionEntryId: "cmp-1",
+			compactionTimestamp: 1000,
+			checkpointRootBlobId: "after",
+			summaryGeneration: 1,
+			archiveHash: "hash",
+			knownTailLocator: turn.slot.committedContextTail,
+		};
+		const compacted: Context = {
+			systemPrompt: ["new-policy"],
+			messages: [
+				{ role: "user", content: "S", timestamp: 1000, historyRewriteAt: 1000 } as Context["messages"][number],
+				...original.slice(4),
+				user("next", 90),
+			],
+		};
+		const rebase = attemptNativeCompactionRebase(turn.slot, compacted);
+		expect(rebase).toBeUndefined();
+		expect(turn.slot.pendingNativeRebase).toBeUndefined();
+		expect(turn.slot.sendState.contextFingerprint).toBe(beforeFingerprint);
+		const { planSend } = await import("../../src/context.ts");
+		expect(planSend(turn.slot.sendState, compacted)).toMatchObject({
+			mode: "bootstrap",
+			resetAgent: true,
+			reason: "context_divergence",
+		});
+	});
+
+	test("stageCursorCompaction publishes pending when owner generation stays current", async () => {
+		const { ctx } = hooks();
+		const owner = ownerForContext(ctx);
+		runtimeTestUtils.setOpenAgent(async () => ({
+			agentId: "agent-x",
+			close() {},
+			async [Symbol.asyncDispose]() {},
+		} as SDKAgent));
+		const messages = conversation(8);
+		const context = { messages } as Context;
+		const turn = await withCursorSessionOwner(owner, () => prepareTurn({
+			cwd: ctx.cwd,
+			agentInstanceId: "main",
+			apiKey: "test-key",
+			modelSelection: { id: "composer-2.5" },
+			modelLimits: { contextWindow: 200_000, maxTokens: 20_000 },
+			context,
+			grantedTools: [],
+		}));
+		const archiveBytes = ConversationSummaryArchiveSchema.encode(ConversationSummaryArchiveSchema.create({
+			summarizedMessages: [1, 2, 3, 4, 5].map((id) => Uint8Array.of(id)),
+			summary: "S1",
+			windowTail: 3,
+			summaryMessage: new TextEncoder().encode("s1"),
+		}));
+		const afterBytes = ConversationStateStructureSchema.encode(ConversationStateStructureSchema.create({
+			turns: [6, 7, 8].map((id) => Uint8Array.of(id)),
+			turnsOld: [],
+			summaryArchives: [archiveBytes],
+			summaryArchive: new Uint8Array(),
+			selfSummaryCount: 1,
+			summary: new TextEncoder().encode("S1"),
+			tokenDetails: { usedTokens: 40, maxTokens: 100 },
+		}));
+		const store = {
+			checkpoints: {
+				async get() {
+					return afterBytes;
+				},
+			},
+		} as unknown as LocalAgentStore;
+		const staged = await withCursorSessionOwner(owner, () => stageCursorCompaction({
+			observation: {
+				summaryGeneration: 1,
+				beforeRoot: null,
+				afterRoot: "after",
+				after: {
+					rootBlobId: "after",
+					turns: 3,
+					turnsOld: 0,
+					summaryArchive: 0,
+					summaryArchives: 1,
+					selfSummaryCount: 1,
+					summaryBytes: 2,
+					summaryArchiveBytes: 1,
+				},
+			},
+			context,
+			contextFingerprint: turn.slot.sendState.contextFingerprint,
+			store,
+			slot: turn.slot,
+			agentId: "agent-x",
+		}));
+		expect(staged?.state).toBe("pending");
+		expect(compactionTestUtils.getPending(owner.sessionId!)?.summary).toBe("S1");
+	});
+
+	test("stageCursorCompaction drops publish after navigation clears coordinator mid-await", async () => {
+		const { ctx } = hooks();
+		const owner = ownerForContext(ctx);
+		runtimeTestUtils.setOpenAgent(async () => ({
+			agentId: "agent-x",
+			close() {},
+			async [Symbol.asyncDispose]() {},
+		} as SDKAgent));
+		const messages = conversation(8);
+		const context = { messages } as Context;
+		const turn = await withCursorSessionOwner(owner, () => prepareTurn({
+			cwd: ctx.cwd,
+			agentInstanceId: "main",
+			apiKey: "test-key",
+			modelSelection: { id: "composer-2.5" },
+			modelLimits: { contextWindow: 200_000, maxTokens: 20_000 },
+			context,
+			grantedTools: [],
+		}));
+		const archiveBytes = ConversationSummaryArchiveSchema.encode(ConversationSummaryArchiveSchema.create({
+			summarizedMessages: [1, 2, 3, 4, 5].map((id) => Uint8Array.of(id)),
+			summary: "S1",
+			windowTail: 3,
+			summaryMessage: new TextEncoder().encode("s1"),
+		}));
+		const afterBytes = ConversationStateStructureSchema.encode(ConversationStateStructureSchema.create({
+			turns: [6, 7, 8].map((id) => Uint8Array.of(id)),
+			turnsOld: [],
+			summaryArchives: [archiveBytes],
+			summaryArchive: new Uint8Array(),
+			selfSummaryCount: 1,
+			summary: new TextEncoder().encode("S1"),
+			tokenDetails: { usedTokens: 40, maxTokens: 100 },
+		}));
+		let release!: (value: Uint8Array | null) => void;
+		const gate = new Promise<Uint8Array | null>((resolve) => { release = resolve; });
+		const store = {
+			checkpoints: {
+				async get() {
+					return gate;
+				},
+			},
+		} as unknown as LocalAgentStore;
+		const staging = withCursorSessionOwner(owner, () => stageCursorCompaction({
+			observation: {
+				summaryGeneration: 1,
+				beforeRoot: null,
+				afterRoot: "after",
+				after: {
+					rootBlobId: "after",
+					turns: 3,
+					turnsOld: 0,
+					summaryArchive: 0,
+					summaryArchives: 1,
+					selfSummaryCount: 1,
+					summaryBytes: 2,
+					summaryArchiveBytes: 1,
+				},
+			},
+			context,
+			contextFingerprint: turn.slot.sendState.contextFingerprint,
+			store,
+			slot: turn.slot,
+			agentId: "agent-x",
+		}));
+		clearCoordinator(owner.sessionId);
+		owner.generation += 1;
+		release(afterBytes);
+		await expect(staging).resolves.toBeUndefined();
+		expect(compactionTestUtils.getPending(owner.sessionId!)).toBeUndefined();
 	});
 });

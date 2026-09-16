@@ -269,9 +269,26 @@ export function attemptNativeCompactionRebase(slot: RuntimeSlot, context: Contex
 		return;
 	}
 	const rebasedPrefix = { ...context, messages: context.messages.slice(0, knownTailIndex + 1) };
+	const rebasedFingerprint = computeContextFingerprint(rebasedPrefix);
+	// Refuse rebase when system prompt changed — keep old sendState so planSend bootstraps.
+	try {
+		const previous = JSON.parse(slot.sendState.contextFingerprint) as { systemHash?: unknown };
+		const next = JSON.parse(rebasedFingerprint) as { systemHash?: unknown };
+		if (
+			typeof previous.systemHash === "string"
+			&& typeof next.systemHash === "string"
+			&& previous.systemHash !== next.systemHash
+		) {
+			slot.pendingNativeRebase = undefined;
+			return;
+		}
+	} catch {
+		slot.pendingNativeRebase = undefined;
+		return;
+	}
 	slot.sendState = {
 		bootstrapped: true,
-		contextFingerprint: computeContextFingerprint(rebasedPrefix),
+		contextFingerprint: rebasedFingerprint,
 		incrementalSendCount: 0,
 	};
 	slot.pendingNativeRebase = undefined;

@@ -209,10 +209,13 @@ function expandedHistoryTurns(archives: DecodedCursorSummaryArchive[], index: nu
 }
 
 /**
- * Frozen alignment:
+ * Frozen alignment against current OMP source turns:
  *   expandedSummarizedTurnCount + windowTail === source turn units
  *   after.turns === windowTail
  * Previous-summary identity is byte-equal summary_message in a later archive.
+ * If OMP already materialized that previous summary, treat it as the baseline
+ * (consume the compaction-summary unit, do not expand into deleted turns).
+ * Otherwise expand through the archive tree into still-present history turns.
  * Any conversation that fails the equality is inapplicable (stale), including
  * continueOnly extra native turns and merged developer sequences.
  */
@@ -226,8 +229,8 @@ export function resolveEffectiveSummaryCoverage(
 	const latestIndex = archives.length - 1;
 	const latest = archives[latestIndex]!;
 	if (!latest.summary) return;
-	const turnUnits = sourceUnits.filter((unit) => unit.kind === "turn");
 	const units: CursorCoverageUnit[] = [];
+	let sourceCursor = 0;
 	let turnCursor = 0;
 	let includesPreviousSummary = false;
 	for (const message of latest.summarizedMessages) {
@@ -239,15 +242,28 @@ export function resolveEffectiveSummaryCoverage(
 				summaryGeneration: previous + 1,
 				summaryMessageHash: archives[previous]!.summaryMessageHash,
 			});
-			turnCursor += expandedHistoryTurns(archives, previous, new Set());
+			if (sourceUnits[sourceCursor]?.kind === "compaction-summary") {
+				sourceCursor += 1;
+				continue;
+			}
+			let remaining = expandedHistoryTurns(archives, previous, new Set());
+			while (remaining > 0) {
+				const source = sourceUnits[sourceCursor];
+				if (!source) return;
+				sourceCursor += 1;
+				if (source.kind !== "turn") continue;
+				turnCursor += 1;
+				remaining -= 1;
+			}
 			continue;
 		}
-		const source = turnUnits[turnCursor];
-		if (!source) return;
+		while (sourceUnits[sourceCursor]?.kind === "compaction-summary") sourceCursor += 1;
+		const source = sourceUnits[sourceCursor];
+		if (!source || source.kind !== "turn") return;
 		units.push({ kind: "history-turn", sourceUnitOrdinal: source.ordinal });
+		sourceCursor += 1;
 		turnCursor += 1;
 	}
-	const expandedSummarizedTurnCount = expandedHistoryTurns(archives, latestIndex, new Set());
 	const summarizedTurnCount = units.filter((unit) => unit.kind === "history-turn").length;
 	return {
 		summary: latest.summary,
@@ -256,7 +272,7 @@ export function resolveEffectiveSummaryCoverage(
 		units,
 		includesPreviousSummary,
 		archiveHash: latest.archiveHash,
-		expandedSummarizedTurnCount,
+		expandedSummarizedTurnCount: turnCursor,
 	};
 }
 
