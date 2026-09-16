@@ -3,6 +3,7 @@ import { readFileSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
 import {
+	cursorEditOwnedReadPath,
 	omitUndefinedArgs,
 	piGrepSkip,
 	piJoinPath,
@@ -55,7 +56,10 @@ const PI_OUTPUT_TOKENS = new Set(["piFindArgs", "piLsArgs"]);
 export type NativeToolExecutor = (name: string, args: Record<string, unknown>, toolCallId: string) => Promise<HostToolResult>;
 export type NativeReadExecutor = (args: Record<string, unknown>, toolCallId: string) => Promise<HostToolResult>;
 
-const nativeTools = new AsyncLocalStorage<NativeToolExecutor>();
+const nativeTools = new AsyncLocalStorage<{
+	execute: NativeToolExecutor;
+	editOwnedToolCallIds: Set<string>;
+}>();
 
 export function resourceArgsName(token: object): string | undefined {
 	const record = token as Record<string, unknown>;
@@ -111,6 +115,16 @@ function str(args: Record<string, unknown>, ...keys: string[]): string {
 
 function asDetails(details: unknown): Record<string, unknown> | undefined {
 	return details && typeof details === "object" ? details as Record<string, unknown> : undefined;
+}
+
+export function rememberNativeEditToolCall(update: unknown): void {
+	const record = asDetails(update);
+	if (asDetails(record?.toolCall)?.type !== "edit") return;
+	const ids = nativeTools.getStore()?.editOwnedToolCallIds;
+	for (const key of ["callId", "modelCallId"]) {
+		const id = record?.[key];
+		if (typeof id === "string" && id) ids?.add(id);
+	}
 }
 
 function toolResultWasTruncated(details: unknown): boolean {
@@ -422,10 +436,11 @@ function mapGrepArgs(args: Record<string, unknown>): { args: Record<string, unkn
 }
 
 function mapShellArgs(args: Record<string, unknown>): Record<string, unknown> {
+	const timeoutMs = typeof args.timeout === "number" && args.timeout > 0 ? args.timeout : undefined;
 	return omitUndefinedArgs({
 		command: str(args, "command"),
 		cwd: str(args, "workingDirectory", "working_directory") || undefined,
-		timeout: typeof args.timeout === "number" && args.timeout > 0 ? args.timeout : undefined,
+		timeout: timeoutMs === undefined ? undefined : Math.ceil(timeoutMs / 1000),
 	});
 }
 
@@ -442,8 +457,9 @@ function unavailable(token: string, args: Record<string, unknown>): object {
 }
 
 async function executeNative(token: string, args: Record<string, unknown>): Promise<object> {
-	const run = nativeTools.getStore();
-	if (!run) return unavailable(token, args);
+	const context = nativeTools.getStore();
+	if (!context) return unavailable(token, args);
+	const run = context.execute;
 	const toolCallId = str(args, "toolCallId", "tool_call_id");
 	const execId = toolCallId ? projectSdkToolCallId(`${toolCallId}:${token}`) : toolCallId;
 	try {
@@ -451,7 +467,9 @@ async function executeNative(token: string, args: Record<string, unknown>): Prom
 			const path = str(args, "path");
 			const offset = typeof args.offset === "number" ? args.offset : undefined;
 			const limit = typeof args.limit === "number" ? args.limit : undefined;
-			const mapped = piReadPath(path, offset, limit);
+			const mapped = context.editOwnedToolCallIds.has(toolCallId)
+				? cursorEditOwnedReadPath(path, offset, limit)
+				: piReadPath(path, offset, limit);
 			if (mapped === null) {
 				return ompReadToSdkResult(path, { content: [{ type: "text", text: "" }], isError: false });
 			}
@@ -583,7 +601,7 @@ export const __testUtils = {
 };
 
 export function runWithNativeTools<T>(execute: NativeToolExecutor, fn: () => T): T {
-	return nativeTools.run(execute, fn);
+	return nativeTools.run({ execute, editOwnedToolCallIds: new Set() }, fn);
 }
 
 export function runWithNativeRead<T>(execute: NativeReadExecutor, fn: () => T): T {

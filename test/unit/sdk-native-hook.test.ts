@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { isHookedOmpTool, mapGlobArgs, mapNativeReadPath, nativeSdkToolsFromGrants, ompGlobToSdkResult, ompGrepToSdkResult, ompLsToSdkResult, ompReadToSdkResult, ompShellToSdkResult, ompWriteToSdkResult, resourceArgsName, runWithNativeTools, __testUtils as nativeHookTestUtils } from "../../src/sdk-native-hook.ts";
+import { isHookedOmpTool, mapGlobArgs, mapNativeReadPath, nativeSdkToolsFromGrants, ompGlobToSdkResult, ompGrepToSdkResult, ompLsToSdkResult, ompReadToSdkResult, ompShellToSdkResult, ompWriteToSdkResult, rememberNativeEditToolCall, resourceArgsName, runWithNativeTools, __testUtils as nativeHookTestUtils } from "../../src/sdk-native-hook.ts";
 import { projectSdkToolCallId } from "../../src/tool-call-id.ts";
 
 describe("resourceArgsName", () => {
@@ -370,6 +370,23 @@ describe("executeNative", () => {
 		}]);
 	});
 
+	test("forces edit-owned materialization reads through the raw selector", async () => {
+		const calls: Array<{ name: string; args: Record<string, unknown> }> = [];
+		await runWithNativeTools(async (name, args) => {
+			calls.push({ name, args });
+			return { content: [{ type: "text", text: "source" }], isError: false };
+		}, async () => {
+			rememberNativeEditToolCall({
+				type: "tool-call-started",
+				callId: "edit-envelope",
+				modelCallId: "edit-call",
+				toolCall: { type: "edit", args: { path: "src/a.ts" } },
+			});
+			await nativeHookTestUtils.executeNative("readArgs", { path: "src/a.ts", toolCallId: "edit-call" });
+		});
+		expect(calls).toEqual([{ name: "read", args: { path: "src/a.ts:raw" } }]);
+	});
+
 	test("computes write metadata from fileText not the host message", async () => {
 		const result = await runWithNativeTools(async () => {
 			return { content: [{ type: "text", text: "Wrote file" }], isError: false };
@@ -380,6 +397,19 @@ describe("executeNative", () => {
 				value: { path: "/tmp/a.ts", linesCreated: 2, fileSize: 4 },
 			},
 		});
+	});
+
+	test("converts SDK shell timeout milliseconds to OMP seconds", async () => {
+		const calls: Array<{ name: string; args: Record<string, unknown> }> = [];
+		await runWithNativeTools(async (name, args) => {
+			calls.push({ name, args });
+			return { content: [{ type: "text", text: "" }], isError: false };
+		}, () => nativeHookTestUtils.executeNative("shellArgs", {
+			command: "sleep 1",
+			timeout: 30_001,
+			toolCallId: "shell1",
+		}));
+		expect(calls).toEqual([{ name: "bash", args: { command: "sleep 1", timeout: 31 } }]);
 	});
 
 	test("forwards grep offset as OMP skip and joins glob onto path", async () => {

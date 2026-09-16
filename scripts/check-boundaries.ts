@@ -24,6 +24,7 @@ const deepImportOwners: Record<string, Record<string, readonly string[]>> = {
 	},
 	"@oh-my-pi/pi-ai/providers/cursor-pi-args": {
 		"src/sdk-native-hook.ts": [
+			"cursorEditOwnedReadPath",
 			"omitUndefinedArgs",
 			"piGrepSkip",
 			"piJoinPath",

@@ -37,7 +37,7 @@ import {
 import { readSettledCheckpointOccupancy } from "./native-history.js";
 import { stageCursorCompaction } from "./native-summary-compaction.js";
 import { openJsonlStore } from "./sdk-session.js";
-import { nativeReadHooked, runWithNativeTools } from "./sdk-native-hook.js";
+import { nativeReadHooked, rememberNativeEditToolCall, runWithNativeTools } from "./sdk-native-hook.js";
 
 const bridgeOwners = new Map<string, { owner: CursorSessionOwner; signal: AbortSignal; onAbort: () => void }>();
 
@@ -266,6 +266,7 @@ export class ProviderTurnRunner {
 						model: modelSelection,
 						local: { customTools },
 						onDelta: ({ update }) => {
+							rememberNativeEditToolCall(update);
 							const sink = live.sink;
 							if (!sink || live.cancelled || getRuntimeSlot(prepared.slot.key) !== prepared.slot) return;
 							applyInteractionUpdate(sink.stream, sink.partial, update, live.projection);
