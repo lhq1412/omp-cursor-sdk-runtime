@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { isHookedOmpTool, mapGlobArgs, mapNativeReadPath, nativeSdkToolsFromGrants, ompGlobToSdkResult, ompGrepToSdkResult, ompLsToSdkResult, ompReadToSdkResult, ompShellToSdkResult, ompWriteToSdkResult, rememberNativeEditToolCall, resourceArgsName, runWithNativeTools, __testUtils as nativeHookTestUtils } from "../../src/sdk-native-hook.ts";
+import { isHookedOmpTool, mapGlobArgs, mapNativeReadPath, nativeSdkToolsFromGrants, ompGlobToSdkResult, ompGrepToSdkResult, ompLsToSdkResult, ompReadToSdkResult, ompShellToSdkResult, ompWriteToSdkResult, resourceArgsName, runWithNativeTools, __testUtils as nativeHookTestUtils } from "../../src/sdk-native-hook.ts";
 import { projectSdkToolCallId } from "../../src/tool-call-id.ts";
 
 describe("resourceArgsName", () => {
@@ -370,21 +370,27 @@ describe("executeNative", () => {
 		}]);
 	});
 
-	test("forces edit-owned materialization reads through the raw selector", async () => {
+	test("correlates raw edit inner IDs independently of envelope and model IDs", async () => {
 		const calls: Array<{ name: string; args: Record<string, unknown> }> = [];
 		await runWithNativeTools(async (name, args) => {
 			calls.push({ name, args });
 			return { content: [{ type: "text", text: "source" }], isError: false };
 		}, async () => {
-			rememberNativeEditToolCall({
-				type: "tool-call-started",
+			nativeHookTestUtils.rememberNativeEditToolCall({
 				callId: "edit-envelope",
-				modelCallId: "edit-call",
-				toolCall: { type: "edit", args: { path: "src/a.ts" } },
+				modelCallId: "model-call",
+				toolCall: {
+					toolCallId: "edit-inner",
+					tool: { case: "editToolCall", value: { args: { path: "src/a.ts" } } },
+				},
 			});
-			await nativeHookTestUtils.executeNative("readArgs", { path: "src/a.ts", toolCallId: "edit-call" });
+			await nativeHookTestUtils.executeNative("readArgs", { path: "src/model.ts", toolCallId: "model-call" });
+			await nativeHookTestUtils.executeNative("readArgs", { path: "src/a.ts", toolCallId: "edit-inner" });
 		});
-		expect(calls).toEqual([{ name: "read", args: { path: "src/a.ts:raw" } }]);
+		expect(calls).toEqual([
+			{ name: "read", args: { path: "src/model.ts" } },
+			{ name: "read", args: { path: "src/a.ts:raw" } },
+		]);
 	});
 
 	test("computes write metadata from fileText not the host message", async () => {
