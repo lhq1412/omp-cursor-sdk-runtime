@@ -44,7 +44,7 @@ const deepImportOwners: Record<string, Record<string, readonly string[]>> = {
 		],
 	},
 	"@oh-my-pi/pi-ai/providers/cursor/exec-modern": {
-		"src/sdk-native-hook.ts": ["buildPiFindResult", "buildPiLsResult"],
+		"src/sdk-native-hook.ts": ["buildPiFindResult", "buildPiLsResult", "buildPiWriteResult", "buildPiWriteRejected"],
 		"scripts/omp-contract-probe.ts": ["buildPiFindResult", "buildPiLsResult"],
 	},
 	"@oh-my-pi/pi-catalog/compat/revision": {

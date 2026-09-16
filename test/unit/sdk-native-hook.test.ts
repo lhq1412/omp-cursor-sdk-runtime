@@ -481,28 +481,29 @@ describe("ompLsToSdkResult", () => {
 describe("nativeSdkToolsFromGrants", () => {
 	test("maps OMP grants onto SDK names and adds ls from read", () => {
 		expect(nativeSdkToolsFromGrants(["read", "glob", "write", "bash"])).toEqual(
-			expect.arrayContaining(["read", "ls", "glob", "edit", "shell"]),
+			expect.arrayContaining(["read", "ls", "glob", "piWrite", "shell"]),
 		);
 		expect(nativeSdkToolsFromGrants(["read", "glob", "write", "bash"])).not.toContain("write");
+		expect(nativeSdkToolsFromGrants(["read", "glob", "write", "bash"])).not.toContain("edit");
 	});
 
-	test("advertises native edit only when read and write are both granted", () => {
-		expect(nativeSdkToolsFromGrants(["write"])).toEqual([]);
+	test("maps write to piWrite and advertises edit only with read and write", () => {
+		expect(nativeSdkToolsFromGrants(["write"])).toEqual(["piWrite"]);
 		expect(nativeSdkToolsFromGrants(["edit"])).toEqual([]);
-		expect(nativeSdkToolsFromGrants(["read", "write"])).toEqual(["read", "ls", "edit"]);
+		expect(nativeSdkToolsFromGrants(["read", "write"])).toEqual(["read", "ls", "piWrite"]);
 		expect(nativeSdkToolsFromGrants(["read", "edit"])).toEqual(["read", "ls"]);
-		expect(nativeSdkToolsFromGrants(["write", "edit"])).toEqual([]);
-		expect(nativeSdkToolsFromGrants(["read", "write", "edit"])).toEqual(["read", "ls", "edit"]);
+		expect(nativeSdkToolsFromGrants(["write", "edit"])).toEqual(["piWrite"]);
+		expect(nativeSdkToolsFromGrants(["read", "write", "edit"])).toEqual(["read", "ls", "piWrite", "edit"]);
 	});
 });
 
 describe("isHookedOmpTool", () => {
-	test("keeps write and edit custom unless read and write are both granted", () => {
-		expect(isHookedOmpTool("write", ["write"])).toBe(false);
+	test("hooks write as piWrite; edit stays custom unless read and write are both granted", () => {
+		expect(isHookedOmpTool("write", ["write"])).toBe(true);
 		expect(isHookedOmpTool("edit", ["edit"])).toBe(false);
 		expect(isHookedOmpTool("write", ["read", "write"])).toBe(true);
 		expect(isHookedOmpTool("edit", ["read", "edit"])).toBe(false);
-		expect(isHookedOmpTool("write", ["write", "edit"])).toBe(false);
+		expect(isHookedOmpTool("write", ["write", "edit"])).toBe(true);
 		expect(isHookedOmpTool("edit", ["write", "edit"])).toBe(false);
 		expect(isHookedOmpTool("write", ["read", "write", "edit"])).toBe(true);
 		expect(isHookedOmpTool("edit", ["read", "write", "edit"])).toBe(true);
@@ -556,6 +557,18 @@ describe("executeNative", () => {
 				case: "success",
 				value: { path: "/tmp/a.ts", linesCreated: 2, fileSize: 4 },
 			},
+		});
+	});
+
+	test("runs piWriteArgs as OMP write and returns the pi write codec", async () => {
+		const calls: Array<{ name: string; args: Record<string, unknown> }> = [];
+		const result = await runWithNativeTools(async (name, args) => {
+			calls.push({ name, args });
+			return { content: [{ type: "text", text: "Successfully wrote 3 bytes to new.ts" }], isError: false };
+		}, () => nativeHookTestUtils.executeNative("piWriteArgs", { path: "new.ts", content: "abc", toolCallId: "w1" }));
+		expect(calls).toEqual([{ name: "write", args: { path: "new.ts", content: "abc" } }]);
+		expect(result).toMatchObject({
+			result: { case: "success", value: { output: "Successfully wrote 3 bytes to new.ts" } },
 		});
 	});
 
