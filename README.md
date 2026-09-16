@@ -10,6 +10,7 @@ This is a separate adapter from [lhq1412/omp-cursor-sdk](https://github.com/lhq1
 
 Pinned baselines:
 
+- Package `0.3.2`
 - OMP `18.2.0` (all four direct OMP packages exact-pinned)
 - `@cursor/sdk` `1.0.31`
 - Direct history-codec dependency: `@oh-my-pi/pi-catalog` `18.2.0`
@@ -40,7 +41,7 @@ npm install
 omp plugin link .
 ```
 
-OMP 18.1.18 only loads plugins declared in `~/.omp/plugins/package.json`. After linking, add a `file:` dependency if `omp models cursor-sdk` is empty:
+OMP 18.2.0 only loads plugins declared in `~/.omp/plugins/package.json`. After linking, add a `file:` dependency if `omp models cursor-sdk` is empty:
 
 ```bash
 cd ~/.omp/plugins
@@ -94,7 +95,7 @@ OMP's materialized selector cache and the adapter's credential-scoped SDK metada
 
 The native model browser's input/output prices are **base-mode reference USD per million tokens, not Cursor SDK charges**. The adapter first checks an exact, nonzero OMP bundled Cursor price, then exact IDs in the bundled OpenAI, Anthropic, Google and xAI catalogs. A small explicit map covers Cursor's alternate Claude names; display names, SDK aliases, arbitrary suffixes and Gemini preview variants are not guessed. Prices follow the pinned OMP catalog, not a live price feed; SDK model IDs, capabilities and selection parameters remain authoritative.
 
-All bundled Cursor prices in OMP 18.1.18 are zero, so matched first-party models supply the current comparisons. Models without a reliable price, including Composer, retain structural zero prices because the provider config requires numeric rates. **OMP 18.1.18 renders those zero prices as `free` in its native price column; this does not mean these models are free.** The plain `omp models` table has no price columns; use the interactive model browser for comparisons.
+All bundled Cursor prices in OMP 18.2.0 are zero, so matched first-party models supply the current comparisons. Models without a reliable price, including Composer, retain structural zero prices because the provider config requires numeric rates. **OMP 18.2.0 renders those zero prices as `free` in its native price column; this does not mean these models are free.** The plain `omp models` table has no price columns; use the interactive model browser for comparisons.
 
 Reference rates do not account for Cursor fast mode, long-context premiums, discounts or plan coverage. Extended-context rows retain the SDK threshold but repeat the base reference rates; they do not import the vendor's pricing tiers. These catalog rates are not used to calculate assistant-message costs: message `usage.cost` remains unavailable, and token/context accounting is unchanged. Restart OMP after updating the extension, then run `/cursor-refresh-models` to refresh the model list.
 
@@ -119,7 +120,7 @@ SDK preset variants are valid selections independently of advertised parameter d
 
 ## Tools
 
-On stock brew OMP, `context.tools` plus xd://-mounted tools (including enabled `mcp__*` MCP tools) are mapped to Cursor SDK custom tools. When the native hook installs, granted OMP `read`/`grep`/`bash`/`glob` are advertised as Cursor `read`/`grep`/`shell`/`glob` (and `ls` when `read` is granted) and intercepted back to the OMP host (`ls` executes as OMP `read`). Native `edit` is advertised only when both `read` and `write` are granted (`edit`/`writeArgs` executes as OMP `write`); `write` or `edit` alone stay custom tools. Cursor has no `write` tool name. `delete` and `task` stay disallowed. SDK `settingSources` is always `[]`; `mcpServers` is always `{}`.
+On stock brew OMP, `context.tools` plus xd://-mounted tools (including enabled `mcp__*` MCP tools) are mapped to Cursor SDK custom tools. When the native hook installs, granted OMP `read`/`grep`/`bash`/`glob` are advertised as Cursor `read`/`grep`/`shell`/`glob` (and `ls` when `read` is granted) and intercepted back to the OMP host (`ls` executes as OMP `read`). Native `edit` is advertised only when both `read` and `write` are granted (`edit`/`writeArgs` executes as OMP `write`); `write` or `edit` alone stay custom tools. Cursor has no `write` tool name. Native `shell` timeouts are Cursor milliseconds converted to OMP seconds. Native `grep`/`ls` results reuse OMP's `buildPiFindResult`/`buildPiLsResult` codecs. `delete` and `task` stay disallowed. SDK `settingSources` is always `[]`; `mcpServers` is always `{}`.
 
 The extension shadows OMP `web_search`. Non-`cursor-sdk` models try an isolated Cursor SDK agent with only `webSearch` (no shell/edit/MCP/session resume), using `/login cursor-sdk` or `CURSOR_API_KEY`. If Cursor is missing, fails, or finishes without calling `webSearch`, it falls back to OMP's native search chain via `ctx.invokeTool`. `cursor-sdk/*` does not bridge that wrapper as a custom tool; when OMP granted `web_search`, the session agent may use native `webSearch` only.
 
@@ -188,7 +189,7 @@ Final SDK results fill missing answer text against the current answer step. A ma
 
 Assistant messages carry `cursorSdk` availability metadata: `tokenUsage` is `actual` or `unavailable`; `contextOccupancy` is `actual` with `source: "checkpoint"` after a successful settled turn whose public store root is new, idle, and stable, otherwise `unavailable`. Run billing and `turn-ended` totals are not occupancy. Occupancy is never copied into `usage.contextTokens`. Parked, cancelled, and unreadable checkpoints leave occupancy `unavailable`. Message `cost` stays `unavailable`: OMP requires numeric cost fields, so their zero placeholders **do not mean free usage**. Official billed totals and dollar amounts come from `/cursor-usage` or OMP `/usage` (`agent.getUsage()`): top-level agent snapshots, not summed listed turns, and not written into `usage.cost`. Local billed IDs are per-turn identities, not SDK Run IDs, and costs can settle later. Some accounts return `feature_unavailable` for `getUsage()`. See the [public SDK usage contracts](https://cursor.com/docs/sdk/typescript#token-usage).
 
-SDK Run billing maps to `usage.orchestration`: input includes cache writes, with output and cache reads in their own orchestration fields. The prompt buckets (`usage.input`, `output`, `cacheRead`, and `cacheWrite`) stay zero, and `usage.totalTokens` is the orchestration sum. OMP 18.1.18 subtracts orchestration from `calculateContextTokens` and checks only prompt input/cache buckets for usage-backed overflow, so cumulative Run totals no longer masquerade as conversation context.
+SDK Run billing maps to `usage.orchestration`: input includes cache writes, with output and cache reads in their own orchestration fields. The prompt buckets (`usage.input`, `output`, `cacheRead`, and `cacheWrite`) stay zero, and `usage.totalTokens` is the orchestration sum. OMP 18.2.0 subtracts orchestration from `calculateContextTokens` and checks only prompt input/cache buckets for usage-backed overflow, so cumulative Run totals no longer masquerade as conversation context.
 
 Provider errors and diagnostic notifications redact credentials, authorization/cookie headers and sensitive query values before display/persistence, while retaining useful error categories and request IDs. Normal assistant/tool content is not globally rewritten.
 
@@ -209,7 +210,7 @@ OMP packages are Bun-targeted, so runtime tests use Bun. GitHub Actions runs `np
 
 Real-host tests cover concurrent request owners, abort/retry, same-directory subagents, unscoped auxiliary completions, and tool execution counts. OMP 18.2's stock session transformer suppresses tool speculation, so tests distinguish stock execution from an explicitly transformer-free public Agent configuration that exercises finalized read speculation. Both must execute each SDK call once; write/edit/bash must not speculate. The adapter does not remove the host transformer or change compaction policy.
 
-OMP integration migrations keep the private credential-scoped model cache separate from OMP's selector cache. Freeze contracts before changing the baseline; change runtime behavior only for demonstrated incompatibilities. Do not bundle session-binding or compaction redesigns into a baseline upgrade. The 18.2 release gate also requires real host cache, request-owner, grant, speculation, and lifecycle tests. Target `0.2.5` only if all gates pass with model-consistency-only runtime changes; session/tool/compaction semantic changes require `0.3.0`. A missing or failed live SDK probe is not validated support and blocks release.
+Current package is `0.3.2` on OMP 18.2.0 and SDK 1.0.31. Keep the private credential-scoped model cache separate from OMP's selector cache. Freeze contracts before changing the baseline; change runtime behavior only for demonstrated incompatibilities. Do not bundle session-binding or compaction redesigns into a pin bump. Real host cache, request-owner, grant, speculation, and lifecycle tests remain the 18.2 gate. Pin-only compatibility stays patch; further session/tool/compaction semantic changes still need a minor bump. A missing or failed live SDK probe is not validated support and blocks release.
 
 The manual release workflow reuses the complete CI workflow before changing the version, pushing a tag, or creating a release. An absent dedicated SDK secret or a failed probe therefore blocks publication; local verification alone does not bypass that gate.
 
