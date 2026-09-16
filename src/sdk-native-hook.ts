@@ -3,7 +3,7 @@ import { readFileSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
 import type { ToolResultMessage } from "@oh-my-pi/pi-ai";
-import { buildPiFindResult, buildPiLsResult } from "@oh-my-pi/pi-ai/providers/cursor/exec-modern";
+import { buildPiFindResult, buildPiLsResult, buildPiWriteRejected, buildPiWriteResult } from "@oh-my-pi/pi-ai/providers/cursor/exec-modern";
 import {
 	cursorEditOwnedReadPath,
 	omitUndefinedArgs,
@@ -16,6 +16,9 @@ import {
 } from "@oh-my-pi/pi-ai/providers/cursor-pi-args";
 import type { HostToolResult } from "./contracts.js";
 import { projectSdkToolCallId } from "./tool-call-id.js";
+import { ensureCursorRipgrepPath } from "./cursor-ripgrep-path.js";
+
+ensureCursorRipgrepPath();
 
 const HOOK = "__cursorSdkNativeToolHook";
 const UPDATE_HOOK = "__cursorSdkNativeToolUpdateHook";
@@ -25,14 +28,14 @@ function resolveSdkBundle(): string {
 	return join(dirname(createRequire(import.meta.url).resolve("@cursor/sdk/package.json")), "dist/bundled/index.js");
 }
 
-/** OMP grant name → SDK AgentOptions.tools name. Native `edit` requires both `read` and `write`: Cursor StrReplace materializes via readArgs then writeArgs. */
+/** OMP grant name → SDK AgentOptions.tools name. SDK has no `write` tool; OMP `write` is `piWrite`. Native `edit` (StrReplace) needs `read`+`write` because it materializes via readArgs then writeArgs. */
 export const NATIVE_OMP_TO_SDK = {
 	read: "read",
 	grep: "grep",
 	bash: "shell",
 	edit: "edit",
 	glob: "glob",
-	write: "edit",
+	write: "piWrite",
 } as const;
 
 /** Extra SDK allowlist names enabled by an OMP grant. Native ls executes as OMP read. */
@@ -46,6 +49,7 @@ const TOKEN_TO_OMP = {
 	shellArgs: "bash",
 	shellStreamArgs: "bash",
 	writeArgs: "write",
+	piWriteArgs: "write",
 	globArgs: "glob",
 	GlobToolArgs: "glob",
 	piFindArgs: "glob",
@@ -81,7 +85,7 @@ export function nativeSdkToolsFromGrants(names: readonly string[]): string[] {
 		if (!tools.includes(sdk)) tools.push(sdk);
 	};
 	for (const name of names) {
-		if ((name === "edit" || name === "write") && !(granted.has("read") && granted.has("write"))) continue;
+		if (name === "edit" && !(granted.has("read") && granted.has("write"))) continue;
 		const sdk = NATIVE_OMP_TO_SDK[name as keyof typeof NATIVE_OMP_TO_SDK];
 		if (sdk) add(sdk);
 		for (const extra of NATIVE_OMP_EXTRA_SDK[name] ?? []) add(extra);
@@ -95,7 +99,7 @@ export function nativeToolsFingerprint(names: readonly string[]): string {
 
 export function isHookedOmpTool(name: string, grantedNames?: readonly string[]): boolean {
 	if (!nativeReadHooked || !(name in NATIVE_OMP_TO_SDK)) return false;
-	if (name === "edit" || name === "write") return Boolean(grantedNames?.includes("read") && grantedNames?.includes("write"));
+	if (name === "edit") return Boolean(grantedNames?.includes("read") && grantedNames?.includes("write"));
 	return true;
 }
 
@@ -490,6 +494,7 @@ function unavailable(token: string, args: Record<string, unknown>): object {
 	const result = { content: [{ type: "text" as const, text: "OMP host unavailable" }], isError: true };
 	if (token === "piFindArgs") return ompGlobToSdkResult(token, args, result);
 	if (token === "piLsArgs") return ompLsToSdkResult(token, path, result);
+	if (token === "piWriteArgs") return buildPiWriteRejected("OMP host unavailable");
 	if (token === "readArgs" || token === "writeArgs" || token === "lsArgs") {
 		return { result: { case: "rejected", value: { path, reason: "OMP host unavailable" } } };
 	}
@@ -542,9 +547,11 @@ async function executeNative(token: string, args: Record<string, unknown>): Prom
 			return ompLsToSdkResult(token, path, await run("read", { path }, execId), execId);
 		}
 		const path = str(args, "path");
-		const content = str(args, "fileText", "file_text")
+		const content = str(args, "content", "fileText", "file_text")
 			|| (args.fileBytes instanceof Uint8Array ? new TextDecoder().decode(args.fileBytes) : "");
-		return ompWriteToSdkResult(path, await run("write", { path, content }, execId), content, args.returnFileContentAfterWrite === true);
+		const written = await run("write", { path, content }, execId);
+		if (token === "piWriteArgs") return buildPiWriteResult(asToolResult(written, "write", execId));
+		return ompWriteToSdkResult(path, written, content, args.returnFileContentAfterWrite === true);
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
 		return ompToError(token, args, message);
@@ -556,6 +563,7 @@ function ompToError(token: string, args: Record<string, unknown>, message: strin
 	const result = { content: [{ type: "text" as const, text: message }], isError: true };
 	if (token === "piFindArgs") return ompGlobToSdkResult(token, args, result);
 	if (token === "piLsArgs") return ompLsToSdkResult(token, path, result);
+	if (token === "piWriteArgs") return buildPiWriteResult(asToolResult(result, "write", str(args, "toolCallId", "tool_call_id")));
 	if (token === "readArgs" || token === "writeArgs" || token === "lsArgs") {
 		return { result: { case: "error", value: { path, error: message } } };
 	}

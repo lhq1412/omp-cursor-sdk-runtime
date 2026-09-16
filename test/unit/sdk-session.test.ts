@@ -77,9 +77,9 @@ describe("buildAgentOptions", () => {
 			model: { id: "composer-2.5" },
 			store,
 			customTools: {},
-			includeNativeTools: ["read", "grep", "shell", "edit", "glob", "ls"],
+			includeNativeTools: ["read", "grep", "shell", "edit", "glob", "ls", "piWrite"],
 		});
-		expect(options.tools).toEqual(expect.arrayContaining(["read", "grep", "shell", "edit", "glob", "ls"]));
+		expect(options.tools).toEqual(expect.arrayContaining(["read", "grep", "shell", "edit", "glob", "ls", "piWrite"]));
 		expect(options.tools).not.toContain("write");
 		expect(options.disallowedTools).not.toContain("read");
 		expect(options.disallowedTools).not.toContain("grep");
@@ -87,6 +87,7 @@ describe("buildAgentOptions", () => {
 		expect(options.disallowedTools).not.toContain("edit");
 		expect(options.disallowedTools).not.toContain("glob");
 		expect(options.disallowedTools).not.toContain("ls");
+		expect(options.disallowedTools).not.toContain("piWrite");
 	});
 
 	test("rejects cloud agent ids", () => {
