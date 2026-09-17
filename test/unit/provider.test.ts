@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -228,7 +229,7 @@ describe("streamCursorRuntime model selection", () => {
 		expect(settled.message.usage.contextTokens).toBeUndefined();
 	});
 
-	test("preserves a native summary across parked continuation and stages compaction from the checkpoint probe", async () => {
+	test("reconciles a content-addressed native summary without delta events across parked continuation", async () => {
 		const directory = mkdtempSync(join(tmpdir(), "cursor-summary-provider-"));
 		scopeTestUtils.set("/tmp/project", join(directory, "session.jsonl"), "sess-1");
 		temporaryPaths.push(directory, storeRootForScope("/tmp/project", getCursorSessionScopeKey()));
@@ -242,15 +243,33 @@ describe("streamCursorRuntime model selection", () => {
 			summary: new Uint8Array(),
 			tokenDetails: { usedTokens: 80, maxTokens: 100 },
 		}));
+		const blobs = new Map<string, Uint8Array>();
+		const put = (bytes: Uint8Array): Uint8Array => {
+			const reference = createHash("sha256").update(bytes).digest();
+			blobs.set(reference.toString("hex"), bytes);
+			return reference;
+		};
+		const summarizedMessages: Uint8Array[] = [];
+		for (let index = 0; index < 5; index += 1) {
+			summarizedMessages.push(
+				put(new TextEncoder().encode(JSON.stringify({ role: "user", content: [{ type: "text", text: `u${index}` }] }))),
+				put(new TextEncoder().encode(JSON.stringify({ role: "assistant", content: [{ type: "text", text: `a${index}` }] }))),
+			);
+		}
+		const summaryMessage = put(new TextEncoder().encode(JSON.stringify({
+			role: "user",
+			content: [{ type: "text", text: "summary:kept native" }],
+		})));
+		const archiveReference = put(ConversationSummaryArchiveSchema.encode(ConversationSummaryArchiveSchema.create({
+			summarizedMessages,
+			summary: "kept native",
+			windowTail: 3,
+			summaryMessage,
+		})));
 		const afterBytes = ConversationStateStructureSchema.encode(ConversationStateStructureSchema.create({
-			turns: [6, 7, 8].map((id) => Uint8Array.of(id)),
+			turns: Array.from({ length: 8 }, (_, index) => Uint8Array.of(index + 1)),
 			turnsOld: [],
-			summaryArchives: [ConversationSummaryArchiveSchema.encode(ConversationSummaryArchiveSchema.create({
-				summarizedMessages: [1, 2, 3, 4, 5].map((id) => Uint8Array.of(id)),
-				summary: "kept native",
-				windowTail: 3,
-				summaryMessage: new TextEncoder().encode("s1"),
-			}))],
+			summaryArchives: [archiveReference],
 			summaryArchive: new Uint8Array(),
 			selfSummaryCount: 1,
 			summary: new TextEncoder().encode("private summary"),
@@ -262,18 +281,13 @@ describe("streamCursorRuntime model selection", () => {
 				latestCheckpoint: { schemaVersion: 1 as const, rootBlobId: "before" },
 			};
 			await input.store.checkpoints.create({ agentId, blobId: "before", data: beforeBytes });
+			for (const [blobId, data] of blobs) {
+				await input.store.checkpoints.create({ agentId, blobId, data });
+			}
 			await input.store.agents.create({ agent: document });
 			return {
 				agentId, close() {}, async [Symbol.asyncDispose]() {},
 				async send(_message, options) {
-					await options?.onDelta?.({ update: { type: "summary-started" } });
-					await options?.onDelta?.({ update: { type: "summary", summary: "kept native" } });
-					await input.store.runEvents.append({
-						runId: "run-summary-park",
-						eventType: "preCompact",
-						payload: { message_count: 8, messages_to_compact: 5 },
-					});
-					await options?.onDelta?.({ update: { type: "summary-completed" } });
 					await input.store.checkpoints.create({ agentId, blobId: "after", data: afterBytes });
 					await input.store.agents.update({
 						agent: { ...document, updatedAt: 2, latestCheckpoint: { schemaVersion: 1, rootBlobId: "after" } },
@@ -308,12 +322,9 @@ describe("streamCursorRuntime model selection", () => {
 		messages.push({ role: "user", content: "inspect", timestamp: 80 } as Context["messages"][number]);
 		const context = { messages, tools: [readTool()] } as Context;
 		const parked = (await drain(cursorModel("composer-2.5", 200_000), context, { apiKey: "test-key" })).at(-1);
-		expect(parked).toMatchObject({
-			type: "done",
-			reason: "toolUse",
-			message: { cursorSdk: { summary: { count: 1, status: "completed", text: "kept native" } } },
-		});
+		expect(parked).toMatchObject({ type: "done", reason: "toolUse" });
 		if (parked?.type !== "done") throw new Error("Expected parked turn");
+		expect(parked.message.cursorSdk.summary).toBeUndefined();
 		const settled = (await drain(cursorModel("composer-2.5", 200_000), {
 			...context,
 			messages: [
@@ -327,25 +338,12 @@ describe("streamCursorRuntime model selection", () => {
 			message: {
 				content: [{ type: "text", text: "done" }],
 				cursorSdk: {
-					summary: {
-						count: 1,
-						status: "completed",
-						text: "kept native",
-						checkpointRootBlobId: "after",
-						probe: {
-							summaryGeneration: 1,
-							beforeRoot: "before",
-							afterRoot: "after",
-							before: { turns: 8, selfSummaryCount: 0 },
-							after: { turns: 3, selfSummaryCount: 1 },
-						},
-					},
 					contextOccupancy: { status: "actual", source: "checkpoint", rootBlobId: "after" },
 				},
 			},
 		});
 		if (settled?.type !== "done") throw new Error("Expected settled turn");
-		expect(JSON.stringify(settled.message.cursorSdk.summary)).not.toContain("private summary");
+		expect(settled.message.cursorSdk.summary).toBeUndefined();
 		expect(compactionTestUtils.getPending("sess-1")).toMatchObject({
 			state: "pending",
 			summary: "kept native",
