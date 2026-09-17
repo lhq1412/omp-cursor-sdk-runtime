@@ -19,7 +19,6 @@ import {
 } from "./context.js";
 import {
 	decodeCheckpointSummaryState,
-	validateNativeTurnAlignment,
 	resolveEffectiveSummaryCoverage,
 	type CursorSummaryCoverage,
 	type NativeCheckpointArchives,
@@ -208,21 +207,25 @@ export async function stageCursorCompaction(input: {
 	const ownerGeneration = owner.generation;
 	const slotKey = runtimeKey(input.slot.scopeKey, input.slot.agentInstanceId);
 	if (!stagingRequestAlive(input, sessionId, ownerGeneration, slotKey)) return;
-	const afterBytes = await input.store.checkpoints.get({ agentId: input.agentId, blobId: input.observation.afterRoot });
-	if (!afterBytes) return;
-	const after = decodeCheckpointSummaryState(afterBytes);
-	if (!after) return;
-	let before: NativeCheckpointArchives | undefined;
-	if (input.observation.beforeRoot) {
-		const beforeBytes = await input.store.checkpoints.get({ agentId: input.agentId, blobId: input.observation.beforeRoot });
-		before = beforeBytes ? decodeCheckpointSummaryState(beforeBytes) : undefined;
+	let after: NativeCheckpointArchives | undefined;
+	try {
+		const afterBytes = await input.store.checkpoints.get({ agentId: input.agentId, blobId: input.observation.afterRoot });
+		after = afterBytes
+			? await decodeCheckpointSummaryState(input.store, input.agentId, afterBytes)
+			: undefined;
+	} catch {
+		after = undefined;
 	}
 	if (!stagingRequestAlive(input, sessionId, ownerGeneration, slotKey)) return;
-	const sourceUnits = projectSourceHistoryUnits(input.context.messages);
-	const coverage = resolveEffectiveSummaryCoverage(before, after, sourceUnits);
 	const existing = pendingBySession.get(sessionId);
-	if (!coverage || !validateNativeTurnAlignment(coverage, sourceUnits, after.turns, before?.turns)) {
-		if (existing && existing.state === "pending") existing.state = "stale";
+	if (!after) {
+		if (existing?.state === "pending") existing.state = "stale";
+		return existing;
+	}
+	const sourceUnits = projectSourceHistoryUnits(input.context.messages);
+	const coverage = resolveEffectiveSummaryCoverage(after, sourceUnits, input.context.messages);
+	if (!coverage) {
+		if (existing?.state === "pending") existing.state = "stale";
 		return existing;
 	}
 	const tokens = tokensBeforeFrom(input.observation, input.context);

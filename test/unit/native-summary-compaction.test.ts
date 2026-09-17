@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import type { Context } from "@oh-my-pi/pi-ai";
 import type { CompactionEntry, ExtensionAPI, ExtensionContext, SessionEntry } from "@oh-my-pi/pi-coding-agent";
@@ -56,6 +57,43 @@ function conversation(count: number): Context["messages"] {
 		messages.push(assistant(`a${index}`, (index + 1) * 10 + 1));
 	}
 	return messages;
+}
+
+function summaryCheckpoint() {
+	const blobs = new Map<string, Uint8Array>();
+	const put = (bytes: Uint8Array): Uint8Array => {
+		const reference = createHash("sha256").update(bytes).digest();
+		blobs.set(reference.toString("hex"), bytes);
+		return reference;
+	};
+	const summarizedMessages: Uint8Array[] = [];
+	for (let index = 0; index < 5; index += 1) {
+		summarizedMessages.push(
+			put(new TextEncoder().encode(JSON.stringify({ role: "user", content: [{ type: "text", text: `u${index}` }] }))),
+			put(new TextEncoder().encode(JSON.stringify({ role: "assistant", content: [{ type: "text", text: `a${index}` }] }))),
+		);
+	}
+	const summaryMessage = put(new TextEncoder().encode(JSON.stringify({
+		role: "user",
+		content: [{ type: "text", text: "summary:S1" }],
+	})));
+	const archiveBytes = ConversationSummaryArchiveSchema.encode(ConversationSummaryArchiveSchema.create({
+		summarizedMessages,
+		summary: "S1",
+		windowTail: 3,
+		summaryMessage,
+	}));
+	const archiveReference = put(archiveBytes);
+	const afterBytes = ConversationStateStructureSchema.encode(ConversationStateStructureSchema.create({
+		turns: [6, 7, 8].map((id) => Uint8Array.of(id)),
+		turnsOld: [],
+		summaryArchives: [archiveReference],
+		summaryArchive: new Uint8Array(),
+		selfSummaryCount: 1,
+		summary: new TextEncoder().encode("private summary"),
+		tokenDetails: { usedTokens: 40, maxTokens: 100 },
+	}));
+	return { afterBytes, blobs };
 }
 
 function messageEntry(id: string, message: Context["messages"][number], parentId: string | null = null): SessionEntry {
@@ -571,25 +609,13 @@ describe("native summary materialization", () => {
 			grantedTools: [],
 		}));
 		commitTurn(turn.slot, context, false);
-		const archiveBytes = ConversationSummaryArchiveSchema.encode(ConversationSummaryArchiveSchema.create({
-			summarizedMessages: [1, 2, 3, 4, 5].map((id) => Uint8Array.of(id)),
-			summary: "S1",
-			windowTail: 3,
-			summaryMessage: new TextEncoder().encode("s1"),
-		}));
-		const afterBytes = ConversationStateStructureSchema.encode(ConversationStateStructureSchema.create({
-			turns: [6, 7, 8].map((id) => Uint8Array.of(id)),
-			turnsOld: [],
-			summaryArchives: [archiveBytes],
-			summaryArchive: new Uint8Array(),
-			selfSummaryCount: 1,
-			summary: new TextEncoder().encode("S1"),
-			tokenDetails: { usedTokens: 40, maxTokens: 100 },
-		}));
+		const checkpoint = summaryCheckpoint();
 		const store = {
 			checkpoints: {
-				async get() {
-					return afterBytes;
+				async get(input: { blobId: string }) {
+					return input.blobId === "after"
+						? checkpoint.afterBytes
+						: checkpoint.blobs.get(input.blobId) ?? null;
 				},
 			},
 		} as unknown as LocalAgentStore;
@@ -639,27 +665,15 @@ describe("native summary materialization", () => {
 			grantedTools: [],
 		}));
 		commitTurn(turn.slot, context, false);
-		const archiveBytes = ConversationSummaryArchiveSchema.encode(ConversationSummaryArchiveSchema.create({
-			summarizedMessages: [1, 2, 3, 4, 5].map((id) => Uint8Array.of(id)),
-			summary: "S1",
-			windowTail: 3,
-			summaryMessage: new TextEncoder().encode("s1"),
-		}));
-		const afterBytes = ConversationStateStructureSchema.encode(ConversationStateStructureSchema.create({
-			turns: [6, 7, 8].map((id) => Uint8Array.of(id)),
-			turnsOld: [],
-			summaryArchives: [archiveBytes],
-			summaryArchive: new Uint8Array(),
-			selfSummaryCount: 1,
-			summary: new TextEncoder().encode("S1"),
-			tokenDetails: { usedTokens: 40, maxTokens: 100 },
-		}));
+		const checkpoint = summaryCheckpoint();
 		let release!: (value: Uint8Array | null) => void;
 		const gate = new Promise<Uint8Array | null>((resolve) => { release = resolve; });
 		const store = {
 			checkpoints: {
-				async get() {
-					return gate;
+				async get(input: { blobId: string }) {
+					return input.blobId === "after"
+						? gate
+						: checkpoint.blobs.get(input.blobId) ?? null;
 				},
 			},
 		} as unknown as LocalAgentStore;
@@ -687,10 +701,67 @@ describe("native summary materialization", () => {
 		}));
 		clearCoordinator(owner.sessionId);
 		owner.generation += 1;
-		release(afterBytes);
+		release(checkpoint.afterBytes);
 		await expect(staging).resolves.toBeUndefined();
 		expect(compactionTestUtils.getPending(owner.sessionId!)).toBeUndefined();
 	});
+
+	test("failed decode after navigation does not stale a newly staged pending", async () => {
+		const { ctx } = hooks();
+		const owner = ownerForContext(ctx);
+		runtimeTestUtils.setOpenAgent(async () => ({
+			agentId: "agent-x",
+			close() {},
+			async [Symbol.asyncDispose]() {},
+		} as SDKAgent));
+		const messages = conversation(8);
+		const context = { messages } as Context;
+		const turn = await withCursorSessionOwner(owner, () => prepareTurn({
+			cwd: ctx.cwd,
+			agentInstanceId: "main",
+			apiKey: "test-key",
+			modelSelection: { id: "composer-2.5" },
+			modelLimits: { contextWindow: 200_000, maxTokens: 20_000 },
+			context,
+			grantedTools: [],
+		}));
+		commitTurn(turn.slot, context, false);
+		let release!: (value: Uint8Array | null) => void;
+		const gate = new Promise<Uint8Array | null>((resolve) => { release = resolve; });
+		const store = {
+			checkpoints: {
+				async get() { return gate; },
+			},
+		} as unknown as LocalAgentStore;
+		const staging = withCursorSessionOwner(owner, () => stageCursorCompaction({
+			observation: {
+				summaryGeneration: 1,
+				beforeRoot: null,
+				afterRoot: "after",
+				after: {
+					rootBlobId: "after",
+					turns: 3,
+					turnsOld: 0,
+					summaryArchive: 0,
+					summaryArchives: 1,
+					selfSummaryCount: 1,
+					summaryBytes: 2,
+					summaryArchiveBytes: 1,
+				},
+			},
+			context,
+			contextFingerprint: turn.slot.sendState.contextFingerprint,
+			store,
+			slot: turn.slot,
+			agentId: "agent-x",
+		}));
+		owner.generation += 1;
+		compactionTestUtils.stagePending(pending());
+		release(null);
+		await expect(staging).resolves.toBeUndefined();
+		expect(compactionTestUtils.getPending(owner.sessionId!)?.state).toBe("pending");
+	});
+
 	test("stageCursorCompaction drops publish after cancel mid-await", async () => {
 		const { ctx } = hooks();
 		const owner = ownerForContext(ctx);
@@ -711,27 +782,15 @@ describe("native summary materialization", () => {
 			grantedTools: [],
 		}));
 		commitTurn(turn.slot, context, false);
-		const archiveBytes = ConversationSummaryArchiveSchema.encode(ConversationSummaryArchiveSchema.create({
-			summarizedMessages: [1, 2, 3, 4, 5].map((id) => Uint8Array.of(id)),
-			summary: "S1",
-			windowTail: 3,
-			summaryMessage: new TextEncoder().encode("s1"),
-		}));
-		const afterBytes = ConversationStateStructureSchema.encode(ConversationStateStructureSchema.create({
-			turns: [6, 7, 8].map((id) => Uint8Array.of(id)),
-			turnsOld: [],
-			summaryArchives: [archiveBytes],
-			summaryArchive: new Uint8Array(),
-			selfSummaryCount: 1,
-			summary: new TextEncoder().encode("S1"),
-			tokenDetails: { usedTokens: 40, maxTokens: 100 },
-		}));
+		const checkpoint = summaryCheckpoint();
 		let release!: (value: Uint8Array | null) => void;
 		const gate = new Promise<Uint8Array | null>((resolve) => { release = resolve; });
 		const store = {
 			checkpoints: {
-				async get() {
-					return gate;
+				async get(input: { blobId: string }) {
+					return input.blobId === "after"
+						? gate
+						: checkpoint.blobs.get(input.blobId) ?? null;
 				},
 			},
 		} as unknown as LocalAgentStore;
@@ -761,7 +820,7 @@ describe("native summary materialization", () => {
 		}));
 		request.abort();
 		await finishTurnFailed(turn.slot, "aborted");
-		release(afterBytes);
+		release(checkpoint.afterBytes);
 		await expect(staging).resolves.toBeUndefined();
 		expect(compactionTestUtils.getPending(owner.sessionId!)).toBeUndefined();
 	});

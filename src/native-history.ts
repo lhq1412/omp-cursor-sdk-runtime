@@ -104,8 +104,15 @@ export const ConversationSummaryArchiveSchema = pb<ConversationSummaryArchive>("
 	{ no: 4, name: "summaryMessage", kind: "bytes" },
 ]);
 
+interface DecodedModelMessage {
+	role: string;
+	anchors: string[];
+	supported: boolean;
+}
+
 export interface DecodedCursorSummaryArchive {
 	summarizedMessages: Uint8Array[];
+	summarizedModelMessages: DecodedModelMessage[];
 	summary: string;
 	windowTail: number;
 	summaryMessage: Uint8Array;
@@ -143,7 +150,7 @@ function bytesEqual(left: Uint8Array, right: Uint8Array): boolean {
 	return true;
 }
 
-export function decodeConversationSummaryArchive(bytes: Uint8Array): DecodedCursorSummaryArchive | undefined {
+export function decodeConversationSummaryArchive(bytes: Uint8Array): Omit<DecodedCursorSummaryArchive, "summarizedModelMessages"> | undefined {
 	if (!bytes.byteLength) return;
 	try {
 		const decoded = ConversationSummaryArchiveSchema.decode(bytes);
@@ -167,14 +174,121 @@ function rawArchivesFromState(state: { summaryArchive?: Uint8Array; summaryArchi
 	];
 }
 
-export function decodeCheckpointSummaryState(bytes: Uint8Array): NativeCheckpointArchives | undefined {
+function blobId(reference: Uint8Array): string | undefined {
+	return reference.byteLength === 32 ? Buffer.from(reference).toString("hex") : undefined;
+}
+
+function anchor(kind: string, value: string): string {
+	return createHash("sha256").update(kind).update("\0").update(value).digest("hex");
+}
+
+function textParts(content: unknown): string[] {
+	if (typeof content === "string") return content.trim() ? [content.trim()] : [];
+	if (!Array.isArray(content)) return [];
+	return content.flatMap((part) => {
+		if (!part || typeof part !== "object") return [];
+		const record = part as Record<string, unknown>;
+		return record.type === "text" && typeof record.text === "string" && record.text.trim()
+			? [record.text.trim()]
+			: [];
+	});
+}
+
+function decodeModelMessage(bytes: Uint8Array): DecodedModelMessage | undefined {
+	try {
+		const message = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes)) as Record<string, unknown>;
+		if (!message || typeof message !== "object" || Array.isArray(message) || typeof message.role !== "string") return;
+		const anchors: string[] = [];
+		let supported = message.role === "system";
+		if (message.role === "user") {
+			const content = message.content;
+			supported = typeof content === "string" || (Array.isArray(content) && content.every((part) =>
+				part && typeof part === "object" && (part as Record<string, unknown>).type === "text" &&
+				typeof (part as Record<string, unknown>).text === "string"));
+			const texts = textParts(content);
+			if (supported && texts.length) anchors.push(anchor("user", texts.join("\n")));
+		} else if (message.role === "assistant" && Array.isArray(message.content)) {
+			supported = true;
+			for (const part of message.content) {
+				if (!part || typeof part !== "object") {
+					supported = false;
+					continue;
+				}
+				const record = part as Record<string, unknown>;
+				if (record.type === "text" && typeof record.text === "string" && record.text.trim()) {
+					anchors.push(anchor("assistant", record.text.trim()));
+				} else if (record.type === "reasoning" && typeof record.text === "string" && record.text.trim()) {
+					anchors.push(anchor("reasoning", record.text.trim()));
+				} else if (record.type === "tool-call" && typeof record.toolCallId === "string" &&
+					typeof record.toolName === "string") {
+					anchors.push(anchor("tool-call", JSON.stringify([
+						record.toolCallId,
+						record.toolName,
+						record.input ?? record.args ?? {},
+					])));
+				} else {
+					supported = false;
+				}
+			}
+		} else if (message.role === "tool" && Array.isArray(message.content)) {
+			supported = true;
+			for (const part of message.content) {
+				if (!part || typeof part !== "object") {
+					supported = false;
+					continue;
+				}
+				const record = part as Record<string, unknown>;
+				const toolCallId = typeof record.toolCallId === "string"
+					? record.toolCallId
+					: typeof message.id === "string" ? message.id : undefined;
+				if (record.type !== "tool-result" || !toolCallId || typeof record.toolName !== "string") {
+					supported = false;
+					continue;
+				}
+				anchors.push(anchor("tool-result", JSON.stringify([
+					toolCallId,
+					record.toolName,
+					record.result,
+					record.isError === true,
+				])));
+			}
+		}
+		return { role: message.role, anchors, supported };
+	} catch {
+		return;
+	}
+}
+
+async function readReferencedBlob(store: LocalAgentStore, agentId: string, reference: Uint8Array): Promise<Uint8Array | undefined> {
+	const id = blobId(reference);
+	if (!id) return;
+	const bytes = await store.checkpoints.get({ agentId, blobId: id });
+	if (!bytes || createHash("sha256").update(bytes).digest("hex") !== id) return;
+	return bytes;
+}
+
+export async function decodeCheckpointSummaryState(
+	store: LocalAgentStore,
+	agentId: string,
+	bytes: Uint8Array,
+): Promise<NativeCheckpointArchives | undefined> {
 	try {
 		const state = ConversationStateStructureSchema.decode(bytes);
 		const archives: DecodedCursorSummaryArchive[] = [];
-		for (const part of rawArchivesFromState(state)) {
-			const decoded = decodeConversationSummaryArchive(part);
+		for (const reference of rawArchivesFromState(state)) {
+			const archiveBytes = await readReferencedBlob(store, agentId, reference);
+			const decoded = archiveBytes ? decodeConversationSummaryArchive(archiveBytes) : undefined;
 			if (!decoded) return;
-			archives.push(decoded);
+			const summarizedModelMessages: DecodedModelMessage[] = [];
+			for (const messageReference of decoded.summarizedMessages) {
+				const messageBytes = await readReferencedBlob(store, agentId, messageReference);
+				const message = messageBytes ? decodeModelMessage(messageBytes) : undefined;
+				if (!message) return;
+				summarizedModelMessages.push(message);
+			}
+			const summaryMessageBytes = await readReferencedBlob(store, agentId, decoded.summaryMessage);
+			if (!summaryMessageBytes || decodeModelMessage(summaryMessageBytes)?.role !== "user") return;
+			archives.push({ ...decoded, summarizedModelMessages });
 		}
 		return {
 			turns: state.turns.length,
@@ -195,98 +309,157 @@ function previousSummaryIndex(archives: DecodedCursorSummaryArchive[], message: 
 	return -1;
 }
 
-function expandedHistoryTurns(archives: DecodedCursorSummaryArchive[], index: number, seen: Set<number>): number {
-	if (seen.has(index)) return 0;
+function archiveInteractions(
+	archives: DecodedCursorSummaryArchive[],
+	index: number,
+	expandPrevious: boolean,
+	seen = new Set<number>(),
+): { interactions: string[][]; previous: number[] } | undefined {
+	if (seen.has(index)) return;
 	seen.add(index);
 	const archive = archives[index];
-	if (!archive) return 0;
-	let count = 0;
-	for (const message of archive.summarizedMessages) {
-		const previous = previousSummaryIndex(archives, message, index);
-		count += previous >= 0 ? expandedHistoryTurns(archives, previous, seen) : 1;
+	if (!archive) return;
+	const interactions: string[][] = [];
+	const previous: number[] = [];
+	let current: string[] | undefined;
+	let currentSupported = false;
+	const finishCurrent = () => {
+		if (!current) return;
+		interactions.push(currentSupported && current.length > 1 ? current : []);
+		current = undefined;
+		currentSupported = false;
+	};
+	for (let messageIndex = 0; messageIndex < archive.summarizedMessages.length; messageIndex += 1) {
+		const prior = previousSummaryIndex(archives, archive.summarizedMessages[messageIndex]!, index);
+		if (prior >= 0) {
+			finishCurrent();
+			previous.push(prior);
+			if (expandPrevious) {
+				const expanded = archiveInteractions(archives, prior, true, seen);
+				if (!expanded) return;
+				interactions.push(...expanded.interactions);
+			}
+			continue;
+		}
+		const message = archive.summarizedModelMessages[messageIndex]!;
+		if (message.role === "user") {
+			finishCurrent();
+			current = [...message.anchors];
+			currentSupported = message.supported && message.anchors.length === 1;
+		} else if (current) {
+			current.push(...message.anchors);
+			currentSupported = currentSupported && message.supported;
+		}
 	}
-	return count;
+	finishCurrent();
+	return { interactions, previous };
+}
+
+function sourceUnitAnchors(unit: SourceHistoryUnit, messages: Context["messages"]): string[] {
+	const anchors: string[] = [];
+	const pendingTools = new Set<string>();
+	let sawUser = false;
+	for (let index = unit.startMessageIndex; index <= unit.endMessageIndex; index += 1) {
+		const message = messages[index];
+		if (!message) return [];
+		if (message.role === "user" || message.role === "developer") {
+			if (sawUser || (Array.isArray(message.content) && message.content.some((part) => part.type !== "text"))) return [];
+			const texts = textParts(message.content);
+			if (!texts.length) return [];
+			sawUser = true;
+			anchors.push(anchor("user", texts.join("\n")));
+			continue;
+		}
+		if (message.role === "toolResult") {
+			const id = nativeToolCallId(message.toolCallId);
+			if (!pendingTools.delete(id) || !Array.isArray(message.content) ||
+				message.content.some((part) => part.type !== "text")) return [];
+			anchors.push(anchor("tool-result", JSON.stringify([
+				id,
+				message.toolName,
+				textParts(message.content).join("\n"),
+				message.isError === true,
+			])));
+			continue;
+		}
+		if (message.role !== "assistant") return [];
+		for (const part of message.content) {
+			if (part.type === "toolCall") {
+				const id = nativeToolCallId(part.id);
+				if (pendingTools.has(id)) return [];
+				pendingTools.add(id);
+				anchors.push(anchor("tool-call", JSON.stringify([id, part.name, part.arguments ?? {}])));
+			} else if (part.type === "text" && part.text.trim()) {
+				anchors.push(anchor("assistant", part.text.trim()));
+			} else if (part.type === "thinking" && part.thinking.trim()) {
+				anchors.push(anchor("reasoning", part.thinking.trim()));
+			} else {
+				return [];
+			}
+		}
+	}
+	return sawUser && !pendingTools.size && anchors.length > 1 ? anchors : [];
+}
+
+function anchorsEqual(left: string[], right: string[]): boolean {
+	if (left.length !== right.length) return false;
+	for (let index = 0; index < left.length; index += 1) {
+		if (left[index] !== right[index]) return false;
+	}
+	return true;
 }
 
 /**
- * Frozen alignment against current OMP source turns:
- *   expandedSummarizedTurnCount + windowTail === source turn units
- *   after.turns === windowTail
- * Previous-summary identity is byte-equal summary_message in a later archive.
- * If OMP already materialized that previous summary, treat it as the baseline
- * (consume the compaction-summary unit, do not expand into deleted turns).
- * Otherwise expand through the archive tree into still-present history turns.
- * Any conversation that fails the equality is inapplicable (stale), including
- * continueOnly extra native turns and merged developer sequences.
+ * Align the native model-message archive to complete OMP source interactions.
+ * Blob counts are deliberately irrelevant: a native turn expands to many
+ * model messages, and summaries may be generated during a parked interaction.
  */
 export function resolveEffectiveSummaryCoverage(
-	before: NativeCheckpointArchives | undefined,
 	after: NativeCheckpointArchives,
 	sourceUnits: SourceHistoryUnit[],
+	messages: Context["messages"],
 ): CursorSummaryCoverage | undefined {
 	if (!after.archives.length) return;
 	const archives = after.archives;
 	const latestIndex = archives.length - 1;
 	const latest = archives[latestIndex]!;
 	if (!latest.summary) return;
-	const units: CursorCoverageUnit[] = [];
-	let sourceCursor = 0;
-	let turnCursor = 0;
-	let includesPreviousSummary = false;
-	for (const message of latest.summarizedMessages) {
-		const previous = previousSummaryIndex(archives, message, latestIndex);
-		if (previous >= 0) {
-			includesPreviousSummary = true;
-			units.push({
-				kind: "previous-summary",
-				summaryGeneration: previous + 1,
-				summaryMessageHash: archives[previous]!.summaryMessageHash,
-			});
-			if (sourceUnits[sourceCursor]?.kind === "compaction-summary") {
-				sourceCursor += 1;
-				continue;
-			}
-			let remaining = expandedHistoryTurns(archives, previous, new Set());
-			while (remaining > 0) {
-				const source = sourceUnits[sourceCursor];
-				if (!source) return;
-				sourceCursor += 1;
-				if (source.kind !== "turn") continue;
-				turnCursor += 1;
-				remaining -= 1;
-			}
-			continue;
-		}
-		while (sourceUnits[sourceCursor]?.kind === "compaction-summary") sourceCursor += 1;
-		const source = sourceUnits[sourceCursor];
-		if (!source || source.kind !== "turn") return;
-		units.push({ kind: "history-turn", sourceUnitOrdinal: source.ordinal });
-		sourceCursor += 1;
-		turnCursor += 1;
+	const hasMaterializedSummary = sourceUnits[0]?.kind === "compaction-summary";
+	const expanded = archiveInteractions(archives, latestIndex, !hasMaterializedSummary);
+	if (!expanded) return;
+	const units: CursorCoverageUnit[] = expanded.previous.map((previous) => ({
+		kind: "previous-summary",
+		summaryGeneration: previous + 1,
+		summaryMessageHash: archives[previous]!.summaryMessageHash,
+	}));
+	const turnUnits = sourceUnits.filter((unit) => unit.kind === "turn");
+	const requiredByUnit = new Map<SourceHistoryUnit, string[]>();
+	const signatureCounts = new Map<string, number>();
+	for (const source of turnUnits) {
+		const required = sourceUnitAnchors(source, messages);
+		requiredByUnit.set(source, required);
+		const signature = required.join("\0");
+		if (signature) signatureCounts.set(signature, (signatureCounts.get(signature) ?? 0) + 1);
 	}
-	const summarizedTurnCount = units.filter((unit) => unit.kind === "history-turn").length;
+	let matchedTurns = 0;
+	while (matchedTurns < turnUnits.length && matchedTurns < expanded.interactions.length) {
+		const source = turnUnits[matchedTurns]!;
+		const required = requiredByUnit.get(source) ?? [];
+		if (!required.length || signatureCounts.get(required.join("\0")) !== 1) break;
+		if (!anchorsEqual(required, expanded.interactions[matchedTurns]!)) break;
+		units.push({ kind: "history-turn", sourceUnitOrdinal: source.ordinal });
+		matchedTurns += 1;
+	}
+	if (!matchedTurns || matchedTurns >= turnUnits.length) return;
 	return {
 		summary: latest.summary,
-		summarizedTurnCount,
+		summarizedTurnCount: matchedTurns,
 		windowTail: latest.windowTail,
 		units,
-		includesPreviousSummary,
+		includesPreviousSummary: expanded.previous.length > 0,
 		archiveHash: latest.archiveHash,
-		expandedSummarizedTurnCount: turnCursor,
+		expandedSummarizedTurnCount: matchedTurns,
 	};
-}
-
-export function validateNativeTurnAlignment(
-	coverage: CursorSummaryCoverage,
-	sourceUnits: SourceHistoryUnit[],
-	afterTurns: number,
-	beforeTurns?: number,
-): boolean {
-	const turnUnits = sourceUnits.filter((unit) => unit.kind === "turn");
-	if (coverage.windowTail !== afterTurns) return false;
-	if (coverage.expandedSummarizedTurnCount + coverage.windowTail !== turnUnits.length) return false;
-	if (!coverage.includesPreviousSummary && beforeTurns !== undefined && beforeTurns !== turnUnits.length) return false;
-	return true;
 }
 
 
@@ -364,6 +537,33 @@ export async function readCheckpointProbe(store: LocalAgentStore, agentId: strin
 		return bytes ? summaryProbeFrom(blobId, bytes) : undefined;
 	} catch {
 		return undefined;
+	}
+}
+
+/** Reconcile a completed summary from stable checkpoints when SDK delta events were absent. */
+export async function reconcileSummaryBoundary(
+	store: LocalAgentStore,
+	agentId: string,
+	previousRoot: string | null,
+): Promise<SummaryBoundaryObservation | undefined> {
+	try {
+		const checkpoint = await readNativeCheckpoint(store, agentId);
+		if (!checkpoint.stable || checkpoint.status !== "idle" || checkpoint.activeRunId ||
+			!checkpoint.rootBlobId || checkpoint.rootBlobId === previousRoot || !checkpoint.probe) return;
+		const before = previousRoot ? await readCheckpointProbe(store, agentId, previousRoot) : undefined;
+		const beforeArchiveCount = before ? before.summaryArchive + before.summaryArchives : 0;
+		const afterArchiveCount = checkpoint.probe.summaryArchive + checkpoint.probe.summaryArchives;
+		if (checkpoint.probe.selfSummaryCount <= (before?.selfSummaryCount ?? 0) ||
+			afterArchiveCount <= beforeArchiveCount) return;
+		return {
+			summaryGeneration: checkpoint.probe.selfSummaryCount,
+			beforeRoot: previousRoot,
+			afterRoot: checkpoint.rootBlobId,
+			...(before ? { before } : {}),
+			after: checkpoint.probe,
+		};
+	} catch {
+		return;
 	}
 }
 

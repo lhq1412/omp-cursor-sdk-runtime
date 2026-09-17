@@ -5,6 +5,7 @@ import {
 	createSummaryBoundaryProbe,
 	readNativeCheckpoint,
 	readSettledCheckpointOccupancy,
+	reconcileSummaryBoundary,
 } from "../../src/native-history.ts";
 import { observeLocalAgentStore, type StoreObservation } from "../../src/store.ts";
 
@@ -21,7 +22,7 @@ function blob(partial: {
 	return ConversationStateStructureSchema.encode(ConversationStateStructureSchema.create({
 		turns: Array.from({ length: partial.turns ?? 0 }, (_, i) => Uint8Array.of(i + 1)),
 		turnsOld: Array.from({ length: partial.turnsOld ?? 0 }, (_, i) => Uint8Array.of(50 + i)),
-		summaryArchives: Array.from({ length: partial.summaryArchives ?? 0 }, (_, i) => Uint8Array.of(90 + i, 91)),
+		summaryArchives: Array.from({ length: partial.summaryArchives ?? 0 }, (_, i) => new Uint8Array(32).fill(90 + i)),
 		summaryArchive: partial.summaryArchive ?? new Uint8Array(),
 		selfSummaryCount: partial.selfSummaryCount ?? 0,
 		summary: partial.summary ?? new Uint8Array(),
@@ -85,7 +86,7 @@ function fake(root: string | null, blobs: Record<string, Uint8Array>) {
 
 test("checkpoint probe reports turn and archive counts without archive bytes", async () => {
 	const summary = new TextEncoder().encode("user-summary-text");
-	const archive = new Uint8Array([9, 9, 9, 9]);
+	const archive = new Uint8Array(32).fill(9);
 	const bytes = blob({
 		turns: 15, turnsOld: 2, summaryArchives: 1, summaryArchive: archive,
 		selfSummaryCount: 1, summary, usedTokens: 150, maxTokens: 100,
@@ -101,7 +102,7 @@ test("checkpoint probe reports turn and archive counts without archive bytes", a
 		summaryArchives: 1,
 		selfSummaryCount: 1,
 		summaryBytes: summary.byteLength,
-		summaryArchiveBytes: archive.byteLength + 2,
+		summaryArchiveBytes: 64,
 		usedTokens: 150,
 		maxTokens: 100,
 	});
@@ -114,6 +115,20 @@ test("settled occupancy is unchanged when the blob also has summary counts", asy
 	const { store } = fake("fresh", { fresh: blob({ turns: 45, selfSummaryCount: 0, usedTokens: 150, maxTokens: 100 }) });
 	expect(await readSettledCheckpointOccupancy(store, "owned", "baseline")).toMatchObject({
 		usedTokens: 150, maxTokens: 100, rootBlobId: "fresh",
+	});
+});
+
+test("settle reconciliation discovers a new summary generation without delta events", async () => {
+	const inner = fake("after", {
+		before: blob({ turns: 12, selfSummaryCount: 0 }),
+		after: blob({ turns: 13, summaryArchives: 1, selfSummaryCount: 1 }),
+	});
+	expect(await reconcileSummaryBoundary(inner.store, "owned", "before")).toMatchObject({
+		summaryGeneration: 1,
+		beforeRoot: "before",
+		afterRoot: "after",
+		before: { turns: 12, selfSummaryCount: 0 },
+		after: { turns: 13, selfSummaryCount: 1 },
 	});
 });
 

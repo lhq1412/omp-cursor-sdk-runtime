@@ -35,7 +35,7 @@ import {
 	reconcileRunResult,
 	type CursorAssistantMessage,
 } from "./projector.js";
-import { readSettledCheckpointOccupancy } from "./native-history.js";
+import { readSettledCheckpointOccupancy, reconcileSummaryBoundary } from "./native-history.js";
 import { stageCursorCompaction } from "./native-summary-compaction.js";
 import { openJsonlStore } from "./sdk-session.js";
 import { nativeReadHooked, runWithNativeTools } from "./sdk-native-hook.js";
@@ -386,7 +386,17 @@ export class ProviderTurnRunner {
 			});
 		}
 		this.assertCurrent();
-		const observation = !live.cancelled ? await live.summaryProbe?.flush() : undefined;
+		let observation = !live.cancelled ? await live.summaryProbe?.flush() : undefined;
+		if (!observation && !live.cancelled && settledAgent && live.checkpointBaseline) {
+			const store = live.checkpointStore ?? preparedSlot.store;
+			if (store) {
+				observation = await reconcileSummaryBoundary(
+					store,
+					settledAgent.agentId,
+					live.checkpointBaseline.rootBlobId,
+				);
+			}
+		}
 		if (!live.cancelled && settledAgent && getLiveRun(preparedSlot.key) === live &&
 			preparedSlot.agent === settledAgent && live.agent === settledAgent) {
 			if (occupancy) {
@@ -412,7 +422,7 @@ export class ProviderTurnRunner {
 						slot: preparedSlot,
 						agentId: settledAgent.agentId,
 						...(this.abortSignal ? { signal: this.abortSignal } : {}),
-					});
+					}).catch(() => undefined);
 				}
 				this.assertCurrent();
 			}

@@ -1,48 +1,20 @@
+import { createHash } from "node:crypto";
 import { describe, expect, test } from "bun:test";
-import { ConversationStateStructureSchema } from "@oh-my-pi/pi-catalog/discovery/cursor-proto";
+import type { LocalAgentStore } from "@cursor/sdk";
 import type { Context } from "@oh-my-pi/pi-ai";
+import { ConversationStateStructureSchema } from "@oh-my-pi/pi-catalog/discovery/cursor-proto";
 import { projectSourceHistoryUnits } from "../../src/context.ts";
+import { nativeToolCallId } from "../../src/tool-call-id.ts";
 import {
 	ConversationSummaryArchiveSchema,
 	decodeCheckpointSummaryState,
 	decodeConversationSummaryArchive,
 	resolveEffectiveSummaryCoverage,
-	validateNativeTurnAlignment,
 } from "../../src/native-history.ts";
 
-function turnBytes(id: number): Uint8Array {
-	return Uint8Array.of(id);
-}
-
-function archive(input: {
-	summarized: Uint8Array[];
-	summary: string;
-	windowTail: number;
-	summaryMessage: Uint8Array;
-}): Uint8Array {
-	return ConversationSummaryArchiveSchema.encode(ConversationSummaryArchiveSchema.create({
-		summarizedMessages: input.summarized,
-		summary: input.summary,
-		windowTail: input.windowTail,
-		summaryMessage: input.summaryMessage,
-	}));
-}
-
-function state(turns: number, archives: Uint8Array[], extra: { usedTokens?: number; summary?: Uint8Array } = {}): Uint8Array {
-	return ConversationStateStructureSchema.encode(ConversationStateStructureSchema.create({
-		turns: Array.from({ length: turns }, (_, index) => turnBytes(index + 1)),
-		turnsOld: [],
-		summaryArchives: archives,
-		summaryArchive: new Uint8Array(),
-		selfSummaryCount: archives.length,
-		summary: extra.summary ?? (archives.length ? new TextEncoder().encode("state-summary") : new Uint8Array()),
-		...(extra.usedTokens !== undefined ? { tokenDetails: { usedTokens: extra.usedTokens, maxTokens: 100 } } : {}),
-	}));
-}
-
-function conversation(count: number): Context["messages"] {
+function conversation(count: number, start = 0): Context["messages"] {
 	const messages: Context["messages"] = [];
-	for (let index = 0; index < count; index += 1) {
+	for (let index = start; index < start + count; index += 1) {
 		messages.push({ role: "user", content: `u${index}`, timestamp: (index + 1) * 10 } as Context["messages"][number]);
 		messages.push({
 			role: "assistant",
@@ -58,136 +30,190 @@ function conversation(count: number): Context["messages"] {
 	return messages;
 }
 
-describe("ConversationSummaryArchive", () => {
-	test("round-trips summarized_messages, summary, window_tail, and summary_message", () => {
-		const summaryMessage = new TextEncoder().encode("summary-envelope");
-		const encoded = archive({
-			summarized: [turnBytes(1), turnBytes(2)],
-			summary: "S(A..B)",
-			windowTail: 3,
+function fixture() {
+	const blobs = new Map<string, Uint8Array>();
+	const put = (bytes: Uint8Array): Uint8Array => {
+		const id = createHash("sha256").update(bytes).digest();
+		blobs.set(id.toString("hex"), bytes);
+		return id;
+	};
+	const modelMessage = (message: unknown) => put(new TextEncoder().encode(JSON.stringify(message)));
+	const archive = (input: { messages: unknown[]; summary: string; windowTail: number; summaryMessage?: Uint8Array }) => {
+		const summaryMessage = input.summaryMessage ?? modelMessage({ role: "user", content: [{ type: "text", text: `summary:${input.summary}` }] });
+		const bytes = ConversationSummaryArchiveSchema.encode(ConversationSummaryArchiveSchema.create({
+			summarizedMessages: input.messages.map(modelMessage),
+			summary: input.summary,
+			windowTail: input.windowTail,
 			summaryMessage,
-		});
-		const decoded = decodeConversationSummaryArchive(encoded);
-		expect(decoded).toMatchObject({ summary: "S(A..B)", windowTail: 3 });
-		expect(decoded?.summarizedMessages).toHaveLength(2);
-		expect(decoded?.summaryMessage).toEqual(summaryMessage);
-		expect(decoded?.archiveHash).toHaveLength(16);
-		expect(decoded?.summaryMessageHash).toHaveLength(16);
-	});
+		}));
+		return { reference: put(bytes), summaryMessage, bytes };
+	};
+	const state = (turns: number, archives: Uint8Array[]) => ConversationStateStructureSchema.encode(ConversationStateStructureSchema.create({
+		turns: Array.from({ length: turns }, (_, index) => Uint8Array.of(index + 1)),
+		turnsOld: [],
+		summaryArchives: archives,
+		summaryArchive: new Uint8Array(),
+		selfSummaryCount: archives.length,
+		summary: archives.length ? new TextEncoder().encode("private-state-summary") : new Uint8Array(),
+	}));
+	const store = {
+		checkpoints: {
+			async get(input: { blobId: string }) { return blobs.get(input.blobId) ?? null; },
+		},
+	} as unknown as LocalAgentStore;
+	return { blobs, put, modelMessage, archive, state, store };
+}
 
-	test("maps a single summary by turn count: expanded + windowTail === source turns", () => {
-		const summaryMessage = new TextEncoder().encode("s1");
-		const after = decodeCheckpointSummaryState(state(3, [archive({
-			summarized: [turnBytes(1), turnBytes(2), turnBytes(3), turnBytes(4), turnBytes(5)],
+function archivedTurns(start: number, count: number): unknown[] {
+	return Array.from({ length: count }, (_, offset) => {
+		const index = start + offset;
+		return [
+			{ role: "user", content: [{ type: "text", text: `u${index}` }] },
+			{ role: "assistant", content: [{ type: "text", text: `a${index}` }] },
+		];
+	}).flat();
+}
+
+describe("ConversationSummaryArchive", () => {
+	test("loads content-addressed archive and message blobs before aligning complete interactions", async () => {
+		const item = fixture();
+		const archive = item.archive({
+			messages: [{ role: "system", content: "native policy" }, ...archivedTurns(0, 5)],
 			summary: "S1",
-			windowTail: 3,
-			summaryMessage,
-		})], { usedTokens: 40, summary: new TextEncoder().encode("S1") }));
-		const before = decodeCheckpointSummaryState(state(8, [], { usedTokens: 80 }));
-		const sourceUnits = projectSourceHistoryUnits(conversation(8));
-		const coverage = resolveEffectiveSummaryCoverage(before, after!, sourceUnits);
+			windowTail: 2,
+		});
+		const decodedArchive = decodeConversationSummaryArchive(archive.bytes);
+		expect(decodedArchive).toMatchObject({ summary: "S1", windowTail: 2 });
+		expect(decodedArchive?.summaryMessage).toEqual(archive.summaryMessage);
+
+		const after = await decodeCheckpointSummaryState(item.store, "agent-x", item.state(8, [archive.reference]));
+		const messages = conversation(8);
+		const coverage = resolveEffectiveSummaryCoverage(after!, projectSourceHistoryUnits(messages), messages);
 		expect(coverage).toMatchObject({
 			summary: "S1",
 			summarizedTurnCount: 5,
-			windowTail: 3,
-			includesPreviousSummary: false,
 			expandedSummarizedTurnCount: 5,
+			windowTail: 2,
+			includesPreviousSummary: false,
 		});
-		expect(coverage?.units.filter((unit) => unit.kind === "history-turn").map((unit) => unit.sourceUnitOrdinal)).toEqual([0, 1, 2, 3, 4]);
-		expect(validateNativeTurnAlignment(coverage!, sourceUnits, after!.turns, before!.turns)).toBe(true);
+		expect(coverage?.units.map((unit) => unit.kind)).toEqual(Array(5).fill("history-turn"));
 	});
 
-	test("aligns a second archive against already-materialized OMP context", () => {
-		const s1Message = new TextEncoder().encode("s1-envelope");
-		const archive1 = archive({
-			summarized: [turnBytes(1), turnBytes(2), turnBytes(3), turnBytes(4), turnBytes(5)],
-			summary: "S1",
-			windowTail: 3,
-			summaryMessage: s1Message,
-		});
-		const archive2 = archive({
-			summarized: [s1Message, turnBytes(6), turnBytes(7)],
+	test("expands a previous summary reference or consumes an existing OMP compaction summary", async () => {
+		const item = fixture();
+		const first = item.archive({ messages: archivedTurns(0, 5), summary: "S1", windowTail: 3 });
+		const secondMessages = archivedTurns(5, 2);
+		const secondBytes = ConversationSummaryArchiveSchema.encode(ConversationSummaryArchiveSchema.create({
+			summarizedMessages: [first.summaryMessage, ...secondMessages.map(item.modelMessage)],
 			summary: "S2",
 			windowTail: 1,
-			summaryMessage: new TextEncoder().encode("s2-envelope"),
-		});
-		const after = decodeCheckpointSummaryState(state(1, [archive1, archive2]));
+			summaryMessage: item.modelMessage({ role: "user", content: [{ type: "text", text: "summary:S2" }] }),
+		}));
+		const second = item.put(secondBytes);
+		const after = await decodeCheckpointSummaryState(item.store, "agent-x", item.state(8, [first.reference, second]));
 		const original = conversation(8);
+		const expanded = resolveEffectiveSummaryCoverage(after!, projectSourceHistoryUnits(original), original);
+		expect(expanded).toMatchObject({ summarizedTurnCount: 7, includesPreviousSummary: true });
+
 		const compacted: Context["messages"] = [
 			{ role: "user", content: "S1", timestamp: 1000, historyRewriteAt: 1000 } as Context["messages"][number],
-			...original.slice(10),
+			...conversation(3, 5),
 		];
-		const sourceUnits = projectSourceHistoryUnits(compacted);
-		const coverage = resolveEffectiveSummaryCoverage(undefined, after!, sourceUnits);
-		expect(coverage).toMatchObject({
-			summary: "S2",
-			summarizedTurnCount: 2,
-			windowTail: 1,
-			includesPreviousSummary: true,
-			expandedSummarizedTurnCount: 2,
-		});
-		expect(coverage?.units[0]).toMatchObject({ kind: "previous-summary", summaryGeneration: 1 });
-		expect(coverage?.units.filter((unit) => unit.kind === "history-turn").map((unit) => unit.sourceUnitOrdinal)).toEqual([1, 2]);
-		expect(validateNativeTurnAlignment(coverage!, sourceUnits, after!.turns)).toBe(true);
+		const materialized = resolveEffectiveSummaryCoverage(after!, projectSourceHistoryUnits(compacted), compacted);
+		expect(materialized).toMatchObject({ summarizedTurnCount: 2, includesPreviousSummary: true });
+		expect(materialized?.units[0]).toMatchObject({ kind: "previous-summary", summaryGeneration: 1 });
 	});
 
-	test("expands a second archive into full history when previous summary was not materialized", () => {
-		const s1Message = new TextEncoder().encode("s1-envelope");
-		const archive1 = archive({
-			summarized: [turnBytes(1), turnBytes(2), turnBytes(3), turnBytes(4), turnBytes(5)],
-			summary: "S1",
-			windowTail: 3,
-			summaryMessage: s1Message,
-		});
-		const archive2 = archive({
-			summarized: [s1Message, turnBytes(6), turnBytes(7)],
-			summary: "S2",
-			windowTail: 1,
-			summaryMessage: new TextEncoder().encode("s2-envelope"),
-		});
-		const after = decodeCheckpointSummaryState(state(1, [archive1, archive2]));
-		const sourceUnits = projectSourceHistoryUnits(conversation(8));
-		const coverage = resolveEffectiveSummaryCoverage(undefined, after!, sourceUnits);
-		expect(coverage).toMatchObject({
-			summary: "S2",
-			summarizedTurnCount: 2,
-			windowTail: 1,
-			includesPreviousSummary: true,
-			expandedSummarizedTurnCount: 7,
-		});
-		expect(coverage?.units[0]).toMatchObject({ kind: "previous-summary", summaryGeneration: 1 });
-		expect(validateNativeTurnAlignment(coverage!, sourceUnits, after!.turns)).toBe(true);
+	test("fails closed when a referenced archive or model message blob is absent", async () => {
+		const item = fixture();
+		const archive = item.archive({ messages: archivedTurns(0, 1), summary: "S", windowTail: 1 });
+		item.blobs.delete(Buffer.from(archive.reference).toString("hex"));
+		expect(await decodeCheckpointSummaryState(item.store, "agent-x", item.state(2, [archive.reference]))).toBeUndefined();
+
+		const missingMessage = item.archive({ messages: archivedTurns(0, 1), summary: "S", windowTail: 1 });
+		const decoded = decodeConversationSummaryArchive(missingMessage.bytes)!;
+		item.blobs.delete(Buffer.from(decoded.summarizedMessages[0]!).toString("hex"));
+		expect(await decodeCheckpointSummaryState(item.store, "agent-x", item.state(2, [missingMessage.reference]))).toBeUndefined();
 	});
 
-	test("marks turn-count mismatch as inapplicable", () => {
-		const after = decodeCheckpointSummaryState(state(3, [archive({
-			summarized: [turnBytes(1)],
-			summary: "S",
-			windowTail: 3,
-			summaryMessage: new TextEncoder().encode("s"),
-		})]));
-		const sourceUnits = projectSourceHistoryUnits(conversation(8));
-		const coverage = resolveEffectiveSummaryCoverage(undefined, after!, sourceUnits);
-		expect(coverage).toBeDefined();
-		expect(validateNativeTurnAlignment(coverage!, sourceUnits, after!.turns, 8)).toBe(false);
+	test("does not drop an OMP prefix that was omitted from the native bootstrap", async () => {
+		const item = fixture();
+		const archive = item.archive({ messages: archivedTurns(1, 2), summary: "native suffix only", windowTail: 1 });
+		const after = await decodeCheckpointSummaryState(item.store, "agent-x", item.state(3, [archive.reference]));
+		const messages = conversation(4);
+		expect(resolveEffectiveSummaryCoverage(after!, projectSourceHistoryUnits(messages), messages)).toBeUndefined();
 	});
 
-	test("does not treat a later archive as covering the previous summary without byte identity", () => {
-		const archive1 = archive({
-			summarized: [turnBytes(1)],
-			summary: "S1",
-			windowTail: 2,
-			summaryMessage: new TextEncoder().encode("s1-envelope"),
-		});
-		const archive2 = archive({
-			summarized: [new TextEncoder().encode("not-s1"), turnBytes(2)],
-			summary: "S2",
+	test("does not cover a source interaction whose final assistant answer is missing from the archive", async () => {
+		const item = fixture();
+		const toolCallId = nativeToolCallId("call-1");
+		const archive = item.archive({
+			messages: [
+				{ role: "user", content: [{ type: "text", text: "inspect" }] },
+				{ role: "assistant", content: [{ type: "tool-call", toolCallId, toolName: "read", input: { path: "a" } }] },
+				{ role: "tool", id: toolCallId, content: [{ type: "tool-result", toolCallId, toolName: "read", result: "one" }] },
+			],
+			summary: "tools only",
 			windowTail: 1,
-			summaryMessage: new TextEncoder().encode("s2-envelope"),
 		});
-		const after = decodeCheckpointSummaryState(state(1, [archive1, archive2]));
-		const sourceUnits = projectSourceHistoryUnits(conversation(3));
-		const coverage = resolveEffectiveSummaryCoverage(undefined, after!, sourceUnits);
-		expect(coverage?.includesPreviousSummary).toBe(false);
+		const after = await decodeCheckpointSummaryState(item.store, "agent-x", item.state(2, [archive.reference]));
+		const messages: Context["messages"] = [
+			{ role: "user", content: "inspect", timestamp: 1 } as Context["messages"][number],
+			{
+				...conversation(1)[1],
+				content: [{ type: "toolCall", id: "call-1", name: "read", arguments: { path: "a" } }],
+				timestamp: 2,
+			} as Context["messages"][number],
+			{ role: "toolResult", toolCallId: "call-1", toolName: "read", content: [{ type: "text", text: "one" }], isError: false, timestamp: 3 } as Context["messages"][number],
+			{ ...conversation(1)[1], content: [{ type: "text", text: "final" }], timestamp: 4 } as Context["messages"][number],
+			...conversation(1, 2),
+		];
+		expect(resolveEffectiveSummaryCoverage(after!, projectSourceHistoryUnits(messages), messages)).toBeUndefined();
+	});
+
+	test("does not stitch omitted source text across later archive interaction boundaries", async () => {
+		const item = fixture();
+		const archive = item.archive({
+			messages: [
+				{ role: "user", content: [{ type: "text", text: "X" }] },
+				{ role: "assistant", content: [{ type: "text", text: "Z" }] },
+				{ role: "user", content: [{ type: "text", text: "W" }] },
+				{ role: "assistant", content: [{ type: "text", text: "Y" }] },
+			],
+			summary: "later pair",
+			windowTail: 1,
+		});
+		const after = await decodeCheckpointSummaryState(item.store, "agent-x", item.state(3, [archive.reference]));
+		const messages: Context["messages"] = [
+			{ role: "user", content: "X", timestamp: 1 } as Context["messages"][number],
+			{ ...conversation(1)[1], content: [{ type: "text", text: "Y" }], timestamp: 2 } as Context["messages"][number],
+			{ role: "user", content: "X", timestamp: 3 } as Context["messages"][number],
+			{ ...conversation(1)[1], content: [{ type: "text", text: "Z" }], timestamp: 4 } as Context["messages"][number],
+			{ role: "user", content: "W", timestamp: 5 } as Context["messages"][number],
+			{ ...conversation(1)[1], content: [{ type: "text", text: "Y" }], timestamp: 6 } as Context["messages"][number],
+			...conversation(1, 3),
+		];
+		expect(resolveEffectiveSummaryCoverage(after!, projectSourceHistoryUnits(messages), messages)).toBeUndefined();
+	});
+
+	test("rejects identical repeated source interactions without unique occurrence identity", async () => {
+		const item = fixture();
+		const archive = item.archive({
+			messages: [
+				{ role: "user", content: [{ type: "text", text: "same" }] },
+				{ role: "assistant", content: [{ type: "text", text: "same answer" }] },
+			],
+			summary: "ambiguous",
+			windowTail: 1,
+		});
+		const after = await decodeCheckpointSummaryState(item.store, "agent-x", item.state(3, [archive.reference]));
+		const messages: Context["messages"] = [
+			{ role: "user", content: "same", timestamp: 1 } as Context["messages"][number],
+			{ ...conversation(1)[1], content: [{ type: "text", text: "same answer" }], timestamp: 2 } as Context["messages"][number],
+			{ role: "user", content: "same", timestamp: 3 } as Context["messages"][number],
+			{ ...conversation(1)[1], content: [{ type: "text", text: "same answer" }], timestamp: 4 } as Context["messages"][number],
+			...conversation(1, 2),
+		];
+		expect(resolveEffectiveSummaryCoverage(after!, projectSourceHistoryUnits(messages), messages)).toBeUndefined();
 	});
 });
