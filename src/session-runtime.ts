@@ -114,10 +114,7 @@ function grantMismatch(slot: RuntimeSlot, includeWebSearch: boolean | undefined,
 function getOrCreateSlot(scopeKey: string, agentInstanceId: string, cwd: string): RuntimeSlot {
 	const key = runtimeKey(scopeKey, agentInstanceId);
 	const existing = slots.get(key);
-	if (existing) {
-		existing.cwd = cwd;
-		return existing;
-	}
+	if (existing) return existing;
 	const slot: RuntimeSlot = {
 		key,
 		owner: getCursorSessionOwner(),
@@ -334,14 +331,18 @@ export async function prepareTurn(input: OpenRuntimeTurnInput): Promise<Prepared
 	const unsafeBinding = Boolean(slot.agent) && (slot.bindingState !== "committed" || configMismatch);
 	const resumeHandle = unsafeBinding ? undefined : getMatchingResumeHandle(input.agentInstanceId, nextCredential, cwd);
 	const sendState = unsafeBinding ? emptySendState() : slot.agent ? slot.sendState : resumeHandle?.sendState ?? emptySendState();
-	if (!unsafeBinding) slot.sendState = sendState;
-	const nativeRebase = !unsafeBinding && trailing.length === 0 && slot.pendingNativeRebase
-		? attemptNativeCompactionRebase(slot, input.context)
+	const plannedSlot: RuntimeSlot = { ...slot, sendState: { ...sendState } };
+	const nativeRebase = !unsafeBinding && trailing.length === 0 && plannedSlot.pendingNativeRebase
+		? attemptNativeCompactionRebase(plannedSlot, input.context)
 		: undefined;
 	const plan = trailing.length > 0
 		? { mode: "bootstrap" as const, resetAgent: true, reason: "context_divergence" as const }
-		: planSend(unsafeBinding ? sendState : slot.sendState, input.context);
+		: planSend(plannedSlot.sendState, input.context);
 	const { prompt, history } = prepareSendInput(plan, input.context, input.modelLimits, modelSelection.id);
+	if (!unsafeBinding) {
+		slot.sendState = { ...plannedSlot.sendState };
+		slot.pendingNativeRebase = plannedSlot.pendingNativeRebase;
+	}
 
 	slot.preparation?.abort();
 	const preparation = new AbortController();

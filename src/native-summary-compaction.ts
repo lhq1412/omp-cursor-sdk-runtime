@@ -76,6 +76,8 @@ const pendingBySession = new Map<string, PendingCursorCompaction>();
 const attempts = new Map<string, MaterializationAttempt>();
 const mainSettleCandidates = new Map<string, number>();
 const polls = new Map<string, PollState>();
+const unverifiedCoverageBySession = new Map<string, Set<string>>();
+const warnedCoverageBySession = new Map<string, Set<string>>();
 let settleEpoch = 0;
 let pollIntervalMs = POLL_INTERVAL_MS;
 let pollDeadlineMs = POLL_DEADLINE_MS;
@@ -191,6 +193,37 @@ function stagingRequestAlive(input: {
 	if (input.slot.bindingState !== "committed" || input.slot.agent?.agentId !== input.agentId) return false;
 	return true;
 }
+function markCoverageUnverified(sessionId: string, agentId: string): void {
+	const agents = unverifiedCoverageBySession.get(sessionId) ?? new Set<string>();
+	agents.add(agentId);
+	unverifiedCoverageBySession.set(sessionId, agents);
+}
+
+function clearUnverifiedCoverage(sessionId: string, agentId: string): void {
+	const agents = unverifiedCoverageBySession.get(sessionId);
+	agents?.delete(agentId);
+	if (!agents?.size) unverifiedCoverageBySession.delete(sessionId);
+}
+
+function notifyUnverifiedCoverage(ctx: ExtensionContext, sessionId: string): void {
+	const agents = unverifiedCoverageBySession.get(sessionId);
+	if (!agents) return;
+	const warned = warnedCoverageBySession.get(sessionId) ?? new Set<string>();
+	for (const agentId of agents) {
+		if (warned.has(agentId)) continue;
+		warned.add(agentId);
+		try {
+			ctx.ui.notify(
+				`Cursor native summary coverage could not be verified for agent ${agentId}; OMP history was left unchanged. Run /compact to compact normally.`,
+				"warning",
+			);
+		} catch {
+			// A UI warning must not fail the completed business turn.
+		}
+	}
+	warnedCoverageBySession.set(sessionId, warned);
+	unverifiedCoverageBySession.delete(sessionId);
+}
 
 export async function stageCursorCompaction(input: {
 	observation: SummaryBoundaryObservation;
@@ -219,15 +252,18 @@ export async function stageCursorCompaction(input: {
 	if (!stagingRequestAlive(input, sessionId, ownerGeneration, slotKey)) return;
 	const existing = pendingBySession.get(sessionId);
 	if (!after) {
+		markCoverageUnverified(sessionId, input.agentId);
 		if (existing?.state === "pending") existing.state = "stale";
 		return existing;
 	}
 	const sourceUnits = projectSourceHistoryUnits(input.context.messages);
 	const coverage = resolveEffectiveSummaryCoverage(after, sourceUnits, input.context.messages);
 	if (!coverage) {
+		markCoverageUnverified(sessionId, input.agentId);
 		if (existing?.state === "pending") existing.state = "stale";
 		return existing;
 	}
+	clearUnverifiedCoverage(sessionId, input.agentId);
 	const tokens = tokensBeforeFrom(input.observation, input.context);
 	const pending: PendingCursorCompaction = {
 		id: randomUUID(),
@@ -268,6 +304,8 @@ function clearPoll(sessionId: string, ctx?: ExtensionContext): void {
 export function clearCoordinator(sessionId: string | undefined, ctx?: ExtensionContext): void {
 	if (!sessionId) return;
 	pendingBySession.delete(sessionId);
+	unverifiedCoverageBySession.delete(sessionId);
+	warnedCoverageBySession.delete(sessionId);
 	attempts.delete(sessionId);
 	mainSettleCandidates.delete(sessionId);
 	clearPoll(sessionId, ctx);
@@ -336,6 +374,7 @@ export function onAgentEnd(event: { willContinue?: boolean }, ctx: ExtensionCont
 	const marker = mainSettleCandidates.get(sessionId);
 	mainSettleCandidates.delete(sessionId);
 	if (!marker || event.willContinue === true) return;
+	notifyUnverifiedCoverage(ctx, sessionId);
 	const pending = pendingFor(sessionId);
 	if (!pending || pending.state !== "pending") return;
 	scheduleMaterializationPoll(ctx, sessionId);
@@ -405,6 +444,8 @@ export const __testUtils = {
 		pendingBySession.clear();
 		attempts.clear();
 		mainSettleCandidates.clear();
+		unverifiedCoverageBySession.clear();
+		warnedCoverageBySession.clear();
 		polls.clear();
 		settleEpoch = 0;
 		pollIntervalMs = POLL_INTERVAL_MS;

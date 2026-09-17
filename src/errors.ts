@@ -1,8 +1,15 @@
 import { CURSOR_API_KEY_ENV_VAR } from "./constants.js";
 
+export class CursorBootstrapBudgetError extends Error {
+	constructor() {
+		super("Cursor SDK cannot safely import the complete OMP history within the bootstrap input budget. Run /compact, then retry.");
+		this.name = "CursorBootstrapBudgetError";
+	}
+}
+
 export class CursorRecoveryBudgetError extends Error {
 	constructor() {
-		super("Cursor SDK recovery cannot restore the current tool turn within the bootstrap input budget");
+		super("Cursor SDK recovery cannot restore the current tool turn and complete OMP history within the bootstrap input budget. Run /compact, then retry.");
 		this.name = "CursorRecoveryBudgetError";
 	}
 }
@@ -11,12 +18,12 @@ export class CursorRecoveryBudgetError extends Error {
 export function sanitizeCursorProviderError(error: unknown, apiKey?: string): string {
 	const parts: string[] = [];
 	const seen = new Set<object>();
-	let recoveryBudget = false;
+	let localBudget = false;
 	let current = error;
 	while (current !== null && typeof current === "object" && !seen.has(current)) {
 		seen.add(current);
 		const record = current as Record<string, unknown>;
-		if (record.name === "CursorRecoveryBudgetError") recoveryBudget = true;
+		if (record.name === "CursorBootstrapBudgetError" || record.name === "CursorRecoveryBudgetError") localBudget = true;
 		if (typeof record.message === "string") parts.push(record.message);
 		for (const field of ["name", "code", "status", "requestId", "request_id"] as const) {
 			const value = record[field];
@@ -55,7 +62,7 @@ export function sanitizeCursorProviderError(error: unknown, apiKey?: string): st
 		category = "Quota exhausted";
 	} else if (rate) {
 		category = "Rate limited";
-	} else if (!recoveryBudget && /context (?:window|length).*(?:exceed|full|overflow|too (?:long|large))|(?:exceed|maximum).*context (?:window|length)|(?:prompt|input|conversation).*(?:too long|too large)|too many (?:input )?tokens/.test(detail)) {
+	} else if (!localBudget && /context (?:window|length).*(?:exceed|full|overflow|too (?:long|large))|(?:exceed|maximum).*context (?:window|length)|(?:prompt|input|conversation).*(?:too long|too large)|too many (?:input )?tokens/.test(detail)) {
 		category = "Context window exceeded";
 	} else if (/authentication|unauthenticated|unauthori[sz]ed|invalid api key|permission denied|status=(?:401|403)\b/.test(detail)) {
 		category = "Authentication failed";

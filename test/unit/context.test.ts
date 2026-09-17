@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { SDK_TOOL_CONTEXT, SDK_TOOL_CONTEXT_WITH_READ } from "../../src/constants.ts";
 import { nativeReadHooked } from "../../src/sdk-native-hook.ts";
 import { activeUserInput, activeUserText, computeContextFingerprint, emptySendState, planSend, prepareSendInput, registerLegacyCursorToolCallIdMigration, type ModelInputLimits } from "../../src/context.ts";
-import { CursorRecoveryBudgetError } from "../../src/errors.ts";
+import { CursorBootstrapBudgetError, CursorRecoveryBudgetError } from "../../src/errors.ts";
 import type { ModelSelection } from "@cursor/sdk";
 import type { Context } from "@oh-my-pi/pi-ai";
 import { normalizeToolCallId } from "@oh-my-pi/pi-ai/utils";
@@ -148,9 +148,9 @@ describe("send policy", () => {
 		const plan = planSend(state, ctx);
 		expect(plan).toMatchObject({ mode: "incremental", resetAgent: false, continueOnly: true });
 		expect(prepareSendInput(plan, ctx, modelLimits).prompt.text).not.toContain("Already executed request");
-		const periodic = planSend({ ...state, incrementalSendCount: 20 }, ctx);
-		expect(periodic).toMatchObject({ mode: "bootstrap", continueOnly: true });
-		expect(prepareSendInput(periodic, ctx, modelLimits).history).toEqual(ctx.messages);
+		const mature = planSend({ ...state, incrementalSendCount: 20_000 }, ctx);
+		expect(mature).toMatchObject({ mode: "incremental", resetAgent: false, continueOnly: true });
+		expect(prepareSendInput(mature, ctx, modelLimits).history).toBeUndefined();
 		const appended = context([...ctx.messages, { role: "user", content: "New request", timestamp: 4 }]);
 		const next = planSend(state, appended);
 		expect(next.mode).toBe("incremental");
@@ -308,19 +308,18 @@ describe("send policy", () => {
 		expect(prepared.prompt.text).not.toContain("Already finished");
 	});
 
-	test("identical committed input continues even when a periodic bootstrap is due", () => {
+	test("identical committed input stays incremental regardless of the recorded send count", () => {
 		const ctx = context(firstUser);
-		for (const incrementalSendCount of [0, 19, 20]) {
+		for (const incrementalSendCount of [0, 19, 20, 20_000]) {
 			const plan = planSend({ bootstrapped: true, contextFingerprint: computeContextFingerprint(ctx), incrementalSendCount }, ctx);
 			const prepared = prepareSendInput(plan, ctx, modelLimits);
 			expect(prepared.prompt.text).toEndWith(activeUserInput(ctx, true).text);
-			expect(plan.continueOnly).toBe(true);
-			expect(plan.mode).toBe(incrementalSendCount < 20 ? "incremental" : "bootstrap");
-			expect(prepared.history).toEqual(incrementalSendCount < 20 ? undefined : ctx.messages);
+			expect(plan).toMatchObject({ mode: "incremental", resetAgent: false, continueOnly: true });
+			expect(prepared.history).toBeUndefined();
 		}
 	});
 
-	test("trims oldest interaction units without splitting tool calls across injected developer input", () => {
+	test("refuses to bootstrap when the complete history does not fit", () => {
 		const ctx = context([
 			{ role: "user", content: "OLD " + "x".repeat(8000), timestamp: 1 },
 			{ role: "assistant", content: [{ type: "toolCall", id: "old-call", name: "read", arguments: {} }], timestamp: 2 },
@@ -331,13 +330,11 @@ describe("send policy", () => {
 			{ role: "toolResult", toolCallId: "recent-call", toolName: "read", content: [{ type: "text", text: "recent-result" }], timestamp: 7 },
 			{ role: "user", content: "CURRENT", timestamp: 8 },
 		] as Context["messages"], "required system");
-		const prepared = bootstrap(ctx, { contextWindow: 2200, maxTokens: 200 });
-		expect(prepared.history).toEqual(ctx.messages.slice(4, -1));
-		expect(prepared.prompt.text).toContain("required system");
-		expect(prepared.prompt.text).toEndWith("CURRENT");
+		expect(() => bootstrap(ctx, { contextWindow: 2200, maxTokens: 200 })).toThrow(CursorBootstrapBudgetError);
+		expect(() => bootstrap(ctx, { contextWindow: 2200, maxTokens: 200 })).toThrow(/\/compact/);
 	});
 
-	test("recovery trims older turns but keeps the initiating request and all completed batches", () => {
+	test("recovery refuses to omit an oversized prefix before the initiating request", () => {
 		const ctx = context([
 			{ role: "user", content: "OBSOLETE " + "x".repeat(20_000), timestamp: 1 },
 			{ role: "assistant", content: [{ type: "text", text: "Old answer" }], timestamp: 2 },
@@ -348,11 +345,10 @@ describe("send policy", () => {
 			{ role: "developer", content: "Use the recorded evidence", timestamp: 6 },
 			{ role: "toolResult", toolCallId: "call-b", toolName: "read", content: [{ type: "text", text: "contents of b.ts" }], timestamp: 7 },
 		] as Context["messages"], "required system");
-		const prepared = bootstrap(ctx, { contextWindow: 2400, maxTokens: 200 });
-		expect(prepared.history).toEqual(ctx.messages.slice(2));
-		expect(prepared.prompt.text).toContain("required system");
-		expect(prepared.prompt.text).not.toContain("Compare a.ts and b.ts");
-		expect(prepared.prompt.images).toBeUndefined();
+		expect(() => bootstrap(ctx, { contextWindow: 2400, maxTokens: 200 })).toThrow(CursorRecoveryBudgetError);
+		expect(() => bootstrap(ctx, { contextWindow: 2400, maxTokens: 200 })).toThrow(/\/compact/);
+		const prepared = bootstrap(ctx, { contextWindow: 30_000, maxTokens: 200 });
+		expect(prepared.history).toEqual(ctx.messages);
 		const incomplete = { ...ctx, messages: ctx.messages.filter((message) => message.role !== "toolResult" || message.toolCallId !== "call-a") };
 		expect(() => bootstrap(incomplete)).toThrow(/missing results/i);
 	});
@@ -371,8 +367,8 @@ describe("send policy", () => {
 			{ role: "assistant", content: [{ type: "toolCall", id: "inspect", name: "capture_screen", arguments: {} }], timestamp: 5 },
 			{ role: "toolResult", toolCallId: "inspect", toolName: "capture_screen", content: [secondImage], timestamp: 6 },
 		] as Context["messages"]);
-		const prepared = bootstrap(ctx, { contextWindow: 17_000, maxTokens: 500 });
-		expect(prepared.history).toEqual(ctx.messages.slice(3));
+		const prepared = bootstrap(ctx, { contextWindow: 50_000, maxTokens: 500 });
+		expect(prepared.history).toEqual(ctx.messages);
 		expect(prepared.prompt.images).toEqual([
 			{ data: resultImage.data, mimeType: resultImage.mimeType },
 			{ data: secondImage.data, mimeType: secondImage.mimeType },
@@ -424,7 +420,7 @@ describe("send policy", () => {
 		const imported = { ...ctx, messages: [...firstUser, ...ctx.messages] };
 		const required = bootstrap(ctx);
 		const requiredTokens = (Buffer.byteLength(required.prompt.text) + 3) >> 2;
-		expect(bootstrap(imported, { contextWindow: 1024 + limits.maxTokens + requiredTokens + 8, maxTokens: limits.maxTokens })).toEqual(required);
+		expect(() => bootstrap(imported, { contextWindow: 1024 + limits.maxTokens + requiredTokens + 8, maxTokens: limits.maxTokens })).toThrow(CursorBootstrapBudgetError);
 	});
 
 	test("does not treat image encoding size as context tokens", () => {
@@ -500,7 +496,7 @@ describe("send policy", () => {
 			{ role: "user", content: "Describe it", timestamp: 2 },
 		], "");
 		expect(bootstrap(ctx, { contextWindow: 6000, maxTokens: 500 }).history).toEqual(ctx.messages.slice(0, -1));
-		expect(bootstrap(ctx, { contextWindow: 5000, maxTokens: 500 }).history).toEqual([]);
+		expect(() => bootstrap(ctx, { contextWindow: 5000, maxTokens: 500 })).toThrow(CursorBootstrapBudgetError);
 		expect(() => bootstrap(context([{ role: "user", content: [image], timestamp: 1 }], ""), { contextWindow: 5000, maxTokens: 500 })).toThrow(/context window exceeded/i);
 	});
 

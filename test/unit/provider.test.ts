@@ -1274,9 +1274,14 @@ describe("streamCursorRuntime model selection", () => {
 		expect(sent).toEqual([]);
 	});
 
-	test.each(["request", "result", "images"])("fails recovery rather than dropping its required oversized %s", async (oversized) => {
+	test.each(["prefix", "request", "result", "images"])("fails recovery rather than dropping its required oversized %s", async (oversized) => {
 		const context = recordedToolContext();
-		if (oversized === "request") {
+		if (oversized === "prefix") {
+			context.messages.unshift(
+				{ role: "user", content: "Earlier request " + "x".repeat(20_000), timestamp: -1 } as Context["messages"][number],
+				{ role: "assistant", content: [{ type: "text", text: "Earlier answer" }], timestamp: 0 } as Context["messages"][number],
+			);
+		} else if (oversized === "request") {
 			context.messages[0] = { role: "user", content: "Required initiating request " + "x".repeat(20_000), timestamp: 1 };
 		} else if (oversized === "images") {
 			context.messages[3] = { role: "toolResult", toolCallId: "call-2", toolName: "read", content: Array.from({ length: 3 }, () => ({ type: "image" as const, data: "screen-payload", mimeType: "image/png" })), isError: false, timestamp: 4 };
@@ -1287,9 +1292,66 @@ describe("streamCursorRuntime model selection", () => {
 		const sent: ModelSelection[] = [];
 		installCapturingAgent(created, sent);
 		const events = await drain(cursorModel("composer-2.5", 10_000), context, { apiKey: "test-key", cwd: "/tmp/project" });
-		expect(events.at(-1)).toMatchObject({ type: "error", error: { errorMessage: expect.stringMatching(/cannot restore the current tool turn/i) } });
+		expect(events.at(-1)).toMatchObject({ type: "error", error: { errorMessage: expect.stringMatching(/cannot restore the current tool turn[\s\S]*\/compact/i) } });
 		expect(created).toEqual([]);
 		expect(sent).toEqual([]);
+	});
+
+	test("bootstrap budget refusal leaves the committed host binding and agent untouched", async () => {
+		const host = createFakeHost({ tools: [], cwd: "/tmp/project", sessionId: "sess-1" });
+		const sends: string[] = [];
+		let opens = 0;
+		let disposals = 0;
+		runtimeTestUtils.setOpenAgent(async () => {
+			opens += 1;
+			return {
+				agentId: "agent-old",
+				close() {},
+				async [Symbol.asyncDispose]() { disposals += 1; },
+				async send() {
+					sends.push("agent-old");
+					return finishedRun();
+				},
+			} as SDKAgent;
+		});
+		const firstContext = userContext("first");
+		const first = await drain(cursorModel("composer-2.5", 200_000), firstContext, {
+			apiKey: "test-key",
+			[HOST_BRIDGE_OPTION_KEY]: host,
+		} as SimpleStreamOptions);
+		expect(first.at(-1)).toMatchObject({ type: "done", reason: "stop" });
+		const slot = [...runtimeTestUtils.slots.values()][0]!;
+		const committedState = structuredClone(slot.sendState);
+		const committedBindings = structuredClone(host.bindings);
+		const oversizedDivergence = {
+			messages: [
+				...firstContext.messages,
+				{
+					role: "assistant",
+					content: [{ type: "text", text: "x".repeat(20_000) }],
+					api: "anthropic-messages",
+					provider: "anthropic",
+					model: "claude-sonnet-4-5",
+					timestamp: 2,
+				},
+				{ role: "user", content: "back to cursor", timestamp: 3 },
+			],
+		} as Context;
+		const rejected = await drain(cursorModel("composer-2.5", 10_000), oversizedDivergence, {
+			apiKey: "test-key",
+			[HOST_BRIDGE_OPTION_KEY]: host,
+		} as SimpleStreamOptions);
+		expect(rejected.at(-1)).toMatchObject({
+			type: "error",
+			error: { errorMessage: expect.stringMatching(/\/compact/) },
+		});
+		expect(opens).toBe(1);
+		expect(sends).toEqual(["agent-old"]);
+		expect(disposals).toBe(0);
+		expect(slot.agent?.agentId).toBe("agent-old");
+		expect(slot.bindingState).toBe("committed");
+		expect(slot.sendState).toEqual(committedState);
+		expect(host.bindings).toEqual(committedBindings);
 	});
 
 	test("parked continuation does not hydrate a different credential", async () => {
