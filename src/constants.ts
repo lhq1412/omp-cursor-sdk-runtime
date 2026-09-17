@@ -3,7 +3,6 @@ export const CURSOR_SDK_API = "cursor-sdk-agent";
 export const HOST_BRIDGE_VERSION = 1;
 export const CURSOR_API_KEY_ENV_VAR = "CURSOR_API_KEY";
 export const DEFAULT_MODEL_ID = "composer-2.5";
-export const MAX_COMPLETED_INCREMENTAL_SENDS_BEFORE_REBOOTSTRAP = 20;
 
 /** OMP context-maintenance reserve; advertised model.maxTokens can be 64k. */
 export const BOOTSTRAP_OUTPUT_RESERVE_TOKENS = 16_384;

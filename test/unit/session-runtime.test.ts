@@ -376,6 +376,80 @@ describe("session runtime", () => {
 		expect(opens).toBe(0);
 	});
 
+	test("bootstrap refusal preserves a committed agent, binding, and pending native rebase", async () => {
+		runtimeTestUtils.clear();
+		liveRunTestUtils.clear();
+		scopeTestUtils.reset();
+		resumeTestUtils.reset();
+		registerResume();
+		let opens = 0;
+		let disposals = 0;
+		const agent = {
+			...fakeAgent("agent-old"),
+			async [Symbol.asyncDispose]() { disposals += 1; },
+		} as SDKAgent;
+		runtimeTestUtils.setOpenAgent(async () => {
+			opens += 1;
+			return agent;
+		});
+		const original = historyThenContinue();
+		const first = await prepareTurn({
+			modelLimits,
+			cwd: "/tmp/project",
+			agentInstanceId: "main",
+			apiKey: "test-key",
+			modelSelection: { id: "composer-2.5" },
+			context: original,
+			grantedTools: [],
+		});
+		commitTurn(first.slot, original, false);
+		liveRunTestUtils.clear();
+		const pending = {
+			materializationId: "attempt-1",
+			compactionEntryId: "cmp-1",
+			compactionTimestamp: 1000,
+			checkpointRootBlobId: "after",
+			summaryGeneration: 1,
+			archiveHash: "hash",
+			knownTailLocator: first.slot.committedContextTail!,
+		};
+		first.slot.pendingNativeRebase = pending;
+		const beforeState = structuredClone(first.slot.sendState);
+		const preparation = first.slot.preparation;
+		const compacted = {
+			messages: [
+				{ role: "user", content: "summary", timestamp: 1000, historyRewriteAt: 1000 },
+				original.messages.at(-1)!,
+				{
+					role: "assistant",
+					content: [{ type: "text", text: "x".repeat(20_000) }],
+					api: "anthropic-messages",
+					provider: "anthropic",
+					model: "claude-sonnet-4-5",
+					timestamp: 1001,
+				},
+				{ role: "user", content: "back to cursor", timestamp: 1002 },
+			],
+		} as Context;
+		await expect(prepareTurn({
+			cwd: "/tmp/project",
+			agentInstanceId: "main",
+			apiKey: "test-key",
+			modelSelection: { id: "composer-2.5" },
+			modelLimits: { contextWindow: 4000, maxTokens: 500 },
+			context: compacted,
+			grantedTools: [],
+		})).rejects.toThrow(/\/compact/);
+		expect(first.slot.agent).toBe(agent);
+		expect(first.slot.bindingState).toBe("committed");
+		expect(first.slot.sendState).toEqual(beforeState);
+		expect(first.slot.pendingNativeRebase).toBe(pending);
+		expect(first.slot.preparation).toBe(preparation);
+		expect(preparation?.signal.aborted).toBe(false);
+		expect(opens).toBe(1);
+		expect(disposals).toBe(0);
+	});
+
 	test("resuming an identical committed context does not replay its user input", async () => {
 		runtimeTestUtils.clear();
 		liveRunTestUtils.clear();
@@ -639,7 +713,7 @@ describe("session runtime", () => {
 		expect(parseResumeEntryData(dirty?.data)?.agentId).toBe("agent-1");
 	});
 
-	test("resumes a matching committed handle incrementally instead of re-sending history", async () => {
+	test("resumes a mature matching committed handle incrementally without re-sending history", async () => {
 		runtimeTestUtils.clear();
 		liveRunTestUtils.clear();
 		scopeTestUtils.reset();
@@ -647,6 +721,7 @@ describe("session runtime", () => {
 		const { sessionFile } = registerResume();
 		const firstContext = userContext("first");
 		seedCommittedHandle(sessionFile, firstContext);
+		resumeTestUtils.state.activeHandle!.sendState.incrementalSendCount = 20_000;
 		const opens: Array<{ savedAgentId?: string }> = [];
 		const histories: Array<Context["messages"] | undefined> = [];
 		runtimeTestUtils.setOpenAgent(async (input) => {

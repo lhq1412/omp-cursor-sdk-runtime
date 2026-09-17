@@ -7,11 +7,10 @@ import {
 	BOOTSTRAP_OUTPUT_RESERVE_TOKENS,
 	CURSOR_SDK_API,
 	CURSOR_SDK_PROVIDER_ID,
-	MAX_COMPLETED_INCREMENTAL_SENDS_BEFORE_REBOOTSTRAP,
 	SDK_TOOL_CONTEXT,
 	SDK_TOOL_CONTEXT_WITH_READ,
 } from "./constants.js";
-import { CursorRecoveryBudgetError } from "./errors.js";
+import { CursorBootstrapBudgetError, CursorRecoveryBudgetError } from "./errors.js";
 import { nativeToolCallId, projectSdkToolCallId } from "./tool-call-id.js";
 import { nativeReadHooked } from "./sdk-native-hook.js";
 
@@ -26,7 +25,7 @@ export interface SendState {
 export interface SendPlan {
 	mode: SendMode;
 	resetAgent: boolean;
-	reason: "initial" | "context_divergence" | "incremental_threshold" | "incremental";
+	reason: "initial" | "context_divergence" | "incremental";
 	continueOnly?: true;
 }
 
@@ -204,9 +203,6 @@ export function planSend(sendState: SendState, context: Context): SendPlan {
 			return { mode: "bootstrap", resetAgent: true, reason: "context_divergence" };
 		}
 	}
-	if (sendState.incrementalSendCount >= MAX_COMPLETED_INCREMENTAL_SENDS_BEFORE_REBOOTSTRAP) {
-		return { mode: "bootstrap", resetAgent: true, reason: "incremental_threshold", ...continuation };
-	}
 	return { mode: "incremental", resetAgent: false, reason: "incremental", ...continuation };
 }
 
@@ -281,12 +277,12 @@ function imagesFromContent(content: unknown): SDKImage[] {
 	return images;
 }
 
-function historyUnits(messages: Context["messages"], recoveryStart?: number): Context["messages"][] {
+function historyUnits(messages: Context["messages"]): Context["messages"][] {
 	const units: Context["messages"][] = [];
 	let unit: Context["messages"] = [];
 	const pending = new Set<string>();
-	for (const [index, message] of messages.entries()) {
-		if ((message.role === "user" || message.role === "developer") && pending.size === 0 && unit.length > 0 && (recoveryStart === undefined || index <= recoveryStart)) {
+	for (const message of messages) {
+		if ((message.role === "user" || message.role === "developer") && pending.size === 0 && unit.length > 0) {
 			units.push(unit);
 			unit = [];
 		}
@@ -501,29 +497,20 @@ export function prepareSendInput(plan: SendPlan, context: Context, limits: Model
 	const sanitized = sanitizeSystemPromptForCursor(serializeSystemPrompt(context.systemPrompt));
 	const system = sanitized ? `System instructions from OMP:\n${sanitized}\n\n` : "";
 	const budget = inputTextBudget(current, limits);
-	let text = system + current.text;
-	const requiredTokens = estimatedTextTokens(text);
-	if (requiredTokens > budget) {
+	const requiredText = system + current.text;
+	if (estimatedTextTokens(requiredText) > budget) {
 		if (recoveryStart !== undefined) throw new CursorRecoveryBudgetError();
 		throwContextOverflow();
 	}
-	const units = historyUnits(prior, recoveryStart);
 	const toolContext = prior.length > 0 ? `${nativeReadHooked ? SDK_TOOL_CONTEXT_WITH_READ : SDK_TOOL_CONTEXT}\n\n` : "";
-	let remaining = budget - requiredTokens - estimatedTextTokens(toolContext);
-	let start = units.length;
-	while (start > 0) {
-		const cost = estimatedHistoryTokens(units[start - 1]!, targetModelId);
-		if (cost > remaining) break;
-		remaining -= cost;
-		start -= 1;
+	const text = system + toolContext + current.text;
+	if (estimatedTextTokens(text) + estimatedHistoryTokens(prior, targetModelId) > budget) {
+		if (recoveryStart !== undefined) throw new CursorRecoveryBudgetError();
+		throw new CursorBootstrapBudgetError();
 	}
-	if (recoveryStart !== undefined && start === units.length) {
-		throw new CursorRecoveryBudgetError();
-	}
-	if (start < units.length) text = system + toolContext + current.text;
 	return {
 		prompt: { ...current, text },
-		history: structuredClone(units.slice(start).flat()),
+		history: structuredClone(prior),
 	};
 }
 

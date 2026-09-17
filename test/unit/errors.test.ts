@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { isContextOverflow } from "@oh-my-pi/pi-ai/error";
 import type { AssistantMessage } from "@oh-my-pi/pi-ai";
-import { CursorRecoveryBudgetError, sanitizeCursorProviderError } from "../../src/errors.ts";
+import { CursorBootstrapBudgetError, CursorRecoveryBudgetError, sanitizeCursorProviderError } from "../../src/errors.ts";
 
 function isOverflow(errorMessage: string): boolean {
 	return isContextOverflow({ stopReason: "error", errorMessage } as AssistantMessage);
@@ -45,11 +45,13 @@ describe("Cursor provider diagnostics", () => {
 		expect(sanitizeCursorProviderError({ code: "resource_exhausted", message: "rate limit exceeded" })).toContain("Rate limited");
 	});
 
-	test("local recovery-budget failure does not start OMP context recovery", () => {
-		const diagnostic = sanitizeCursorProviderError(new CursorRecoveryBudgetError());
-		expect(isOverflow(diagnostic)).toBe(false);
-		expect(diagnostic).not.toMatch(/context window exceeded/i);
-		expect(diagnostic).toContain("cannot restore the current tool turn");
+	test("local bootstrap-budget failures do not start OMP context recovery", () => {
+		for (const error of [new CursorBootstrapBudgetError(), new CursorRecoveryBudgetError()]) {
+			const diagnostic = sanitizeCursorProviderError(error);
+			expect(isOverflow(diagnostic)).toBe(false);
+			expect(diagnostic).not.toMatch(/context window exceeded/i);
+			expect(diagnostic).toContain("/compact");
+		}
 	});
 
 	test("redacts authorization schemes other than bearer", () => {

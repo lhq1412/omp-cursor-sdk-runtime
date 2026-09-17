@@ -143,10 +143,17 @@ function pending(partial: Partial<PendingCursorCompaction> = {}): PendingCursorC
 
 function hooks() {
 	const handlers = new Map<string, Array<(event: unknown, ctx: ExtensionContext) => unknown>>();
+	const notifications: Array<{ message: string; type?: string }> = [];
 	let idle = false;
 	let pendingMessages = false;
 	const ctx = {
 		cwd: "/tmp/project",
+		hasUI: true,
+		ui: {
+			notify(message: string, type?: string) {
+				notifications.push({ message, type });
+			},
+		},
 		model: { provider: CURSOR_SDK_PROVIDER_ID },
 		sessionManager: {
 			getSessionId: () => "sess-1",
@@ -172,7 +179,13 @@ function hooks() {
 		},
 	};
 	registerCursorSessionLifecycle(pi as Pick<ExtensionAPI, "on">);
-	return { handlers, ctx, setIdle: (value: boolean) => { idle = value; }, setPending: (value: boolean) => { pendingMessages = value; } };
+	return {
+		handlers,
+		ctx,
+		notifications,
+		setIdle: (value: boolean) => { idle = value; },
+		setPending: (value: boolean) => { pendingMessages = value; },
+	};
 }
 
 async function emit(
@@ -643,6 +656,80 @@ describe("native summary materialization", () => {
 		}));
 		expect(staged?.state).toBe("pending");
 		expect(compactionTestUtils.getPending(owner.sessionId!)?.summary).toBe("S1");
+	});
+
+	test("warns once without materializing when native summary coverage cannot be verified", async () => {
+		const { ctx, notifications } = hooks();
+		const owner = ownerForContext(ctx);
+		runtimeTestUtils.setOpenAgent(async () => ({
+			agentId: "agent-x",
+			close() {},
+			async [Symbol.asyncDispose]() {},
+		} as SDKAgent));
+		const messages = conversation(8);
+		messages[0] = user("different source turn", 10);
+		const context = { messages } as Context;
+		const turn = await withCursorSessionOwner(owner, () => prepareTurn({
+			cwd: ctx.cwd,
+			agentInstanceId: "main",
+			apiKey: "test-key",
+			modelSelection: { id: "composer-2.5" },
+			modelLimits: { contextWindow: 200_000, maxTokens: 20_000 },
+			context,
+			grantedTools: [],
+		}));
+		commitTurn(turn.slot, context, false);
+		const checkpoint = summaryCheckpoint();
+		const store = {
+			checkpoints: {
+				async get(input: { blobId: string }) {
+					return input.blobId === "after"
+						? checkpoint.afterBytes
+						: checkpoint.blobs.get(input.blobId) ?? null;
+				},
+			},
+		} as unknown as LocalAgentStore;
+		const stageInput = {
+			observation: {
+				summaryGeneration: 1,
+				beforeRoot: null,
+				afterRoot: "after",
+				after: {
+					rootBlobId: "after",
+					turns: 3,
+					turnsOld: 0,
+					summaryArchive: 0,
+					summaryArchives: 1,
+					selfSummaryCount: 1,
+					summaryBytes: 2,
+					summaryArchiveBytes: 1,
+				},
+			},
+			context,
+			contextFingerprint: turn.slot.sendState.contextFingerprint,
+			store,
+			slot: turn.slot,
+			agentId: "agent-x",
+		};
+		let compactCalls = 0;
+		ctx.compact = async () => {
+			compactCalls += 1;
+		};
+
+		await expect(withCursorSessionOwner(owner, () => stageCursorCompaction(stageInput))).resolves.toBeUndefined();
+		await expect(withCursorSessionOwner(owner, () => stageCursorCompaction(stageInput))).resolves.toBeUndefined();
+		noteMainSessionStop(owner.sessionId);
+		onAgentEnd({ willContinue: false }, ctx);
+		noteMainSessionStop(owner.sessionId);
+		onAgentEnd({ willContinue: false }, ctx);
+
+		expect(compactionTestUtils.getPending(owner.sessionId!)).toBeUndefined();
+		expect(compactCalls).toBe(0);
+		expect(notifications).toHaveLength(1);
+		expect(notifications[0]).toMatchObject({ type: "warning" });
+		expect(notifications[0]!.message).toContain("coverage could not be verified");
+		expect(notifications[0]!.message).toContain("OMP history was left unchanged");
+		expect(notifications[0]!.message).toContain("/compact");
 	});
 
 	test("stageCursorCompaction drops publish after navigation clears coordinator mid-await", async () => {
