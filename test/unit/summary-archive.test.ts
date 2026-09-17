@@ -124,6 +124,62 @@ describe("ConversationSummaryArchive", () => {
 		expect(materialized?.units[0]).toMatchObject({ kind: "previous-summary", summaryGeneration: 1 });
 	});
 
+	test("consumes a raw imported OMP compaction summary before aligning retained turns", async () => {
+		const item = fixture();
+		const archive = item.archive({
+			messages: [
+				{
+					role: "user",
+					content: [
+						{ type: "text", text: "native environment prefix" },
+						{ type: "text", text: "S1" },
+						{ type: "image", image: "data:image/png;base64,aW1hZ2U=", mimeType: "image/png" },
+					],
+				},
+				{ role: "user", content: [{ type: "text", text: "u5" }] },
+				{
+					role: "assistant",
+					content: [
+						{ type: "redacted-reasoning", data: "opaque", providerOptions: { cursor: {} } },
+						{ type: "text", text: "a5" },
+					],
+				},
+				...archivedTurns(6, 1),
+			],
+			summary: "S2",
+			windowTail: 1,
+		});
+		const after = await decodeCheckpointSummaryState(item.store, "agent-x", item.state(3, [archive.reference]));
+		const retained = conversation(3, 5);
+		retained[1] = {
+			...retained[1],
+			content: [
+				{ type: "thinking", thinking: "visible but provider-private" },
+				{ type: "text", text: "a5" },
+			],
+		} as Context["messages"][number];
+		const compacted: Context["messages"] = [
+			{
+				role: "user",
+				content: [
+					{ type: "text", text: "S1" },
+					{ type: "image", data: "blob:sha256:source-image", mimeType: "image/png" },
+				],
+				timestamp: 1000,
+				historyRewriteAt: 1000,
+			} as Context["messages"][number],
+			...retained,
+		];
+		expect(resolveEffectiveSummaryCoverage(after!, projectSourceHistoryUnits(compacted), compacted)).toMatchObject({
+			summarizedTurnCount: 2,
+			includesPreviousSummary: true,
+		});
+
+		const missingSummary = item.archive({ messages: archivedTurns(5, 2), summary: "unsafe", windowTail: 1 });
+		const missingAfter = await decodeCheckpointSummaryState(item.store, "agent-x", item.state(3, [missingSummary.reference]));
+		expect(resolveEffectiveSummaryCoverage(missingAfter!, projectSourceHistoryUnits(compacted), compacted)).toBeUndefined();
+	});
+
 	test("fails closed when a referenced archive or model message blob is absent", async () => {
 		const item = fixture();
 		const archive = item.archive({ messages: archivedTurns(0, 1), summary: "S", windowTail: 1 });

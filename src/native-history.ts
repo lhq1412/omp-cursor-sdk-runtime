@@ -217,8 +217,11 @@ function decodeModelMessage(bytes: Uint8Array): DecodedModelMessage | undefined 
 				const record = part as Record<string, unknown>;
 				if (record.type === "text" && typeof record.text === "string" && record.text.trim()) {
 					anchors.push(anchor("assistant", record.text.trim()));
-				} else if (record.type === "reasoning" && typeof record.text === "string" && record.text.trim()) {
-					anchors.push(anchor("reasoning", record.text.trim()));
+				} else if (
+					(record.type === "reasoning" && typeof record.text === "string") ||
+					(record.type === "redacted-reasoning" && typeof record.data === "string")
+				) {
+					// Native history may omit or redact model reasoning. It is not stable coverage identity.
 				} else if (record.type === "tool-call" && typeof record.toolCallId === "string" &&
 					typeof record.toolName === "string") {
 					anchors.push(anchor("tool-call", JSON.stringify([
@@ -391,8 +394,8 @@ function sourceUnitAnchors(unit: SourceHistoryUnit, messages: Context["messages"
 				anchors.push(anchor("tool-call", JSON.stringify([id, part.name, part.arguments ?? {}])));
 			} else if (part.type === "text" && part.text.trim()) {
 				anchors.push(anchor("assistant", part.text.trim()));
-			} else if (part.type === "thinking" && part.thinking.trim()) {
-				anchors.push(anchor("reasoning", part.thinking.trim()));
+			} else if (part.type === "thinking" && typeof part.thinking === "string") {
+				// The native history mapper may omit this provider-private state.
 			} else {
 				return [];
 			}
@@ -427,6 +430,8 @@ export function resolveEffectiveSummaryCoverage(
 	const hasMaterializedSummary = sourceUnits[0]?.kind === "compaction-summary";
 	const expanded = archiveInteractions(archives, latestIndex, !hasMaterializedSummary);
 	if (!expanded) return;
+	const importedMaterializedSummary = hasMaterializedSummary && expanded.previous.length === 0;
+	const interactions = importedMaterializedSummary ? expanded.interactions.slice(1) : expanded.interactions;
 	const units: CursorCoverageUnit[] = expanded.previous.map((previous) => ({
 		kind: "previous-summary",
 		summaryGeneration: previous + 1,
@@ -442,11 +447,11 @@ export function resolveEffectiveSummaryCoverage(
 		if (signature) signatureCounts.set(signature, (signatureCounts.get(signature) ?? 0) + 1);
 	}
 	let matchedTurns = 0;
-	while (matchedTurns < turnUnits.length && matchedTurns < expanded.interactions.length) {
+	while (matchedTurns < turnUnits.length && matchedTurns < interactions.length) {
 		const source = turnUnits[matchedTurns]!;
 		const required = requiredByUnit.get(source) ?? [];
 		if (!required.length || signatureCounts.get(required.join("\0")) !== 1) break;
-		if (!anchorsEqual(required, expanded.interactions[matchedTurns]!)) break;
+		if (!anchorsEqual(required, interactions[matchedTurns]!)) break;
 		units.push({ kind: "history-turn", sourceUnitOrdinal: source.ordinal });
 		matchedTurns += 1;
 	}
@@ -456,7 +461,7 @@ export function resolveEffectiveSummaryCoverage(
 		summarizedTurnCount: matchedTurns,
 		windowTail: latest.windowTail,
 		units,
-		includesPreviousSummary: expanded.previous.length > 0,
+		includesPreviousSummary: importedMaterializedSummary || expanded.previous.length > 0,
 		archiveHash: latest.archiveHash,
 		expandedSummarizedTurnCount: matchedTurns,
 	};
