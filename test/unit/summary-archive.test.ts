@@ -133,7 +133,7 @@ describe("ConversationSummaryArchive", () => {
 					content: [
 						{ type: "text", text: "native environment prefix" },
 						{ type: "text", text: "S1" },
-						{ type: "image", image: "data:image/png;base64,aW1hZ2U=", mimeType: "image/png" },
+						{ type: "image", image: "data:image/png;base64,aW1hZ2U=", mediaType: "image/png" },
 					],
 				},
 				{ role: "user", content: [{ type: "text", text: "u5" }] },
@@ -163,7 +163,7 @@ describe("ConversationSummaryArchive", () => {
 				role: "user",
 				content: [
 					{ type: "text", text: "S1" },
-					{ type: "image", data: "blob:sha256:source-image", mimeType: "image/png" },
+					{ type: "image", data: "aW1hZ2U=", mimeType: "image/png" },
 				],
 				timestamp: 1000,
 				historyRewriteAt: 1000,
@@ -178,6 +178,29 @@ describe("ConversationSummaryArchive", () => {
 		const missingSummary = item.archive({ messages: archivedTurns(5, 2), summary: "unsafe", windowTail: 1 });
 		const missingAfter = await decodeCheckpointSummaryState(item.store, "agent-x", item.state(3, [missingSummary.reference]));
 		expect(resolveEffectiveSummaryCoverage(missingAfter!, projectSourceHistoryUnits(compacted), compacted)).toBeUndefined();
+
+		const unrelated = item.archive({
+			messages: [
+				{ role: "user", content: [{ type: "text", text: "X" }] },
+				{ role: "assistant", content: [{ type: "text", text: "unrelated" }] },
+				...archivedTurns(5, 2),
+			],
+			summary: "unsafe",
+			windowTail: 1,
+		});
+		const unrelatedAfter = await decodeCheckpointSummaryState(item.store, "agent-x", item.state(3, [unrelated.reference]));
+		expect(resolveEffectiveSummaryCoverage(unrelatedAfter!, projectSourceHistoryUnits(compacted), compacted)).toBeUndefined();
+
+		const unrelatedStandalone = item.archive({
+			messages: [
+				{ role: "user", content: [{ type: "text", text: "X" }] },
+				...archivedTurns(5, 2),
+			],
+			summary: "unsafe",
+			windowTail: 1,
+		});
+		const standaloneAfter = await decodeCheckpointSummaryState(item.store, "agent-x", item.state(3, [unrelatedStandalone.reference]));
+		expect(resolveEffectiveSummaryCoverage(standaloneAfter!, projectSourceHistoryUnits(compacted), compacted)).toBeUndefined();
 	});
 
 	test("fails closed when a referenced archive or model message blob is absent", async () => {

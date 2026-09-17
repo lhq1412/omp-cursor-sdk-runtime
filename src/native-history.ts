@@ -108,6 +108,12 @@ interface DecodedModelMessage {
 	role: string;
 	anchors: string[];
 	supported: boolean;
+	userParts?: string[];
+}
+interface DecodedArchiveInteraction {
+	anchors: string[];
+	userParts: string[];
+	hasResponse: boolean;
 }
 
 export interface DecodedCursorSummaryArchive {
@@ -193,6 +199,26 @@ function textParts(content: unknown): string[] {
 			: [];
 	});
 }
+function decodedUserParts(content: unknown): string[] | undefined {
+	const parts = typeof content === "string" ? [{ type: "text", text: content }] : content;
+	if (!Array.isArray(parts)) return;
+	const decoded: string[] = [];
+	for (const part of parts) {
+		if (!part || typeof part !== "object") return;
+		const record = part as Record<string, unknown>;
+		if (record.type === "text" && typeof record.text === "string") {
+			const text = record.text.trim();
+			if (text) decoded.push(JSON.stringify(["text", text]));
+			continue;
+		}
+		if (record.type !== "image" || typeof record.image !== "string" || typeof record.mediaType !== "string") return;
+		const prefix = `data:${record.mediaType};base64,`;
+		if (!record.image.startsWith(prefix)) return;
+		decoded.push(JSON.stringify(["image", record.mediaType, record.image.slice(prefix.length)]));
+	}
+	return decoded;
+}
+
 
 function decodeModelMessage(bytes: Uint8Array): DecodedModelMessage | undefined {
 	try {
@@ -200,8 +226,10 @@ function decodeModelMessage(bytes: Uint8Array): DecodedModelMessage | undefined 
 		if (!message || typeof message !== "object" || Array.isArray(message) || typeof message.role !== "string") return;
 		const anchors: string[] = [];
 		let supported = message.role === "system";
+		let userParts: string[] | undefined;
 		if (message.role === "user") {
 			const content = message.content;
+			userParts = decodedUserParts(content);
 			supported = typeof content === "string" || (Array.isArray(content) && content.every((part) =>
 				part && typeof part === "object" && (part as Record<string, unknown>).type === "text" &&
 				typeof (part as Record<string, unknown>).text === "string"));
@@ -256,7 +284,7 @@ function decodeModelMessage(bytes: Uint8Array): DecodedModelMessage | undefined 
 				])));
 			}
 		}
-		return { role: message.role, anchors, supported };
+		return { role: message.role, anchors, supported, ...(userParts ? { userParts } : {}) };
 	} catch {
 		return;
 	}
@@ -317,19 +345,27 @@ function archiveInteractions(
 	index: number,
 	expandPrevious: boolean,
 	seen = new Set<number>(),
-): { interactions: string[][]; previous: number[] } | undefined {
+): { interactions: DecodedArchiveInteraction[]; previous: number[] } | undefined {
 	if (seen.has(index)) return;
 	seen.add(index);
 	const archive = archives[index];
 	if (!archive) return;
-	const interactions: string[][] = [];
+	const interactions: DecodedArchiveInteraction[] = [];
 	const previous: number[] = [];
 	let current: string[] | undefined;
+	let currentUserParts: string[] = [];
+	let currentHasResponse = false;
 	let currentSupported = false;
 	const finishCurrent = () => {
 		if (!current) return;
-		interactions.push(currentSupported && current.length > 1 ? current : []);
+		interactions.push({
+			anchors: currentSupported && current.length > 1 ? current : [],
+			userParts: currentUserParts,
+			hasResponse: currentHasResponse,
+		});
 		current = undefined;
+		currentUserParts = [];
+		currentHasResponse = false;
 		currentSupported = false;
 	};
 	for (let messageIndex = 0; messageIndex < archive.summarizedMessages.length; messageIndex += 1) {
@@ -348,8 +384,10 @@ function archiveInteractions(
 		if (message.role === "user") {
 			finishCurrent();
 			current = [...message.anchors];
+			currentUserParts = message.userParts ?? [];
 			currentSupported = message.supported && message.anchors.length === 1;
 		} else if (current) {
+			currentHasResponse = true;
 			current.push(...message.anchors);
 			currentSupported = currentSupported && message.supported;
 		}
@@ -403,6 +441,30 @@ function sourceUnitAnchors(unit: SourceHistoryUnit, messages: Context["messages"
 	}
 	return sawUser && !pendingTools.size && anchors.length > 1 ? anchors : [];
 }
+function sourceSummaryParts(unit: SourceHistoryUnit, messages: Context["messages"]): string[] | undefined {
+	if (unit.startMessageIndex !== unit.endMessageIndex) return;
+	const message = messages[unit.startMessageIndex];
+	if (!message || message.role !== "user") return;
+	if (typeof message.content === "string") {
+		const text = message.content.trim();
+		return text ? [JSON.stringify(["text", text])] : undefined;
+	}
+	const content = message.content;
+	if (!Array.isArray(content)) return;
+	const parts: string[] = [];
+	for (const part of content) {
+		if (part.type === "text") {
+			const text = part.text.trim();
+			if (text) parts.push(JSON.stringify(["text", text]));
+		} else if (part.type === "image") {
+			parts.push(JSON.stringify(["image", part.mimeType, part.data]));
+		} else {
+			return;
+		}
+	}
+	return parts.length ? parts : undefined;
+}
+
 
 function anchorsEqual(left: string[], right: string[]): boolean {
 	if (left.length !== right.length) return false;
@@ -427,10 +489,19 @@ export function resolveEffectiveSummaryCoverage(
 	const latestIndex = archives.length - 1;
 	const latest = archives[latestIndex]!;
 	if (!latest.summary) return;
-	const hasMaterializedSummary = sourceUnits[0]?.kind === "compaction-summary";
-	const expanded = archiveInteractions(archives, latestIndex, !hasMaterializedSummary);
+	const materializedSummary = sourceUnits[0]?.kind === "compaction-summary" ? sourceUnits[0] : undefined;
+	const expanded = archiveInteractions(archives, latestIndex, !materializedSummary);
 	if (!expanded) return;
-	const importedMaterializedSummary = hasMaterializedSummary && expanded.previous.length === 0;
+	const firstInteraction = expanded.interactions[0];
+	const summaryParts = materializedSummary ? sourceSummaryParts(materializedSummary, messages) : undefined;
+	const importedMaterializedSummary = expanded.previous.length === 0 &&
+		firstInteraction !== undefined &&
+		!firstInteraction.hasResponse &&
+		summaryParts !== undefined &&
+		firstInteraction.userParts.length >= summaryParts.length &&
+		summaryParts.every((part, index) =>
+			firstInteraction.userParts[firstInteraction.userParts.length - summaryParts.length + index] === part);
+	if (materializedSummary && expanded.previous.length === 0 && !importedMaterializedSummary) return;
 	const interactions = importedMaterializedSummary ? expanded.interactions.slice(1) : expanded.interactions;
 	const units: CursorCoverageUnit[] = expanded.previous.map((previous) => ({
 		kind: "previous-summary",
@@ -451,7 +522,7 @@ export function resolveEffectiveSummaryCoverage(
 		const source = turnUnits[matchedTurns]!;
 		const required = requiredByUnit.get(source) ?? [];
 		if (!required.length || signatureCounts.get(required.join("\0")) !== 1) break;
-		if (!anchorsEqual(required, interactions[matchedTurns]!)) break;
+		if (!anchorsEqual(required, interactions[matchedTurns]!.anchors)) break;
 		units.push({ kind: "history-turn", sourceUnitOrdinal: source.ordinal });
 		matchedTurns += 1;
 	}
