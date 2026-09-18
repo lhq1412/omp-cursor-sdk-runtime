@@ -250,6 +250,37 @@ describe("ConversationSummaryArchive", () => {
 		expect(resolveEffectiveSummaryCoverage(after!, projectSourceHistoryUnits(messages), messages)).toBeUndefined();
 	});
 
+	test("covers a tool interaction whose imported result text kept a trailing newline", async () => {
+		const item = fixture();
+		const toolCallId = nativeToolCallId("call-1");
+		const archive = item.archive({
+			messages: [
+				{ role: "user", content: [{ type: "text", text: "inspect" }] },
+				{ role: "assistant", content: [{ type: "tool-call", toolCallId, toolName: "read", input: { path: "a" } }] },
+				{ role: "tool", id: toolCallId, content: [{ type: "tool-result", toolCallId, toolName: "read", result: "---\nexit_code: 0\n---\n" }] },
+				{ role: "assistant", content: [{ type: "text", text: "final" }] },
+			],
+			summary: "trailing newline",
+			windowTail: 1,
+		});
+		const after = await decodeCheckpointSummaryState(item.store, "agent-x", item.state(2, [archive.reference]));
+		const messages: Context["messages"] = [
+			{ role: "user", content: "inspect", timestamp: 1 } as Context["messages"][number],
+			{
+				...conversation(1)[1],
+				content: [{ type: "toolCall", id: "call-1", name: "read", arguments: { path: "a" } }],
+				timestamp: 2,
+			} as Context["messages"][number],
+			{ role: "toolResult", toolCallId: "call-1", toolName: "read", content: [{ type: "text", text: "---\nexit_code: 0\n---" }], isError: false, timestamp: 3 } as Context["messages"][number],
+			{ ...conversation(1)[1], content: [{ type: "text", text: "final" }], timestamp: 4 } as Context["messages"][number],
+			...conversation(1, 2),
+		];
+		expect(resolveEffectiveSummaryCoverage(after!, projectSourceHistoryUnits(messages), messages)).toMatchObject({
+			summary: "trailing newline",
+			summarizedTurnCount: 1,
+		});
+	});
+
 	test("does not stitch omitted source text across later archive interaction boundaries", async () => {
 		const item = fixture();
 		const archive = item.archive({
