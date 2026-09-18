@@ -1,13 +1,14 @@
-import { createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
+import { closeSync, fstatSync, openSync, readSync } from "node:fs";
 import { resolve as resolvePath } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import { CURSOR_SESSION_AGENT_RESUME_ENTRY_TYPE } from "./constants.js";
 import type { BindingState } from "./contracts.js";
-import type { SendState } from "./context.js";
+import { emptySendState, type SendState } from "./context.js";
 import { getCursorSessionOwner, getCursorSessionScopeKey, sessionEvents, type CursorSessionOwner } from "./session-scope.js";
 
-export const RESUME_ENTRY_VERSION = 3;
+export const RESUME_ENTRY_VERSION = 4;
+const MAX_RESUME_CONFIRMATION_BYTES = 64 * 1024;
 
 export interface ResumeStoreIdentity {
 	version: 1;
@@ -24,7 +25,7 @@ export interface ResumeSessionEntry {
 }
 
 export interface ResumeEntryData {
-	version: 1 | 2 | 3;
+	version: 1 | 2 | 3 | 4;
 	runtime: "local";
 	agentId: string;
 	scopeKey: string;
@@ -40,6 +41,7 @@ export interface ResumeEntryData {
 	state?: BindingState;
 	agentInstanceId?: string;
 	credentialScopeId?: string;
+	persistenceId?: string;
 }
 
 export interface ResumeScope {
@@ -127,7 +129,7 @@ function parseBindingState(value: unknown): BindingState | undefined {
 export function parseResumeEntryData(value: unknown): ResumeEntryData | undefined {
 	const record = asRecord(value);
 	if (!record) return undefined;
-	if (record.version !== 1 && record.version !== 2 && record.version !== 3) return undefined;
+	if (record.version !== 1 && record.version !== 2 && record.version !== 3 && record.version !== 4) return undefined;
 	if (record.runtime !== "local") return undefined;
 	if (
 		!isLocalAgentId(record.agentId) ||
@@ -145,6 +147,12 @@ export function parseResumeEntryData(value: unknown): ResumeEntryData | undefine
 	if (record.sessionId !== undefined && typeof record.sessionId !== "string") return undefined;
 	const storeIdentity = parseStoreIdentity(record.storeIdentity);
 	if (record.version >= 2 && !storeIdentity) return undefined;
+	if (
+		record.version >= 4
+		&& (typeof record.persistenceId !== "string" || !record.persistenceId || record.persistenceId.length > 128)
+	) {
+		return undefined;
+	}
 	return {
 		version: record.version,
 		runtime: "local",
@@ -168,6 +176,7 @@ export function parseResumeEntryData(value: unknown): ResumeEntryData | undefine
 		...(typeof record.credentialScopeId === "string" && record.credentialScopeId
 			? { credentialScopeId: record.credentialScopeId }
 			: {}),
+		...(typeof record.persistenceId === "string" ? { persistenceId: record.persistenceId } : {}),
 	};
 }
 
@@ -202,31 +211,60 @@ function parseResumeLine(value: unknown): ResumeEntryData | undefined {
 	return parseResumeEntryData(record.data ?? record);
 }
 
-/** Latest on-disk resume record for this lineage must match the in-flight payload. */
-export function sessionFileContainsResume(sessionFile: string, data: ResumeEntryData): boolean {
-	let text: string;
+function readBoundedLastLine(sessionFile: string): string | undefined {
+	let fd: number | undefined;
 	try {
-		text = readFileSync(sessionFile, "utf8");
+		fd = openSync(sessionFile, "r");
+		const size = fstatSync(fd).size;
+		if (size <= 0) return;
+		const length = Math.min(size, MAX_RESUME_CONFIRMATION_BYTES);
+		const position = size - length;
+		const buffer = Buffer.allocUnsafe(length);
+		let offset = 0;
+		while (offset < length) {
+			const bytesRead = readSync(fd, buffer, offset, length - offset, position + offset);
+			if (bytesRead === 0) break;
+			offset += bytesRead;
+		}
+		const tail = buffer.subarray(0, offset).toString("utf8").trimEnd();
+		if (!tail) return;
+		const lineStart = tail.lastIndexOf("\n") + 1;
+		if (position > 0 && lineStart === 0) return;
+		return tail.slice(lineStart).trim();
+	} catch {
+		return;
+	} finally {
+		if (fd !== undefined) {
+			try {
+				closeSync(fd);
+			} catch {
+				// The confirmation already fails closed on open/read errors.
+			}
+		}
+	}
+}
+
+/** The bounded on-disk tail must end with the exact in-flight append. */
+export function sessionFileContainsResume(sessionFile: string, data: ResumeEntryData): boolean {
+	const line = readBoundedLastLine(sessionFile);
+	if (!line) return false;
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(line);
 	} catch {
 		return false;
 	}
-	let latest: ResumeEntryData | undefined;
-	const lineage = resumeLineageKey(data);
-	for (const line of text.split("\n")) {
-		const trimmed = line.trim();
-		if (!trimmed) continue;
-		let parsed: unknown;
-		try {
-			parsed = JSON.parse(trimmed);
-		} catch {
-			continue;
-		}
-		const entry = parseResumeLine(parsed);
-		if (!entry || resumeLineageKey(entry) !== lineage) continue;
-		latest = entry;
-	}
+	const latest = parseResumeLine(parsed);
 	return Boolean(
-		latest && latest.state === data.state && latest.agentId === data.agentId && latest.createdAt === data.createdAt,
+		latest
+		&& resumeLineageKey(latest) === resumeLineageKey(data)
+		&& latest.state === data.state
+		&& latest.createdAt === data.createdAt
+		&& (
+			data.persistenceId
+				? latest.persistenceId === data.persistenceId
+				: latest.agentId === data.agentId
+		),
 	);
 }
 
@@ -384,12 +422,16 @@ function resumeEntryFromPending(pending: PendingResumeHandle): ResumeEntryData {
 		poolKey: pending.poolKey,
 		branchPathHash: state.branchPathHash,
 		compactionGeneration: state.compactionGeneration,
-		sendState: { ...pending.sendState },
+		// Invalid bindings are never reusable, so their growing legacy fingerprint
+		// is unnecessary. This also lets old messageHashes[] sessions migrate
+		// through one bounded in-flight record before the next compact commit.
+		sendState: pending.state === "committed" ? { ...pending.sendState } : emptySendState(),
 		createdAt: new Date().toISOString(),
 		storeIdentity: { ...pending.storeIdentity },
 		state: pending.state,
 		agentInstanceId: pending.agentInstanceId,
 		...(pending.credentialScopeId ? { credentialScopeId: pending.credentialScopeId } : {}),
+		persistenceId: randomUUID(),
 	};
 }
 
@@ -512,6 +554,7 @@ export function clearResumeHandle(): void {
 
 export const __testUtils = {
 	EMPTY_BRANCH_HASH,
+	MAX_RESUME_CONFIRMATION_BYTES,
 	reset() {
 		const state = getResumeState();
 		state.appendEntry = undefined;
