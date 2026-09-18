@@ -141,6 +141,9 @@ describe("send policy", () => {
 			{ role: "user", content: "Already executed request", timestamp: 3 },
 		] as Context["messages"]);
 		const legacy = JSON.parse(computeContextFingerprint(ctx));
+		delete legacy.formatVersion;
+		delete legacy.messageCount;
+		delete legacy.prefixDigest;
 		legacy.messageHashes = ctx.messages.map((message, index) =>
 			new Bun.CryptoHasher("sha256").update(`${index}:${message.role}:${JSON.stringify(message)}`).digest("hex").slice(0, 16),
 		);
@@ -469,6 +472,31 @@ describe("send policy", () => {
 		const ctx = context(firstUser, ["first", "second"]);
 		const equivalent = context(firstUser, "first\nsecond");
 		expect(computeContextFingerprint(equivalent)).toBe(computeContextFingerprint(ctx));
+	});
+
+	test("keeps the persisted fingerprint bounded while validating the complete prefix", () => {
+		const short = context([{ role: "user", content: "first", timestamp: 1 }]);
+		const long = context(Array.from({ length: 1_000 }, (_, index) => ({
+			role: "user" as const,
+			content: `message-${index}`,
+			timestamp: index,
+		})));
+		const shortFingerprint = computeContextFingerprint(short);
+		const longFingerprint = computeContextFingerprint(long);
+		expect(longFingerprint.length).toBe(shortFingerprint.length + 3);
+		expect(JSON.parse(longFingerprint)).toMatchObject({
+			format: "native-checkpoint-v1",
+			formatVersion: 2,
+			messageCount: 1_000,
+		});
+
+		const changed = structuredClone(long);
+		changed.messages[500] = { role: "user", content: "changed", timestamp: 500 };
+		expect(planSend({
+			bootstrapped: true,
+			contextFingerprint: longFingerprint,
+			incrementalSendCount: 999,
+		}, changed)).toMatchObject({ mode: "bootstrap", reason: "context_divergence" });
 	});
 
 	test("captures historical arguments and images before later context mutation", () => {

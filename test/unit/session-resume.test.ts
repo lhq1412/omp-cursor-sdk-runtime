@@ -12,6 +12,7 @@ import {
 	persistResumeHandle,
 	flushResumeHandleNow,
 	registerCursorSessionResume,
+	sessionFileContainsResume,
 	__testUtils as resumeTestUtils,
 	type ResumeEntryData,
 	type ResumeSessionEntry,
@@ -83,6 +84,24 @@ describe("session resume fold", () => {
 		expect(parseResumeEntryData(validData())?.agentId).toBe("agent-local-1");
 		expect(parseResumeEntryData({ ...validData(), runtime: "cloud" })).toBeUndefined();
 		expect(parseResumeEntryData({ ...validData(), agentId: "bc-cloud" })).toBeUndefined();
+	});
+
+	test("requires a bounded persistence identity on v4 entries", () => {
+		const data = { ...validData(), version: 4 as const, persistenceId: "write-1" };
+		expect(parseResumeEntryData(data)?.persistenceId).toBe("write-1");
+		expect(parseResumeEntryData({ ...data, persistenceId: "" })).toBeUndefined();
+		expect(parseResumeEntryData({ ...data, persistenceId: "x".repeat(129) })).toBeUndefined();
+	});
+
+	test("confirms only the bounded final JSONL record", () => {
+		const sessionFile = join(mkdtempSync(join(tmpdir(), "omp-csr-tail-")), "session.jsonl");
+		const data = { ...validData(), version: 4 as const, persistenceId: "write-tail" };
+		writeFileSync(sessionFile, `${"x".repeat(resumeTestUtils.MAX_RESUME_CONFIRMATION_BYTES * 2)}\n${
+			JSON.stringify({ type: "custom", customType: CURSOR_SESSION_AGENT_RESUME_ENTRY_TYPE, data })
+		}\n`);
+		expect(sessionFileContainsResume(sessionFile, data)).toBe(true);
+		appendFileSync(sessionFile, `${JSON.stringify({ type: "custom", customType: "other", data: {} })}\n`);
+		expect(sessionFileContainsResume(sessionFile, data)).toBe(false);
 	});
 
 	test("keeps a handle that matches the current branch hash and compaction generation", () => {
@@ -268,7 +287,10 @@ describe("session resume fold", () => {
 			credentialScopeId: "cred-1",
 		});
 		expect(appended).toHaveLength(1);
-		expect(parseResumeEntryData(appended[0]?.data)?.state).toBe("in-flight");
+		expect(parseResumeEntryData(appended[0]?.data)).toMatchObject({
+			state: "in-flight",
+			sendState: { bootstrapped: false, contextFingerprint: "", incrementalSendCount: 0 },
+		});
 		expect(getMatchingResumeHandle("main", "cred-1")).toBeUndefined();
 	});
 

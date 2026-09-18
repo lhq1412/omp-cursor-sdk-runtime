@@ -56,6 +56,7 @@ export interface SourceHistoryUnit {
 }
 
 const NATIVE_HISTORY_FORMAT = "native-checkpoint-v1";
+const CONTEXT_FINGERPRINT_VERSION = 2;
 const IMAGE_TOKEN_RESERVE = 4096;
 
 export function registerLegacyCursorToolCallIdMigration(pi: Pick<ExtensionAPI, "on">): void {
@@ -163,11 +164,30 @@ function sanitizeSystemPromptForCursor(systemPrompt: string): string {
 
 export function computeContextFingerprint(context: Context): string {
 	const systemHash = hashValue(serializeSystemPrompt(context.systemPrompt));
-	const messageHashes = context.messages.map((message, index) => {
-		const { role, json } = stableMessageParts(message);
-		return hashValue(`${index}:${role}:${json}`);
+	const messageCount = context.messages.length;
+	const prefixDigest = messagePrefixDigest(context.messages, messageCount);
+	return JSON.stringify({
+		format: NATIVE_HISTORY_FORMAT,
+		formatVersion: CONTEXT_FINGERPRINT_VERSION,
+		systemHash,
+		messageCount,
+		prefixDigest,
 	});
-	return JSON.stringify({ format: NATIVE_HISTORY_FORMAT, systemHash, messageHashes });
+}
+
+function messagePrefixDigest(messages: Context["messages"], messageCount: number): string {
+	const hash = createHash("sha256");
+	for (let index = 0; index < messageCount; index += 1) {
+		const message = messages[index]!;
+		const { role, json } = stableMessageParts(message);
+		hash.update(String(index));
+		hash.update("\0");
+		hash.update(role);
+		hash.update("\0");
+		hash.update(json);
+		hash.update("\0");
+	}
+	return hash.digest("hex");
 }
 
 export function emptySendState(): SendState {
@@ -179,39 +199,74 @@ export function planSend(sendState: SendState, context: Context): SendPlan {
 		return { mode: "bootstrap", resetAgent: false, reason: "initial" };
 	}
 	const previous = parseFingerprint(sendState.contextFingerprint);
-	const current = parseFingerprint(computeContextFingerprint(context));
-	if (!previous || !current) {
+	if (!previous) {
 		return { mode: "bootstrap", resetAgent: true, reason: "context_divergence" };
 	}
-	if (current.messageHashes.length < previous.messageHashes.length) {
+	if (context.messages.length < previous.messageCount) {
 		return { mode: "bootstrap", resetAgent: true, reason: "context_divergence" };
 	}
-	for (let index = 0; index < previous.messageHashes.length; index += 1) {
-		if (current.messageHashes[index] !== previous.messageHashes[index]) {
-			// Older v1 fingerprints include host metadata. Accept only an exact raw-message match.
-			const message = context.messages[index]!;
-			if (previous.messageHashes[index] === hashValue(`${index}:${message.role}:${JSON.stringify(message)}`)) continue;
+	if (previous.kind === "digest") {
+		if (messagePrefixDigest(context.messages, previous.messageCount) !== previous.prefixDigest) {
 			return { mode: "bootstrap", resetAgent: true, reason: "context_divergence" };
 		}
+	} else {
+		for (let index = 0; index < previous.messageHashes.length; index += 1) {
+			const message = context.messages[index]!;
+			const { role, json } = stableMessageParts(message);
+			if (hashValue(`${index}:${role}:${json}`) !== previous.messageHashes[index]) {
+				// Older v1 fingerprints include host metadata. Accept only an exact raw-message match.
+				if (previous.messageHashes[index] === hashValue(`${index}:${message.role}:${JSON.stringify(message)}`)) continue;
+				return { mode: "bootstrap", resetAgent: true, reason: "context_divergence" };
+			}
+		}
 	}
-	const continuation = current.messageHashes.length === previous.messageHashes.length ? { continueOnly: true as const } : {};
-	if (current.systemHash !== previous.systemHash) {
+	const continuation = context.messages.length === previous.messageCount ? { continueOnly: true as const } : {};
+	if (hashValue(serializeSystemPrompt(context.systemPrompt)) !== previous.systemHash) {
 		return { mode: "bootstrap", resetAgent: true, reason: "context_divergence", ...continuation };
 	}
-	if (current.messageHashes.length > previous.messageHashes.length) {
-		if (suffixRequiresBootstrap(context.messages, previous.messageHashes.length)) {
+	if (context.messages.length > previous.messageCount) {
+		if (suffixRequiresBootstrap(context.messages, previous.messageCount)) {
 			return { mode: "bootstrap", resetAgent: true, reason: "context_divergence" };
 		}
 	}
 	return { mode: "incremental", resetAgent: false, reason: "incremental", ...continuation };
 }
 
-function parseFingerprint(value: string): { systemHash: string; messageHashes: string[] } | undefined {
+type ParsedFingerprint =
+	| { kind: "digest"; systemHash: string; messageCount: number; prefixDigest: string }
+	| { kind: "legacy"; systemHash: string; messageCount: number; messageHashes: string[] };
+
+function parseFingerprint(value: string): ParsedFingerprint | undefined {
 	try {
-		const parsed = JSON.parse(value) as { format?: unknown; systemHash?: unknown; messageHashes?: unknown };
-		if (parsed.format !== NATIVE_HISTORY_FORMAT || typeof parsed.systemHash !== "string" || !Array.isArray(parsed.messageHashes)) return undefined;
-		if (!parsed.messageHashes.every((item) => typeof item === "string")) return undefined;
-		return { systemHash: parsed.systemHash, messageHashes: parsed.messageHashes };
+		const parsed = JSON.parse(value) as {
+			format?: unknown;
+			formatVersion?: unknown;
+			systemHash?: unknown;
+			messageCount?: unknown;
+			prefixDigest?: unknown;
+			messageHashes?: unknown;
+		};
+		if (parsed.format !== NATIVE_HISTORY_FORMAT || typeof parsed.systemHash !== "string") return undefined;
+		if (
+			parsed.formatVersion === CONTEXT_FINGERPRINT_VERSION
+			&& Number.isSafeInteger(parsed.messageCount)
+			&& (parsed.messageCount as number) >= 0
+			&& typeof parsed.prefixDigest === "string"
+		) {
+			return {
+				kind: "digest",
+				systemHash: parsed.systemHash,
+				messageCount: parsed.messageCount as number,
+				prefixDigest: parsed.prefixDigest,
+			};
+		}
+		if (!Array.isArray(parsed.messageHashes) || !parsed.messageHashes.every((item) => typeof item === "string")) return undefined;
+		return {
+			kind: "legacy",
+			systemHash: parsed.systemHash,
+			messageCount: parsed.messageHashes.length,
+			messageHashes: parsed.messageHashes,
+		};
 	} catch {
 		return undefined;
 	}
