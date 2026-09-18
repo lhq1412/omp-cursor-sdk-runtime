@@ -279,7 +279,7 @@ function decodeModelMessage(bytes: Uint8Array): DecodedModelMessage | undefined 
 				anchors.push(anchor("tool-result", JSON.stringify([
 					toolCallId,
 					record.toolName,
-					record.result,
+					typeof record.result === "string" ? record.result.trim() : record.result,
 					record.isError === true,
 				])));
 			}
@@ -418,7 +418,8 @@ function sourceUnitAnchors(unit: SourceHistoryUnit, messages: Context["messages"
 			anchors.push(anchor("tool-result", JSON.stringify([
 				id,
 				message.toolName,
-				textParts(message.content).join("\n"),
+				// Importer shape: raw texts joined by "\n"; trimmed on both sides.
+				message.content.map((part) => (part as { text: string }).text).join("\n").trim(),
 				message.isError === true,
 			])));
 			continue;
