@@ -19,7 +19,7 @@ import {
 	bindLiveAbort,
 	getLiveRun,
 } from "./live-run.js";
-import { commitTurn, disposeRuntimeForScope, finishLiveKeepAgent, finishTurnFailed, getRuntimeSlot, prepareTurn, runtimeKey, type PreparedTurn, type RuntimeSlot } from "./session-runtime.js";
+import { commitTurn, disposeRuntimeForScope, finishLiveKeepAgent, finishTurnFailed, getRuntimeSlot, prepareTurn, runtimeKey, warmLocalExecutor, type PreparedTurn, type RuntimeSlot } from "./session-runtime.js";
 import { captureCursorRequestOwner, getCursorSessionCwd, ownerForRequest, withCursorSessionOwner, type CursorSessionOwner } from "./session-scope.js";
 import { withSdkExitSuppressed } from "./sdk-exit-guard.js";
 import { ensureCursorModels, getModelMetadata, buildModelSelection } from "./catalog.js";
@@ -162,6 +162,8 @@ export class ProviderTurnRunner {
 		const cwd = snapshot?.cwd ?? (typeof options?.cwd === "string" && options.cwd ? options.cwd : getCursorSessionCwd());
 		const agentInstanceId = snapshot?.agentInstanceId ?? options?.sessionId ?? DEFAULT_AGENT_INSTANCE_ID;
 		this.apiKey = requireCursorApiKey(typeof options?.apiKey === "string" ? options.apiKey : undefined);
+		// Overlap executor construction with model discovery and agent open; `send()` awaits the shared lease.
+		if (!this.auxiliary) warmLocalExecutor(cwd, this.apiKey, model.id);
 		const rawGranted = snapshot
 			? snapshot.grantedTools
 			: mergeGrantedTools(grantedToolsFromContext(this.context));

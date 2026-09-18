@@ -102,6 +102,8 @@ type CatalogState = {
 
 let state: CatalogState = { key: undefined, metadata: new Map() };
 const catalogsByCredential = new Map<string, Map<string, CursorModelMetadata>>();
+const modelIdsByCredential = new Map<string, string[]>();
+const LOCAL_MODEL_CATALOG_ENV = "CURSOR_SDK_LOCAL_MODEL_CATALOG_JSON";
 let listModelsImpl: ListModels | undefined;
 let catalogMutation: Promise<void> = Promise.resolve();
 let composerFallbackMetadata: Map<string, CursorModelMetadata> | undefined;
@@ -469,9 +471,24 @@ function composerFallbackMap(): Map<string, CursorModelMetadata> {
 
 function registerModelItems(items: readonly ModelListItem[], key?: string, source: CursorModelMetadata["source"] = "sdk"): ProviderModelConfig[] {
 	const projected = projectItems(items, source);
-	if (key) catalogsByCredential.set(key, projected.metadata);
+	if (key) {
+		catalogsByCredential.set(key, projected.metadata);
+		modelIdsByCredential.set(key, items.map((item) => item.id));
+		publishLocalModelCatalog();
+	}
 	state = { key, metadata: projected.metadata };
 	return projected.models;
+}
+
+/**
+ * The SDK re-fetches `/v1/models` inside every `Agent.create`/`Agent.resume` to validate the
+ * selection unless this env var supplies the catalog. Only ids matter for that check, so publish
+ * the union of ids known for every credential; `buildModelSelection` already validates per credential.
+ */
+function publishLocalModelCatalog(): void {
+	const ids = new Set<string>();
+	for (const list of modelIdsByCredential.values()) for (const id of list) ids.add(id);
+	process.env[LOCAL_MODEL_CATALOG_ENV] = JSON.stringify([...ids].map((id) => ({ id })));
 }
 
 function hydrateFallbackIfEmpty(): void {
@@ -574,7 +591,8 @@ export function buildModelSelection(
 
 
 async function listCursorModels(apiKey: string): Promise<readonly ModelListItem[]> {
-	return listModelsImpl ? listModelsImpl(apiKey) : Cursor.models.list({ apiKey });
+	// `return await` attaches the handler synchronously; a bare `return promise` leaves the rejection unhandled for one tick.
+	return await (listModelsImpl ? listModelsImpl(apiKey) : Cursor.models.list({ apiKey }));
 }
 
 async function fetchCursorModelsUnlocked(apiKey: string): Promise<ProviderModelConfig[]> {
@@ -599,13 +617,14 @@ export async function ensureCursorModels(apiKey: string): Promise<void> {
 	const key = credentialScopeId(apiKey);
 	await serializeCatalogMutation(async () => {
 		if ((catalogsByCredential.get(key)?.size ?? 0) > 0) return;
-		try {
+		// Cache-first: a validated private cache serves the first turn; live discovery refreshes behind it.
+		const cached = cacheRoot === null ? undefined : await readModelCache(cacheRoot ?? modelCacheRoot(), key);
+		if (!cached) {
 			await fetchCursorModelsUnlocked(apiKey);
-		} catch (error) {
-			const cached = cacheRoot === null ? undefined : await readModelCache(cacheRoot ?? modelCacheRoot(), key);
-			if (!cached) throw error;
-			registerModelItems(cached, key, "cache");
+			return;
 		}
+		registerModelItems(cached, key, "cache");
+		void fetchCursorModels(apiKey).catch(() => undefined);
 	});
 }
 
@@ -621,6 +640,8 @@ export const __testUtils = {
 	resetCatalog(): void {
 		state = { key: undefined, metadata: new Map() };
 		catalogsByCredential.clear();
+		modelIdsByCredential.clear();
+		delete process.env[LOCAL_MODEL_CATALOG_ENV];
 		listModelsImpl = undefined;
 		catalogMutation = Promise.resolve();
 		cacheRoot = null;
