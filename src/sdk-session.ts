@@ -1,6 +1,6 @@
 import "./sdk-exit-guard.js";
 import { nativeReadHooked } from "./sdk-native-hook.js";
-import { Agent, JsonlLocalAgentStore, type AgentOptions, type LocalAgentStore, type ModelSelection, type SDKAgent, type SDKCustomTool } from "@cursor/sdk";
+import { Agent, JsonlLocalAgentStore, createAgentPlatform, type AgentOptions, type LocalAgentStore, type ModelSelection, type SDKAgent, type SDKCustomTool } from "@cursor/sdk";
 import type { Context } from "@oh-my-pi/pi-ai";
 import { buildNativeHistory } from "./native-history.js";
 import { SDK_NATIVE_DISALLOWED_TOOLS } from "./constants.js";
@@ -63,6 +63,16 @@ export function buildAgentOptions(input: OpenAgentInput): AgentOptions {
 
 export function openJsonlStore(rootDir: string): LocalAgentStore {
 	return new JsonlLocalAgentStore(rootDir);
+}
+
+/**
+ * Build the SDK local executor ahead of the first `send()` and return its release. The SDK caches
+ * executors by the option shape `buildAgentOptions` emits (cwd, credential, settingSources, mcpServers,
+ * enableAgentRetries), so warm through the same builder; tools and model are not part of that key.
+ */
+export function prewarmLocalExecutor(input: Pick<OpenAgentInput, "apiKey" | "cwd" | "model" | "store">): Promise<() => Promise<void>> {
+	const options = buildAgentOptions({ ...input, customTools: {}, includeNativeTools: [] });
+	return createAgentPlatform({ localStore: input.store }).then((platform) => platform.prewarmLocalWorkspace(options));
 }
 
 async function disposeFreshAgent(agent: SDKAgent, input: OpenAgentInput): Promise<void> {

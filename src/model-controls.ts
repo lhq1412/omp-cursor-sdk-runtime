@@ -116,7 +116,7 @@ function modelLabel(model: { id: string; provider?: string } | undefined): strin
 	return model.provider ? `${model.provider}/${model.id}` : model.id;
 }
 
-async function resolveRegistryApiKey(
+export async function resolveRegistryApiKey(
 	ctx: Pick<ExtensionCommandContext, "modelRegistry">,
 ): Promise<string | undefined> {
 	const key = await ctx.modelRegistry.getApiKeyForProvider(CURSOR_SDK_PROVIDER_ID);

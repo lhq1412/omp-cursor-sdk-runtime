@@ -7,8 +7,9 @@ import {
 	onAgentEnd,
 	onSessionBeforeCompact,
 } from "./native-summary-compaction.js";
+import { resolveRegistryApiKey } from "./model-controls.js";
 import { getCursorSessionOwner, sessionEvents } from "./session-scope.js";
-import { disposeRuntimeForScope, disposeRuntimeForShutdown, invalidateRuntime } from "./session-runtime.js";
+import { disposeRuntimeForScope, disposeRuntimeForShutdown, invalidateRuntime, warmLocalExecutor } from "./session-runtime.js";
 
 export function registerCursorSessionLifecycle(pi: Pick<ExtensionAPI, "on">): void {
 	const on = sessionEvents(pi);
@@ -19,6 +20,12 @@ export function registerCursorSessionLifecycle(pi: Pick<ExtensionAPI, "on">): vo
 		getCursorSessionOwner().generation++;
 		await disposeRuntimeForScope();
 	};
+	on("session_start", async (_event, ctx) => {
+		const model = ctx.model;
+		if (model?.provider !== CURSOR_SDK_PROVIDER_ID) return;
+		const apiKey = await resolveRegistryApiKey(ctx).catch(() => undefined);
+		if (apiKey) warmLocalExecutor(ctx.cwd, apiKey, model.id);
+	});
 	on("session_shutdown", async (_event, ctx) => {
 		clearCoordinator(sessionId(ctx), ctx);
 		getCursorSessionOwner().generation++;

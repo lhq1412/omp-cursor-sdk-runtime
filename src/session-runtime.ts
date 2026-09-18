@@ -20,7 +20,7 @@ import { trailingToolResults } from "./omp-tools.js";
 import { withSdkExitSuppressed } from "./sdk-exit-guard.js";
 import { createSummaryBoundaryProbe, type SummaryBoundaryProbe } from "./native-history.js";
 import { nativeSdkToolsFromGrants, nativeToolsFingerprint, isHookedOmpTool } from "./sdk-native-hook.js";
-import { openAgent, type OpenAgentInput } from "./sdk-session.js";
+import { openAgent, prewarmLocalExecutor, type OpenAgentInput } from "./sdk-session.js";
 import { flushResumeHandleNow, getMatchingResumeHandle, persistResumeHandle, type ResumeStoreIdentity } from "./session-resume.js";
 import { getCursorSessionCwd, getCursorSessionOwner, getCursorSessionScopeKey, withCursorSessionOwner, type CursorSessionOwner } from "./session-scope.js";
 import { observeLocalAgentStore, openScopedJsonlStore, storeRootForScope } from "./store.js";
@@ -65,6 +65,35 @@ export interface NativeRebaseResult {
 
 const slots = new Map<string, RuntimeSlot>();
 let openAgentImpl: (input: OpenAgentInput) => Promise<SDKAgent> = openAgent;
+let prewarmImpl: typeof prewarmLocalExecutor = prewarmLocalExecutor;
+
+interface ExecutorLease {
+	fingerprint: string;
+	release: Promise<() => Promise<void>>;
+}
+/** scopeKey → held SDK executor lease; keeps the workspace runtime warm across agent disposals. */
+const executorLeases = new Map<string, ExecutorLease>();
+
+/** Start (or keep) the SDK local executor for this scope's cwd + credential. Failures are ignored; `send()` rebuilds. */
+export function warmLocalExecutor(cwd: string, apiKey: string, modelId: string, scopeKey = getCursorSessionScopeKey()): void {
+	cwd = normalizeRuntimeCwd(cwd);
+	const fingerprint = `${cwd}\0${credentialScopeId(apiKey)}`;
+	const current = executorLeases.get(scopeKey);
+	if (current?.fingerprint === fingerprint) return;
+	if (current) void releaseExecutorLease(scopeKey);
+	const release = withSdkExitSuppressed(() =>
+		prewarmImpl({ apiKey, cwd, model: { id: modelId }, store: openScopedJsonlStore(cwd, scopeKey) }),
+	);
+	release.catch(() => undefined);
+	executorLeases.set(scopeKey, { fingerprint, release });
+}
+
+function releaseExecutorLease(scopeKey: string): Promise<void> {
+	const lease = executorLeases.get(scopeKey);
+	if (!lease) return Promise.resolve();
+	executorLeases.delete(scopeKey);
+	return lease.release.then((release) => withSdkExitSuppressed(release), () => undefined);
+}
 
 export function runtimeKey(scopeKey = getCursorSessionScopeKey(), agentInstanceId = DEFAULT_AGENT_INSTANCE_ID): string {
 	return liveRunKey(scopeKey, agentInstanceId);
@@ -201,7 +230,8 @@ function persistDirtyHandle(slot: RuntimeSlot, handle: {
 	}
 }
 
-async function persistDirtyAndDisposeAgent(slot: RuntimeSlot): Promise<void> {
+/** Resets slot state synchronously; the returned agent disposal may run concurrently with the next open. */
+function persistDirtyAndDisposeAgent(slot: RuntimeSlot): Promise<void> {
 	const dirty = resumePending(slot, "dirty");
 	if (dirty) persistDirtyHandle(slot, dirty);
 	const agent = slot.agent;
@@ -214,7 +244,7 @@ async function persistDirtyAndDisposeAgent(slot: RuntimeSlot): Promise<void> {
 	slot.summaryProbe = undefined;
 	slot.committedContextTail = undefined;
 	slot.pendingNativeRebase = undefined;
-	if (agent) await disposeAgent(agent);
+	return agent ? disposeAgent(agent) : Promise.resolve();
 }
 
 function invalidateBindingBeforeSend(slot: RuntimeSlot, agentId: string): void {
@@ -354,11 +384,9 @@ export async function prepareTurn(input: OpenRuntimeTurnInput): Promise<Prepared
 		if (slots.get(slot.key) !== slot) throw new Error("Cursor SDK preparation was superseded");
 	};
 	try {
-		if (existingLive || unsafeBinding) {
-			await Promise.all([
-				existingLive ? disposeLiveRun(slot.key, "OMP started a new user turn", false) : undefined,
-				unsafeBinding ? persistDirtyAndDisposeAgent(slot) : undefined,
-			]);
+		if (unsafeBinding) void persistDirtyAndDisposeAgent(slot);
+		if (existingLive) {
+			await disposeLiveRun(slot.key, "OMP started a new user turn", false);
 			assertCurrent();
 		}
 		if (resumeHandle && !slot.agent) {
@@ -372,8 +400,7 @@ export async function prepareTurn(input: OpenRuntimeTurnInput): Promise<Prepared
 		}
 		if (plan.resetAgent) {
 			if (slot.agent) {
-				await persistDirtyAndDisposeAgent(slot);
-				assertCurrent();
+				void persistDirtyAndDisposeAgent(slot);
 			} else if (resumeHandle) {
 				persistDirtyHandle(slot, resumeHandle);
 				slot.bindingState = "dirty";
@@ -529,6 +556,7 @@ export async function disposeRuntimeForScope(scopeKey = getCursorSessionScopeKey
 		await disposeLiveRun(key, "session scope closed", false);
 		if (slot.agent) await disposeAgent(slot.agent);
 	}
+	await releaseExecutorLease(scopeKey);
 }
 
 export async function disposeRuntimeForShutdown(): Promise<void> {
@@ -540,10 +568,15 @@ export const __testUtils = {
 	clear() {
 		for (const slot of slots.values()) slot.preparation?.abort();
 		slots.clear();
+		executorLeases.clear();
 		openAgentImpl = openAgent;
+		prewarmImpl = prewarmLocalExecutor;
 	},
 	slots,
-	setOpenAgent(fn: (input: OpenAgentInput) => Promise<SDKAgent>) {
+	executorLeases,
+	/** Fake agents never own a real SDK executor, so prewarm becomes a no-op unless overridden. */
+	setOpenAgent(fn: (input: OpenAgentInput) => Promise<SDKAgent>, prewarm: typeof prewarmLocalExecutor = async () => async () => undefined) {
 		openAgentImpl = fn;
+		prewarmImpl = prewarm;
 	},
 };
