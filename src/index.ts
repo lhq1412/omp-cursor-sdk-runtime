@@ -1,5 +1,4 @@
 import "./sdk-exit-guard.js";
-import "./sdk-native-hook.js";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import { CURSOR_API_KEY_ENV_VAR, CURSOR_SDK_API, CURSOR_SDK_PROVIDER_ID } from "./constants.js";
 import { fallbackModels, fetchCursorModels } from "./catalog.js";
@@ -12,7 +11,6 @@ import { registerHostToolCatalog } from "./tool-catalog.js";
 import { recordDynamicModelFetch, registerModelControls } from "./model-controls.js";
 import { sanitizeCursorProviderError } from "./errors.js";
 import { registerLegacyCursorToolCallIdMigration } from "./context.js";
-import { registerCursorWebSearchTool } from "./web-search-tool.js";
 import { registerCursorUsage } from "./usage-command.js";
 import { cursorSdkUsageProvider } from "./usage-provider.js";
 
@@ -20,7 +18,6 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	registerCursorSessionResume(pi);
 	registerCursorSessionLifecycle(pi);
 	registerHostToolCatalog(pi);
-	registerCursorWebSearchTool(pi);
 	registerModelControls(pi);
 	registerCursorUsage(pi);
 	registerLegacyCursorToolCallIdMigration(pi);

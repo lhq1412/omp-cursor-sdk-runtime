@@ -444,6 +444,82 @@ describe("provider late events after park and abort", () => {
 		expect(bTerminal.message.usage.contextTokens).toBeUndefined();
 	});
 
+	test("stale A continuation cannot cancel newer parked B", async () => {
+		const waitA = deferred<RunResult>();
+		const waitB = deferred<RunResult>();
+		const parks: Promise<unknown>[] = [];
+		runtime.__testUtils.setOpenAgent(async () => {
+			const agentId = `agent-${opens.length + 1}`;
+			opens.push(agentId);
+			return {
+				agentId,
+				async [Symbol.asyncDispose]() {},
+				async send(_message: unknown, options?: SendOptions) {
+					sends.push(agentId);
+					const tools = options?.local?.customTools ?? {};
+					if (agentId === "agent-1") {
+						parks.push(tools.a.execute({ path: "a.ts" }, { toolCallId: "call-a" }));
+						return { supports: () => false, wait: () => waitA.promise } as unknown as Run;
+					}
+					const execution = tools.b.execute({ path: "b.ts" }, { toolCallId: "call-b" });
+					parks.push(execution);
+					void execution.then(
+						() => waitB.resolve({ status: "finished", result: "B answer" } as RunResult),
+						waitB.reject,
+					);
+					return { supports: () => false, wait: () => waitB.promise } as unknown as Run;
+				},
+			} as unknown as SDKAgent;
+		});
+
+		const controller = new AbortController();
+		const aEvents = await bounded(collect(owned({ apiKey: "test-key", signal: controller.signal }), {
+			messages: [PARK_CONTEXT.messages[0]!],
+			tools: [TOOL_A],
+		}));
+		const aTerminal = expectOneTerminal(aEvents);
+		expect(aTerminal).toMatchObject({ type: "done", reason: "toolUse" });
+		if (aTerminal.type !== "done") throw new Error("expected A toolUse");
+		controller.abort();
+		await Promise.allSettled(parks);
+
+		const bContext: Context = {
+			messages: [{ role: "user", content: "request B", timestamp: 2 }],
+			tools: [TOOL_B],
+		};
+		const bParkedEvents = await bounded(collect(owned({ apiKey: "test-key" }), bContext));
+		const bParkedTerminal = expectOneTerminal(bParkedEvents);
+		expect(bParkedTerminal).toMatchObject({ type: "done", reason: "toolUse" });
+		if (bParkedTerminal.type !== "done") throw new Error("expected B toolUse");
+		const bLive = getLiveRun(runtime.runtimeKey());
+		expect(bLive?.parked.map((call) => call.sdkToolCallId)).toEqual(["call-b"]);
+		expect(bLive?.cancelled).toBe(false);
+
+		const staleEvents = await bounded(collect(owned({ apiKey: "test-key" }), {
+			messages: [
+				PARK_CONTEXT.messages[0]!,
+				aTerminal.message,
+				toolResultMessage("call-a", "a"),
+			],
+			tools: [TOOL_A],
+		}));
+		expect(expectOneTerminal(staleEvents)).toMatchObject({ type: "error", reason: "error" });
+		expect(getLiveRun(runtime.runtimeKey())).toBe(bLive);
+		expect(bLive?.parked.map((call) => call.sdkToolCallId)).toEqual(["call-b"]);
+		expect(bLive?.cancelled).toBe(false);
+
+		const bEvents = await bounded(collect(owned({ apiKey: "test-key" }), {
+			messages: [
+				bContext.messages[0]!,
+				bParkedTerminal.message,
+				toolResultMessage("call-b", "b"),
+			],
+			tools: [TOOL_B],
+		}));
+		expect(expectOneTerminal(bEvents)).toMatchObject({ type: "done", reason: "stop" });
+		expect(JSON.stringify(bEvents)).toContain("B answer");
+	});
+
 	test("abort before send handle and terminal then start B isolates late A events", async () => {
 		const sendA = deferred<Run>();
 		const waitA = deferred<RunResult>();
@@ -671,7 +747,7 @@ describe("provider grant fail-closed", () => {
 		rmSync(cwd, { recursive: true, force: true });
 	});
 
-	test("parked continuation fails closed when webSearch grant is revoked", async () => {
+	test("parked continuation fails closed when the tool contract changes", async () => {
 		runtime.__testUtils.setOpenAgent(async () => ({
 			agentId: "agent-1",
 			async [Symbol.asyncDispose]() {},
@@ -684,10 +760,9 @@ describe("provider grant fail-closed", () => {
 				} as unknown as Run;
 			},
 		} as unknown as SDKAgent));
-		const webSearch = { name: "web_search", description: "search", parameters: { type: "object", properties: { query: { type: "string" } } } } as Tool;
 		const parkContext: Context = {
 			messages: [{ role: "user", content: "request A", timestamp: 1 }],
-			tools: [TOOL_A, webSearch],
+			tools: [TOOL_A, TOOL_B],
 		};
 		const parked = await bounded(collect({ apiKey: "test-key", cwd, onPayload: scopeTestUtils.bindRequest }, parkContext));
 		const terminal = expectOneTerminal(parked);
@@ -700,7 +775,7 @@ describe("provider grant fail-closed", () => {
 		const failed = expectOneTerminal(next);
 		expect(failed.type).toBe("error");
 		if (failed.type !== "error") throw new Error("expected grant error");
-		expect(failed.error.errorMessage).toMatch(/webSearch grant changed/);
+		expect(failed.error.errorMessage).toMatch(/tool contract changed/);
 	});
 });
 

@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { alreadyExecuted, createSharedToolExec } from "../../src/host-exec.ts";
-import { buildCustomTools, ToolBridgeError } from "../../src/tools.ts";
+import { buildCustomTools, buildToolContract, ToolBridgeError } from "../../src/tools.ts";
 import { createFakeHost } from "../helpers/fake-host.ts";
 
 describe("shared tool exec", () => {
@@ -27,7 +27,7 @@ describe("shared tool exec", () => {
 		);
 		await expect(exec.execute("write", { path: "x" }, "call-x")).rejects.toBeInstanceOf(ToolBridgeError);
 		expect(host.calls).toHaveLength(0);
-		const tools = buildCustomTools(host.snapshot().grantedTools, exec.execute, exec.dedupe);
+		const tools = buildCustomTools(buildToolContract(host.snapshot().grantedTools), exec.execute, exec.dedupe);
 		expect(Object.keys(tools)).toEqual(["read"]);
 	});
 });

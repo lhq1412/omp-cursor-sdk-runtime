@@ -76,6 +76,7 @@ describe("session resume fold", () => {
 			agentInstanceId: "main",
 			cwd: "/tmp/project",
 			credentialScopeId: "cred-1",
+			toolContractFingerprint: "tools-fp",
 		})).toThrow(/session changed/);
 		expect(appended).toEqual([]);
 	});
@@ -102,6 +103,13 @@ describe("session resume fold", () => {
 		expect(sessionFileContainsResume(sessionFile, data)).toBe(true);
 		appendFileSync(sessionFile, `${JSON.stringify({ type: "custom", customType: "other", data: {} })}\n`);
 		expect(sessionFileContainsResume(sessionFile, data)).toBe(false);
+	});
+
+	test("parses v5 toolContractFingerprint and rejects incomplete v5", () => {
+		const data = validData({ version: 5, persistenceId: "write-1", toolContractFingerprint: "tools-fp" });
+		expect(parseResumeEntryData(data)?.toolContractFingerprint).toBe("tools-fp");
+		expect(parseResumeEntryData({ ...data, toolContractFingerprint: undefined })).toBeUndefined();
+		expect(parseResumeEntryData({ ...data, toolContractFingerprint: "" })).toBeUndefined();
 	});
 
 	test("keeps a handle that matches the current branch hash and compaction generation", () => {
@@ -177,6 +185,7 @@ describe("session resume fold", () => {
 			agentInstanceId: "main",
 			cwd: "/tmp/project",
 			credentialScopeId: "cred-1",
+			toolContractFingerprint: "tools-fp",
 		});
 		await handlers.get("turn_end")?.[0]?.({ type: "turn_end" }, ctx);
 		expect(appended).toHaveLength(1);
@@ -184,6 +193,7 @@ describe("session resume fold", () => {
 		expect(parseResumeEntryData(appended[0]?.data)?.agentId).toBe("agent-local-1");
 		expect(parseResumeEntryData(appended[0]?.data)?.state).toBe("committed");
 		expect(parseResumeEntryData(appended[0]?.data)?.cwd).toBe(resolve("/tmp/project"));
+		expect(parseResumeEntryData(appended[0]?.data)).toMatchObject({ version: 5, toolContractFingerprint: "tools-fp" });
 	});
 
 	test("session_switch rebinds resume writer for a new owner without session_start", async () => {
@@ -197,6 +207,7 @@ describe("session resume fold", () => {
 			agentInstanceId: "main",
 			cwd: "/tmp/project",
 			credentialScopeId: "cred-1",
+			toolContractFingerprint: "tools-fp",
 		};
 		persistResumeHandle({ ...pending, agentId: "agent-a", state: "committed" });
 		await handlers.get("turn_end")?.[0]?.({ type: "turn_end" }, ctx);
@@ -243,6 +254,7 @@ describe("session resume fold", () => {
 			agentInstanceId: "main",
 			cwd: "/tmp/other",
 			credentialScopeId: "cred-1",
+			toolContractFingerprint: "tools-fp",
 		});
 		expect(parseResumeEntryData(appended[0]?.data)?.cwd).toBe(resolve("/tmp/other"));
 		expect(parseResumeEntryData(appended[0]?.data)?.cwd).not.toBe(resolve("/tmp/project"));
@@ -273,6 +285,7 @@ describe("session resume fold", () => {
 				agentInstanceId: "main",
 				cwd: "/tmp/project",
 				credentialScopeId: "cred-1",
+			toolContractFingerprint: "tools-fp",
 			}),
 		).toThrow(/appendEntry/);
 		const { appended } = registerResume();
@@ -285,6 +298,7 @@ describe("session resume fold", () => {
 			agentInstanceId: "main",
 			cwd: "/tmp/project",
 			credentialScopeId: "cred-1",
+			toolContractFingerprint: "tools-fp",
 		});
 		expect(appended).toHaveLength(1);
 		expect(parseResumeEntryData(appended[0]?.data)).toMatchObject({
@@ -308,6 +322,7 @@ describe("session resume fold", () => {
 				agentInstanceId: "main",
 				cwd: "/tmp/project",
 				credentialScopeId: "cred-1",
+			toolContractFingerprint: "tools-fp",
 			}),
 		).toThrow(/not persisted/);
 		expect(resumeTestUtils.state.activeHandle).toBeUndefined();
@@ -327,6 +342,7 @@ describe("session resume fold", () => {
 				agentInstanceId: "main",
 				cwd: "/tmp/project",
 				credentialScopeId: "cred-1",
+			toolContractFingerprint: "tools-fp",
 			}),
 		).toThrow(/session file/);
 	});
@@ -375,6 +391,7 @@ describe("session resume fold", () => {
 			agentInstanceId: "main",
 			cwd: "/tmp/project",
 			credentialScopeId: "cred-1",
+			toolContractFingerprint: "tools-fp",
 		});
 		expect(appended).toHaveLength(1);
 		expect(parseResumeEntryData(appended[0]?.data)?.state).toBe("in-flight");
@@ -399,6 +416,24 @@ describe("session resume fold", () => {
 		expect(getMatchingResumeHandle("main", "other-cred")).toBeUndefined();
 		resumeTestUtils.state.activeHandle = validData({ state: "committed", credentialScopeId: undefined });
 		expect(getMatchingResumeHandle("main", "cred-1")).toBeUndefined();
+	});
+
+	test("matching with an expected fingerprint keeps v5 and rejects legacy", () => {
+		scopeTestUtils.reset();
+		scopeTestUtils.set("/tmp/project", "/tmp/session.jsonl", "sess-1");
+		resumeTestUtils.reset();
+		resumeTestUtils.state.scopeKey = "/tmp/session.jsonl";
+		resumeTestUtils.state.sessionFile = "/tmp/session.jsonl";
+		resumeTestUtils.state.sessionId = "sess-1";
+		resumeTestUtils.state.cwd = "/tmp/project";
+		resumeTestUtils.state.activeHandle = validData({ version: 5, persistenceId: "write-1", toolContractFingerprint: "tools-fp", state: "committed" });
+		expect(getMatchingResumeHandle("main", "cred-1", "/tmp/project", "tools-fp")?.agentId).toBe("agent-local-1");
+		expect(getMatchingResumeHandle("main", "cred-1", "/tmp/project", "other-fp")).toBeUndefined();
+		resumeTestUtils.state.activeHandle = validData({ state: "committed" });
+		expect(getMatchingResumeHandle("main", "cred-1", "/tmp/project", "tools-fp")).toBeUndefined();
+		expect(getMatchingResumeHandle("main", "cred-1")?.agentId).toBe("agent-local-1");
+		resumeTestUtils.state.activeHandle = validData({ version: 3, toolContractFingerprint: "tools-fp", state: "committed" });
+		expect(getMatchingResumeHandle("main", "cred-1", "/tmp/project", "tools-fp")).toBeUndefined();
 	});
 
 	test("a later in-flight record supersedes an older committed handle on the same lineage", () => {

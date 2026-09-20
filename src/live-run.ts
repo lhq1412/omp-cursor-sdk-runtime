@@ -6,6 +6,7 @@ import { toolResultToHost, trailingToolResults } from "./omp-tools.js";
 import { withSdkExitSuppressed } from "./sdk-exit-guard.js";
 import type { SharedToolExec } from "./host-exec.js";
 import type { RunProjection } from "./projector.js";
+import type { MessageLocator } from "./context.js";
 
 export interface ParkedToolCall {
 	name: string;
@@ -25,6 +26,7 @@ export interface LiveRun {
 	summaryProbe?: SummaryBoundaryProbe;
 	wait: Promise<RunResult>;
 	starting?: Promise<RunResult>;
+	requestLocator?: MessageLocator;
 	parked: ParkedToolCall[];
 	onPark?: () => void;
 	onCancel?: () => void;

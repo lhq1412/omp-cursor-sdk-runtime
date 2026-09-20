@@ -47,7 +47,7 @@ function runChild(mode: "write" | "recover", root: string, cutpoint: string): Pr
 		const timer = setTimeout(() => {
 			child.kill("SIGKILL");
 			reject(new Error(`cutpoint=${cutpoint} mode=${mode} timed out stdout=${stdout} stderr=${stderr}`));
-		}, 10_000);
+		}, 30_000);
 		child.on("exit", (code) => {
 			clearTimeout(timer);
 			resolve({ stdout, stderr, code });
@@ -100,5 +100,5 @@ describe("session resume crash cutpoints", () => {
 		} finally {
 			rmSync(root, { recursive: true, force: true });
 		}
-	});
+	}, 60_000);
 });

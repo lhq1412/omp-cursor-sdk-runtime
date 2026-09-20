@@ -1,5 +1,4 @@
 import "./sdk-exit-guard.js";
-import { nativeReadHooked } from "./sdk-native-hook.js";
 import { Agent, JsonlLocalAgentStore, createAgentPlatform, type AgentOptions, type LocalAgentStore, type ModelSelection, type SDKAgent, type SDKCustomTool } from "@cursor/sdk";
 import type { Context } from "@oh-my-pi/pi-ai";
 import { buildNativeHistory } from "./native-history.js";
@@ -20,8 +19,7 @@ export interface OpenAgentInput {
 	model: ModelSelection;
 	store: LocalAgentStore;
 	customTools: Record<string, SDKCustomTool>;
-	includeWebSearch?: boolean;
-	includeNativeTools?: readonly string[];
+	toolNameMap?: ReadonlyMap<string, string>;
 	savedAgentId?: string;
 	bootstrapHistory?: Context["messages"];
 	signal?: AbortSignal;
@@ -35,15 +33,8 @@ export function assertLocalAgentId(agentId: string | undefined): void {
 
 export function buildAgentOptions(input: OpenAgentInput): AgentOptions {
 	assertLocalAgentId(input.savedAgentId);
-	const nativeTools = nativeReadHooked ? [...new Set(input.includeNativeTools ?? [])] : [];
-	const tools: NonNullable<AgentOptions["tools"]> = [];
-	if (Object.keys(input.customTools).length > 0) tools.push("mcp");
-	if (input.includeWebSearch) tools.push("webSearch");
-	for (const name of nativeTools) {
-		if (!tools.includes(name as (typeof tools)[number])) tools.push(name as (typeof tools)[number]);
-	}
-	const allowed = new Set(nativeTools);
-	const disallowedTools = SDK_NATIVE_DISALLOWED_TOOLS.filter((name) => !allowed.has(name));
+	const tools: NonNullable<AgentOptions["tools"]> = Object.keys(input.customTools).length > 0 ? ["mcp"] : [];
+	const disallowedTools = [...SDK_NATIVE_DISALLOWED_TOOLS];
 	// Capability gap: omit systemPrompt. The live CLI rejects `--system-prompt`.
 	return {
 		apiKey: input.apiKey,
@@ -71,7 +62,7 @@ export function openJsonlStore(rootDir: string): LocalAgentStore {
  * enableAgentRetries), so warm through the same builder; tools and model are not part of that key.
  */
 export function prewarmLocalExecutor(input: Pick<OpenAgentInput, "apiKey" | "cwd" | "model" | "store">): Promise<() => Promise<void>> {
-	const options = buildAgentOptions({ ...input, customTools: {}, includeNativeTools: [] });
+	const options = buildAgentOptions({ ...input, customTools: {} });
 	return createAgentPlatform({ localStore: input.store }).then((platform) => platform.prewarmLocalWorkspace(options));
 }
 
@@ -108,7 +99,7 @@ export async function openAgent(input: OpenAgentInput): Promise<SDKAgent> {
 		throw new Error("Bootstrap history is only supported for a new agent");
 	}
 	const history = input.bootstrapHistory?.length
-		? await buildNativeHistory(input.bootstrapHistory, input.model)
+		? await buildNativeHistory(input.bootstrapHistory, input.model, input.toolNameMap)
 		: undefined;
 	signal?.throwIfAborted();
 	let agent: SDKAgent | undefined;

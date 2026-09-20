@@ -19,12 +19,11 @@ import {
 import { trailingToolResults } from "./omp-tools.js";
 import { withSdkExitSuppressed } from "./sdk-exit-guard.js";
 import { createSummaryBoundaryProbe, type SummaryBoundaryProbe } from "./native-history.js";
-import { nativeSdkToolsFromGrants, nativeToolsFingerprint, isHookedOmpTool } from "./sdk-native-hook.js";
 import { openAgent, prewarmLocalExecutor, type OpenAgentInput } from "./sdk-session.js";
 import { flushResumeHandleNow, getMatchingResumeHandle, persistResumeHandle, type ResumeStoreIdentity } from "./session-resume.js";
 import { getCursorSessionCwd, getCursorSessionOwner, getCursorSessionScopeKey, withCursorSessionOwner, type CursorSessionOwner } from "./session-scope.js";
 import { observeLocalAgentStore, openScopedJsonlStore, storeRootForScope } from "./store.js";
-import { buildCustomTools, newBridgeRunId } from "./tools.js";
+import { buildCustomTools, buildToolContract, newBridgeRunId } from "./tools.js";
 import { ompToolCallId } from "./projector.js";
 
 export interface RuntimeSlot {
@@ -35,8 +34,7 @@ export interface RuntimeSlot {
 	cwd: string;
 	createCwd?: string;
 	credentialScopeId?: string;
-	includeWebSearch?: boolean;
-	nativeTools?: string;
+	toolContractFingerprint?: string;
 	agent?: SDKAgent;
 	sendState: SendState;
 	bindingState: BindingState;
@@ -136,9 +134,6 @@ export function slotIdentityMismatch(slot: RuntimeSlot, cwd: string, nextCredent
 	return normalizeRuntimeCwd(slot.createCwd) !== normalizeRuntimeCwd(cwd) || slot.credentialScopeId !== nextCredentialScopeId;
 }
 
-function grantMismatch(slot: RuntimeSlot, includeWebSearch: boolean | undefined, nativeTools: string): boolean {
-	return Boolean(slot.includeWebSearch) !== Boolean(includeWebSearch) || (slot.nativeTools ?? "") !== nativeTools;
-}
 
 function getOrCreateSlot(scopeKey: string, agentInstanceId: string, cwd: string): RuntimeSlot {
 	const key = runtimeKey(scopeKey, agentInstanceId);
@@ -166,7 +161,6 @@ export interface OpenRuntimeTurnInput {
 	modelLimits: ModelInputLimits;
 	context: Context;
 	grantedTools: readonly GrantedTool[];
-	includeWebSearch?: boolean;
 	host?: OmpHostBridgeV1;
 	signal?: AbortSignal;
 }
@@ -193,7 +187,7 @@ function attachParkExecutor(live: LiveRun, grantedTools: readonly GrantedTool[],
 }
 
 function resumePending(slot: RuntimeSlot, state: BindingState) {
-	if (!slot.agent || !slot.createCwd) return undefined;
+	if (!slot.agent || !slot.createCwd || !slot.toolContractFingerprint) return undefined;
 	return {
 		agentId: slot.agent.agentId,
 		poolKey: slot.agentInstanceId,
@@ -202,6 +196,7 @@ function resumePending(slot: RuntimeSlot, state: BindingState) {
 		state,
 		agentInstanceId: slot.agentInstanceId,
 		cwd: slot.createCwd,
+		toolContractFingerprint: slot.toolContractFingerprint,
 		...(slot.credentialScopeId ? { credentialScopeId: slot.credentialScopeId } : {}),
 	};
 }
@@ -212,7 +207,10 @@ function persistDirtyHandle(slot: RuntimeSlot, handle: {
 	storeIdentity?: ResumeStoreIdentity;
 	credentialScopeId?: string;
 	cwd: string;
+	toolContractFingerprint?: string;
 }): void {
+	const toolContractFingerprint = slot.toolContractFingerprint ?? handle.toolContractFingerprint;
+	if (!toolContractFingerprint) return;
 	const dirty = {
 		agentId: handle.agentId,
 		poolKey: slot.agentInstanceId,
@@ -222,6 +220,7 @@ function persistDirtyHandle(slot: RuntimeSlot, handle: {
 		agentInstanceId: slot.agentInstanceId,
 		cwd: handle.cwd,
 		...(handle.credentialScopeId ? { credentialScopeId: handle.credentialScopeId } : {}),
+		toolContractFingerprint,
 	};
 	try {
 		withCursorSessionOwner(slot.owner, () => flushResumeHandleNow(dirty));
@@ -239,6 +238,7 @@ function persistDirtyAndDisposeAgent(slot: RuntimeSlot): Promise<void> {
 	slot.bindingState = "dirty";
 	slot.createCwd = undefined;
 	slot.credentialScopeId = undefined;
+	slot.toolContractFingerprint = undefined;
 	slot.sendState = emptySendState();
 	slot.store = undefined;
 	slot.summaryProbe = undefined;
@@ -248,9 +248,11 @@ function persistDirtyAndDisposeAgent(slot: RuntimeSlot): Promise<void> {
 }
 
 function invalidateBindingBeforeSend(slot: RuntimeSlot, agentId: string): void {
-	if (!slot.createCwd) {
-		throw new Error("Cannot invalidate a Cursor SDK binding without the agent's execution cwd");
+	if (!slot.createCwd || !slot.toolContractFingerprint) {
+		throw new Error("Cannot invalidate a Cursor SDK binding without its execution cwd and tool contract");
 	}
+	const createCwd = slot.createCwd;
+	const toolContractFingerprint = slot.toolContractFingerprint;
 	withCursorSessionOwner(slot.owner, () => flushResumeHandleNow({
 		agentId,
 		poolKey: slot.agentInstanceId,
@@ -258,7 +260,8 @@ function invalidateBindingBeforeSend(slot: RuntimeSlot, agentId: string): void {
 		storeIdentity: slot.storeIdentity,
 		state: "in-flight",
 		agentInstanceId: slot.agentInstanceId,
-		cwd: slot.createCwd!,
+		cwd: createCwd,
+		toolContractFingerprint,
 		...(slot.credentialScopeId ? { credentialScopeId: slot.credentialScopeId } : {}),
 	}));
 	slot.bindingState = "in-flight";
@@ -330,21 +333,35 @@ export async function prepareTurn(input: OpenRuntimeTurnInput): Promise<Prepared
 	const scopeKey = getCursorSessionScopeKey();
 	const cwd = normalizeRuntimeCwd(input.cwd || getCursorSessionCwd());
 	const nextCredential = credentialScopeId(input.apiKey);
+	const toolContract = buildToolContract(input.grantedTools);
 	let slot = getOrCreateSlot(scopeKey, input.agentInstanceId, cwd);
 	const existingLive = getLiveRun(slot.key);
 	const trailing = trailingToolResults(input.context);
-	const continuing = Boolean(existingLive && trailing.length > 0);
+	const parkedByOmpId = existingLive
+		? new Map(existingLive.parked.map((call) => [call.ompToolCallId, call]))
+		: undefined;
+	const continuing = Boolean(
+		existingLive
+		&& trailing.length > 0
+		&& trailing.every((result) => parkedByOmpId?.get(result.toolCallId)?.name === result.toolName),
+	);
+	if (existingLive && trailing.length > 0 && !continuing) {
+		const ownsContinuation = existingLive.requestLocator
+			? findUniqueMessageIndex(input.context.messages, existingLive.requestLocator) !== undefined
+			: false;
+		if (existingLive.parked.length > 0 && ownsContinuation) {
+			await finishTurnFailed(slot, "mismatched parked tool results");
+		}
+		throw new Error("OMP tool results do not match the current parked Cursor SDK calls");
+	}
 
 	if (existingLive && continuing) {
-		const nextNativeTools = nativeToolsFingerprint(input.grantedTools.map((tool) => tool.name));
-		if (slotIdentityMismatch(slot, cwd, nextCredential) || grantMismatch(slot, input.includeWebSearch, nextNativeTools)) {
-			await finishTurnFailed(slot, "tool grant or identity changed during parked tool calls");
+		if (slotIdentityMismatch(slot, cwd, nextCredential) || slot.toolContractFingerprint !== toolContract.fingerprint) {
+			await finishTurnFailed(slot, "tool contract or identity changed during parked tool calls");
 			throw new Error(
 				slotIdentityMismatch(slot, cwd, nextCredential)
 					? "Cannot continue parked Cursor SDK tool calls after cwd or credentials changed"
-					: Boolean(slot.includeWebSearch) !== Boolean(input.includeWebSearch)
-						? "Cannot continue parked Cursor SDK tool calls after webSearch grant changed"
-						: "Cannot continue parked Cursor SDK tool calls after native tool grants changed",
+					: "Cannot continue parked Cursor SDK tool calls after the OMP tool contract changed",
 			);
 		}
 		return { slot, live: existingLive, continuing: true, customTools: {}, incremental: true };
@@ -355,11 +372,12 @@ export async function prepareTurn(input: OpenRuntimeTurnInput): Promise<Prepared
 		throw new Error("Cannot open a Cursor SDK agent without a model selection");
 	}
 
-	const nextNativeTools = nativeToolsFingerprint(input.grantedTools.map((tool) => tool.name));
 	const configMismatch = agentConfigMismatch(slot, cwd, nextCredential)
-		|| Boolean(slot.agent) && grantMismatch(slot, input.includeWebSearch, nextNativeTools);
+		|| Boolean(slot.agent) && slot.toolContractFingerprint !== toolContract.fingerprint;
 	const unsafeBinding = Boolean(slot.agent) && (slot.bindingState !== "committed" || configMismatch);
-	const resumeHandle = unsafeBinding ? undefined : getMatchingResumeHandle(input.agentInstanceId, nextCredential, cwd);
+	const resumeHandle = unsafeBinding
+		? undefined
+		: getMatchingResumeHandle(input.agentInstanceId, nextCredential, cwd, toolContract.fingerprint);
 	const sendState = unsafeBinding ? emptySendState() : slot.agent ? slot.sendState : resumeHandle?.sendState ?? emptySendState();
 	const plannedSlot: RuntimeSlot = { ...slot, sendState: { ...sendState } };
 	const nativeRebase = !unsafeBinding && trailing.length === 0 && plannedSlot.pendingNativeRebase
@@ -368,7 +386,7 @@ export async function prepareTurn(input: OpenRuntimeTurnInput): Promise<Prepared
 	const plan = trailing.length > 0
 		? { mode: "bootstrap" as const, resetAgent: true, reason: "context_divergence" as const }
 		: planSend(plannedSlot.sendState, input.context);
-	const { prompt, history } = prepareSendInput(plan, input.context, input.modelLimits, modelSelection.id);
+	const { prompt, history } = prepareSendInput(plan, input.context, input.modelLimits, modelSelection.id, toolContract.guidance);
 	if (!unsafeBinding) {
 		slot.sendState = { ...plannedSlot.sendState };
 		slot.pendingNativeRebase = plannedSlot.pendingNativeRebase;
@@ -395,6 +413,7 @@ export async function prepareTurn(input: OpenRuntimeTurnInput): Promise<Prepared
 			slot.createCwd = resumeHandle.cwd;
 			slot.credentialScopeId = resumeHandle.credentialScopeId;
 			slot.storeIdentity = resumeHandle.storeIdentity ?? slot.storeIdentity;
+			slot.toolContractFingerprint = resumeHandle.toolContractFingerprint;
 		} else if (!slot.agent) {
 			slot.sendState = emptySendState();
 		}
@@ -406,6 +425,7 @@ export async function prepareTurn(input: OpenRuntimeTurnInput): Promise<Prepared
 				slot.bindingState = "dirty";
 				slot.createCwd = undefined;
 				slot.credentialScopeId = undefined;
+				slot.toolContractFingerprint = undefined;
 				slot.sendState = emptySendState();
 			}
 		}
@@ -431,12 +451,11 @@ export async function prepareTurn(input: OpenRuntimeTurnInput): Promise<Prepared
 		const live = createLiveRun(createSharedToolExec(input.grantedTools, async () => {
 			throw new Error("tool executor is not attached");
 		}, newBridgeRunId()));
+		const requestMessage = input.context.messages.at(-trailing.length - 1);
+		live.requestLocator = requestMessage ? locatorFor(requestMessage) : undefined;
 		const toolExec = attachParkExecutor(live, input.grantedTools, input.host);
-		const sdkToOmp = new Map<string, string>();
-		const grantedNames = input.grantedTools.map((tool) => tool.name);
-		const customGranted = input.grantedTools.filter((tool) => !isHookedOmpTool(tool.name, grantedNames));
-		const customTools = buildCustomTools(customGranted, toolExec.execute, toolExec.dedupe, sdkToOmp);
-		live.projection.sdkToOmp = sdkToOmp;
+		const customTools = buildCustomTools(toolContract, toolExec.execute, toolExec.dedupe);
+		live.projection.sdkToOmp = new Map(toolContract.sdkToOmp);
 		live.projection.allowToolPreview = !input.host;
 
 		if (!slot.agent) {
@@ -447,8 +466,7 @@ export async function prepareTurn(input: OpenRuntimeTurnInput): Promise<Prepared
 					model: modelSelection,
 					store,
 					customTools,
-					includeWebSearch: input.includeWebSearch,
-					includeNativeTools: nativeSdkToolsFromGrants(grantedNames),
+					toolNameMap: toolContract.ompToSdk,
 					savedAgentId,
 					...(!savedAgentId ? { bootstrapHistory: history } : {}),
 					signal,
@@ -461,8 +479,7 @@ export async function prepareTurn(input: OpenRuntimeTurnInput): Promise<Prepared
 			slot.agent = agent;
 			slot.createCwd = cwd;
 			slot.credentialScopeId = nextCredential;
-			slot.includeWebSearch = Boolean(input.includeWebSearch);
-			slot.nativeTools = nextNativeTools;
+			slot.toolContractFingerprint = toolContract.fingerprint;
 		}
 		live.agent = slot.agent;
 		live.checkpointStore = store;
@@ -471,8 +488,7 @@ export async function prepareTurn(input: OpenRuntimeTurnInput): Promise<Prepared
 		slot.bindingState = "in-flight";
 		slot.cwd = cwd;
 		slot.credentialScopeId = nextCredential;
-		slot.includeWebSearch = Boolean(input.includeWebSearch);
-		slot.nativeTools = nextNativeTools;
+		slot.toolContractFingerprint = toolContract.fingerprint;
 
 		return {
 			slot,
@@ -517,6 +533,7 @@ export function markTurnDirty(slot: RuntimeSlot): void {
 	}
 	slot.agent = undefined;
 	slot.sendState = emptySendState();
+	slot.toolContractFingerprint = undefined;
 	slot.store = undefined;
 	slot.summaryProbe = undefined;
 	slot.committedContextTail = undefined;

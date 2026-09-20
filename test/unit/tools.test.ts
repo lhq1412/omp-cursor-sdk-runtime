@@ -1,11 +1,47 @@
+import { createHash } from "node:crypto";
 import { describe, expect, test } from "bun:test";
-import { buildCustomTools, createToolCallDedupe, mapOmpToolName, ToolBridgeError } from "../../src/tools.ts";
+import { buildCustomTools, buildToolContract, createToolCallDedupe, mapOmpToolName, ToolBridgeError } from "../../src/tools.ts";
 import { createFakeHost } from "../helpers/fake-host.ts";
 
+function hashedSdkName(name: string): string {
+	return `omp_${createHash("sha256").update(name).digest("hex").slice(0, 60)}`;
+}
+
 describe("custom tools", () => {
-	test("maps unsafe names without collision", () => {
+	test("maps safe names through and hashes unsafe names deterministically", () => {
 		expect(mapOmpToolName("read")).toBe("read");
-		expect(mapOmpToolName("read file")).toBe("omp_read_file");
+		expect(mapOmpToolName("mcp__server_tool")).toBe("mcp__server_tool");
+		expect(mapOmpToolName("read file")).toBe(hashedSdkName("read file"));
+		expect(mapOmpToolName("read file")).toBe(mapOmpToolName("read file"));
+		expect(mapOmpToolName("read file")).not.toBe(mapOmpToolName("read\tfile"));
+	});
+
+	test("buildToolContract sorts canonically and fingerprints/guidance stay stable", () => {
+		const granted = [
+			{ name: "write", description: "write", inputSchema: { type: "object", properties: { path: { type: "string" } } } },
+			{ name: "read file", description: "read a file", inputSchema: { type: "object", properties: { path: { type: "string" } } } },
+			{ name: "read", description: "read", inputSchema: { type: "object", properties: { path: { type: "string" } } } },
+		] as const;
+		const first = buildToolContract(granted);
+		const second = buildToolContract([...granted].reverse());
+		expect(first.definitions.map((tool) => tool.ompName)).toEqual(["read", "read file", "write"]);
+		expect(first.definitions.map((tool) => tool.sdkName)).toEqual(["read", hashedSdkName("read file"), "write"]);
+		expect(first.fingerprint).toBe(second.fingerprint);
+		expect(first.guidance).toBe(second.guidance);
+		expect(first.guidance).toContain("SDK name: read");
+		expect(first.guidance).toContain(`SDK name: ${hashedSdkName("read file")}`);
+		expect(first.guidance).toContain("OMP name: read file");
+		expect(first.guidance).toContain("Pass arguments exactly as defined by the OMP schema");
+		expect(first.ompToSdk.get("read file")).toBe(hashedSdkName("read file"));
+		expect(first.sdkToOmp.get(hashedSdkName("read file"))).toBe("read file");
+	});
+
+	test("fails closed on invalid or colliding schemas", () => {
+		expect(() => buildToolContract([{ name: "bad", description: "bad", inputSchema: { type: "array" } }])).toThrow(ToolBridgeError);
+		expect(() => buildToolContract([
+			{ name: "read", description: "a", inputSchema: { type: "object" } },
+			{ name: "read", description: "b", inputSchema: { type: "object" } },
+		])).toThrow(/duplicate granted tool read/);
 	});
 
 	test("dedupes by bridgeRunId + toolCallId", async () => {
@@ -70,49 +106,51 @@ describe("custom tools", () => {
 
 	test("does not grant write when the snapshot has only read", async () => {
 		const host = createFakeHost({ tools: ["read"] });
-		const tools = buildCustomTools(host.snapshot().grantedTools, (name, args, toolCallId) => host.executeTool(name, args, toolCallId), createToolCallDedupe("run-1"));
+		const tools = buildCustomTools(
+			buildToolContract(host.snapshot().grantedTools),
+			(name, args, toolCallId) => host.executeTool(name, args, toolCallId),
+			createToolCallDedupe("run-1"),
+		);
 		expect(Object.keys(tools)).toEqual(["read"]);
 		await expect(host.executeTool("write", { path: "x" }, "call-x")).rejects.toThrow(/not granted/);
 	});
 
-	test("rejects empty grep pattern before parking and composes glob into path", async () => {
+	test("passes OMP grep arguments through exactly without rewriting", async () => {
 		const calls: Array<{ name: string; args: Record<string, unknown> }> = [];
+		const contract = buildToolContract([
+			{ name: "grep", description: "grep", inputSchema: { type: "object", additionalProperties: true } },
+		]);
 		const tools = buildCustomTools(
-			[{ name: "grep", description: "grep", inputSchema: { type: "object", additionalProperties: true } }],
+			contract,
 			async (name, args) => {
 				calls.push({ name, args });
 				return { content: [{ type: "text", text: "ok" }], isError: false };
 			},
 			createToolCallDedupe("run-1"),
 		);
-		const missing = await tools.grep.execute({ path: "src" }, { toolCallId: "call-missing" });
-		expect(missing).toEqual({
-			content: [{ type: "text", text: "grep pattern is required (received an empty pattern)." }],
-			isError: true,
-		});
-		const globOnly = await tools.grep.execute({ pattern: "  ", glob: "*.ts" }, { toolCallId: "call-glob" });
-		expect(globOnly).toEqual({
-			content: [{
-				type: "text",
-				text: 'grep pattern is required (received an empty pattern). To list files matching "*.ts", pass a non-empty regex (e.g. ".") and set path to that glob, or use the ls/read tool instead.',
-			}],
-			isError: true,
-		});
+		const empty = await tools.grep.execute({ path: "src" }, { toolCallId: "call-empty" });
+		expect(empty).toEqual({ content: [{ type: "text", text: "ok" }], isError: false });
+		const blankPattern = await tools.grep.execute({ pattern: "  ", glob: "*.ts" }, { toolCallId: "call-blank" });
+		expect(blankPattern).toEqual({ content: [{ type: "text", text: "ok" }], isError: false });
 		const composed = await tools.grep.execute({ pattern: "foo", path: "src", glob: "*.ts" }, { toolCallId: "call-ok" });
 		expect(composed).toEqual({ content: [{ type: "text", text: "ok" }], isError: false });
-		expect(calls).toEqual([{ name: "grep", args: { pattern: "foo", path: "src/*.ts" } }]);
+		expect(calls).toEqual([
+			{ name: "grep", args: { path: "src" } },
+			{ name: "grep", args: { pattern: "  ", glob: "*.ts" } },
+			{ name: "grep", args: { pattern: "foo", path: "src", glob: "*.ts" } },
+		]);
 	});
 
 	test("projects combinators out of advertised custom-tool schemas", () => {
 		const tools = buildCustomTools(
-			[{
+			buildToolContract([{
 				name: "eval",
 				description: "eval",
 				inputSchema: {
 					type: "object",
 					properties: { language: { anyOf: [{ type: "string" }, { type: "null" }] } },
 				},
-			}],
+			}]),
 			async () => ({ content: [], isError: false }),
 			createToolCallDedupe("run-1"),
 		);

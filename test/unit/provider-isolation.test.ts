@@ -15,7 +15,6 @@ import { parseResumeEntryData, registerCursorSessionResume, __testUtils as resum
 import { disposeRuntimeForScope, __testUtils as runtimeTestUtils } from "../../src/session-runtime.ts";
 import { registerCursorSessionScope, __testUtils as scopeTestUtils } from "../../src/session-scope.ts";
 import { createFakeHost } from "../helpers/fake-host.ts";
-import { __testUtils as nativeHookTestUtils } from "../../src/sdk-native-hook.ts";
 
 const ITEMS: ModelListItem[] = [{ id: "composer-2.5", displayName: "Composer 2.5" }];
 const MODEL = { id: "composer-2.5", provider: CURSOR_SDK_PROVIDER_ID, api: CURSOR_SDK_API, contextWindow: 200_000, maxTokens: 8_192 } as Model<Api>;
@@ -32,9 +31,14 @@ async function collect(context: Context, options: SimpleStreamOptions): Promise<
 }
 
 function expectAnswer(events: AssistantMessageEvent[], text: string): void {
-	expect(events.filter((event) => event.type === "error" || event.type === "done")).toMatchObject([
-		{ type: "done", reason: "stop", message: { content: [{ type: "text", text }] } },
-	]);
+	const terminal = events.filter((event) => event.type === "error" || event.type === "done");
+	expect(terminal).toHaveLength(1);
+	expect(terminal[0]).toMatchObject({ type: "done", reason: "stop" });
+	if (terminal[0]?.type !== "done") throw new Error("Expected a successful terminal event");
+	const content = terminal[0].message.content[0];
+	expect(content?.type).toBe("text");
+	if (content?.type !== "text") throw new Error("Expected a text answer");
+	expect(content.text.endsWith(text)).toBe(true);
 }
 
 function continuation(initial: Context, events: AssistantMessageEvent[]): Context {
@@ -69,7 +73,6 @@ describe("provider session isolation through host hooks", () => {
 	let releases: Array<() => void>;
 
 	beforeEach(async () => {
-		nativeHookTestUtils.setNativeHooked(false);
 		cwd = mkdtempSync(join(tmpdir(), "omp-provider-isolation-"));
 		sessions = [];
 		sends = [];
@@ -90,7 +93,6 @@ describe("provider session isolation through host hooks", () => {
 	});
 
 	afterEach(async () => {
-		nativeHookTestUtils.resetNativeHooked();
 		for (const release of releases) release();
 		for (const host of sessions) await host.emit("session_shutdown");
 		for (const scopeKey of new Set([...runtimeTestUtils.slots.values()].map((slot) => slot.scopeKey))) {
@@ -227,10 +229,11 @@ describe("provider session isolation through host hooks", () => {
 		const second = collect(context, { apiKey: "test-key", [HOST_BRIDGE_OPTION_KEY]: secondBridge } as SimpleStreamOptions);
 		await Promise.race([entered.promise, second.then(() => { throw new Error("Second bridged request never entered send"); })]);
 		expect(opened).toBe(1);
-		expect(sends).toEqual([
-			{ agentId: "agent-1", message: { text: "first input" } },
-			{ agentId: "agent-1", message: { text: "second input" } },
-		]);
+		expect(sends).toHaveLength(2);
+		expect(sends[0]?.agentId).toBe("agent-1");
+		expect(sends[0]?.message.text.endsWith("first input")).toBe(true);
+		expect(sends[0]?.message.text).toContain("OMP custom tool contract");
+		expect(sends[1]).toEqual({ agentId: "agent-1", message: { text: "second input" } });
 		const cancellationsBefore = [...cancellations];
 		oldSignal.abort();
 		await new Promise<void>((resolve) => setImmediate(resolve));
@@ -306,7 +309,9 @@ describe("provider session isolation through host hooks", () => {
 		release.resolve();
 		const parked = await parentStream;
 		const next = continuation(replacement, parked);
-		expect(sends).toEqual([{ agentId: "agent-1", message: { text: "replacement parent input" } }]);
+		expect(sends).toHaveLength(1);
+		expect(sends[0]?.agentId).toBe("agent-1");
+		expect(sends[0]?.message.text.endsWith("replacement parent input")).toBe(true);
 		expectAnswer(await collect(userContext("child answer"), child.options), "child answer");
 		await child.emit("turn_end");
 		await child.emit("session_shutdown");
