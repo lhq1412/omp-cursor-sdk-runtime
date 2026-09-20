@@ -28,7 +28,7 @@ test("deep OMP imports require an allowlisted owner and symbol", async () => {
 			].join("\n")),
 			writeFile(join(root, "src/context.ts"), 'import { classifyModel } from "@oh-my-pi/pi-catalog/compat/taxonomy";'),
 			writeFile(join(root, "src/catalog.ts"), 'import { getBundledModel } from "@oh-my-pi/pi-catalog/models";'),
-			writeFile(join(root, "src/sdk-native-hook.ts"), 'import { buildPiFindResult, buildPiLsResult } from "@oh-my-pi/pi-ai/providers/cursor/exec-modern";'),
+			writeFile(join(root, "scripts/omp-contract-probe.ts"), 'import { buildPiFindResult, buildPiLsResult } from "@oh-my-pi/pi-ai/providers/cursor/exec-modern";'),
 		]);
 
 		const allowed = await runChecker(root);
@@ -37,7 +37,7 @@ test("deep OMP imports require an allowlisted owner and symbol", async () => {
 		await Promise.all([
 			writeFile(join(root, "src/native-history.ts"), 'import { buildGrpcRequest, unownedSymbol } from "@oh-my-pi/pi-ai/providers/cursor";'),
 			writeFile(join(root, "src/wrong-owner.ts"), 'import { buildGrpcRequest } from "@oh-my-pi/pi-ai/providers/cursor";'),
-			writeFile(join(root, "src/sdk-native-hook.ts"), 'import { buildPiFindResult, piOutputText } from "@oh-my-pi/pi-ai/providers/cursor/exec-modern";'),
+			writeFile(join(root, "scripts/omp-contract-probe.ts"), 'import { buildPiFindResult, piOutputText } from "@oh-my-pi/pi-ai/providers/cursor/exec-modern";'),
 			writeFile(join(root, "src/unknown.mts"), 'import { unknown } from "@oh-my-pi/pi-utils/private/unknown";'),
 			writeFile(join(root, "src/forms.ts"), [
 				'import * as Namespace from "@oh-my-pi/pi-catalog/models";',
@@ -53,7 +53,7 @@ test("deep OMP imports require an allowlisted owner and symbol", async () => {
 		expect(denied.exitCode).toBe(1);
 		expect(denied.stderr).toContain("src/native-history.ts:1: @oh-my-pi/pi-ai/providers/cursor");
 		expect(denied.stderr).toContain("src/wrong-owner.ts:1: @oh-my-pi/pi-ai/providers/cursor");
-		expect(denied.stderr).toContain("src/sdk-native-hook.ts:1: @oh-my-pi/pi-ai/providers/cursor/exec-modern");
+		expect(denied.stderr).toContain("scripts/omp-contract-probe.ts:1: @oh-my-pi/pi-ai/providers/cursor/exec-modern");
 		expect(denied.stderr).toContain("src/unknown.mts:1: @oh-my-pi/pi-utils/private/unknown");
 		expect(denied.stderr.match(/src\/forms\.ts:\d+:/g)).toHaveLength(6);
 	} finally {

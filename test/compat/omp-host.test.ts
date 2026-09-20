@@ -22,7 +22,6 @@ import { CURSOR_SDK_PROVIDER_ID } from "../../src/constants.ts";
 import cursorPlugin from "../../src/index.ts";
 import { __testUtils as liveRunTestUtils } from "../../src/live-run.ts";
 import { __testUtils as controlsTestUtils } from "../../src/model-controls.ts";
-import { __testUtils as nativeHookTestUtils } from "../../src/sdk-native-hook.ts";
 import { __testUtils as resumeTestUtils } from "../../src/session-resume.ts";
 import { __testUtils as runtimeTestUtils } from "../../src/session-runtime.ts";
 import { __testUtils as scopeTestUtils } from "../../src/session-scope.ts";
@@ -56,7 +55,6 @@ interface CreateHostOptions {
 	cwd?: string;
 	enableEligibleSpeculation?: boolean;
 }
-
 
 interface HostFixture {
 	root: string;
@@ -222,7 +220,6 @@ describe("OMP 18.2 host compatibility", () => {
 	const fixtures: HostFixture[] = [];
 
 	beforeEach(async () => {
-		nativeHookTestUtils.setNativeHooked(false);
 		runtimeTestUtils.clear();
 		liveRunTestUtils.clear();
 		scopeTestUtils.reset();
@@ -242,7 +239,6 @@ describe("OMP 18.2 host compatibility", () => {
 			rmSync(fixture.root, { recursive: true, force: true });
 		}
 		fixtures.length = 0;
-		nativeHookTestUtils.resetNativeHooked();
 		runtimeTestUtils.clear();
 		liveRunTestUtils.clear();
 		scopeTestUtils.reset();

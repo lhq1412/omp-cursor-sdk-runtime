@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { SDK_NATIVE_DISALLOWED_TOOLS, SYSTEM_PROMPT_REPLACEMENT } from "../../src/constants.ts";
 import { emptySendState, planSend, prepareSendInput } from "../../src/context.ts";
 import { buildAgentOptions, CloudAgentRejectedError, openAgent } from "../../src/sdk-session.ts";
+import { mapOmpToolName } from "../../src/tools.ts";
 import { Agent, JsonlLocalAgentStore, type SDKAgent, type LocalAgentRunDocument } from "@cursor/sdk";
 import type { Context } from "@oh-my-pi/pi-ai";
 
@@ -45,49 +46,11 @@ describe("buildAgentOptions", () => {
 			customTools: {},
 		});
 		expect(options.tools).toEqual([]);
-	});
-
-	test("enables only webSearch without custom tools and adds it after mcp otherwise", () => {
-		const input = {
-			apiKey: "test-key",
-			cwd: "/tmp",
-			model: { id: "composer-2.5" },
-			store,
-			customTools: {},
-			includeWebSearch: true,
-		};
-		expect(buildAgentOptions(input).tools).toEqual(["webSearch"]);
-		const options = buildAgentOptions({
-			...input,
-			customTools: {
-				read: {
-					description: "read",
-					execute: async () => ({ content: [{ type: "text", text: "ok" }] }),
-				},
-			},
-		});
-		expect(options.tools).toEqual(["mcp", "webSearch"]);
-		expect(options.disallowedTools).not.toContain("webSearch");
-	});
-
-	test("enables hooked native tools and drops them from disallowedTools", () => {
-		const options = buildAgentOptions({
-			apiKey: "test-key",
-			cwd: "/tmp",
-			model: { id: "composer-2.5" },
-			store,
-			customTools: {},
-			includeNativeTools: ["read", "grep", "shell", "edit", "glob", "ls", "piWrite"],
-		});
-		expect(options.tools).toEqual(expect.arrayContaining(["read", "grep", "shell", "edit", "glob", "ls", "piWrite"]));
-		expect(options.tools).not.toContain("write");
-		expect(options.disallowedTools).not.toContain("read");
-		expect(options.disallowedTools).not.toContain("grep");
-		expect(options.disallowedTools).not.toContain("shell");
-		expect(options.disallowedTools).not.toContain("edit");
-		expect(options.disallowedTools).not.toContain("glob");
-		expect(options.disallowedTools).not.toContain("ls");
-		expect(options.disallowedTools).not.toContain("piWrite");
+		expect(options.disallowedTools).toEqual([...SDK_NATIVE_DISALLOWED_TOOLS]);
+		expect(options.disallowedTools).toContain("webSearch");
+		expect(options.disallowedTools).toContain("read");
+		expect(options.disallowedTools).toContain("grep");
+		expect(options.disallowedTools).toContain("shell");
 	});
 
 	test("rejects cloud agent ids", () => {
@@ -205,6 +168,63 @@ describe("native history bootstrap", () => {
 				});
 			}
 			expect(history).toEqual(original);
+		} finally {
+			await agent[Symbol.asyncDispose]();
+		}
+	});
+
+	test("maps unsafe historical OMP tool names through toolNameMap without changing input", async () => {
+		const fixture = setup();
+		const ompName = "read file";
+		const sdkName = mapOmpToolName(ompName);
+		const history = [
+			{ role: "user", content: "Read the spaced tool", timestamp: 1 },
+			{
+				role: "assistant", provider: "openai", model: "original-model", api: "openai-responses", timestamp: 2,
+				content: [
+					{ type: "toolCall", id: "call:one", name: ompName, arguments: { path: "first.txt" } },
+					{ type: "toolCall", id: "call_one", name: ompName, arguments: { path: "second.txt" } },
+				],
+			},
+			{ role: "toolResult", toolCallId: "call_one", toolName: ompName, content: [{ type: "text", text: "second result" }], isError: false, timestamp: 3 },
+			{ role: "toolResult", toolCallId: "call:one", toolName: ompName, content: [{ type: "text", text: "first result" }], isError: false, timestamp: 4 },
+		] as Context["messages"];
+		const original = structuredClone(history);
+		const agent = await openAgent({
+			...fixture.input,
+			bootstrapHistory: history,
+			toolNameMap: new Map([[ompName, sdkName]]),
+		});
+		try {
+			const messages = await Agent.messages.list(agent.agentId, { cwd: fixture.input.cwd, store: fixture.store });
+			const turn = messages[0]?.message as {
+				turn: { value: { steps: Array<{ message: { value: { toolCallId: string } } }> } };
+			};
+			const steps = turn.turn.value.steps;
+			expect(steps).toHaveLength(2);
+			const ids = steps.map((step) => step.message.value.toolCallId);
+			expect(new Set(ids).size).toBe(2);
+			for (const [index, text] of ["first result", "second result"].entries()) {
+				expect(ids[index]).toMatch(/^[a-zA-Z0-9_-]{1,64}$/);
+				expect(steps[index]).toMatchObject({
+					message: { case: "toolCall", value: {
+						tool: { case: "mcpToolCall", value: {
+							args: {
+								name: sdkName,
+								toolName: sdkName,
+								toolCallId: ids[index],
+								args: { path: { kind: { case: "stringValue", value: index === 0 ? "first.txt" : "second.txt" } } },
+							},
+							result: { result: { case: "success", value: {
+								content: [{ content: { case: "text", value: { text } } }],
+							} } },
+						} },
+					} },
+				});
+			}
+			expect(history).toEqual(original);
+			expect(JSON.stringify(messages)).not.toContain(ompName);
+			expect(JSON.stringify(messages)).toContain(sdkName);
 		} finally {
 			await agent[Symbol.asyncDispose]();
 		}

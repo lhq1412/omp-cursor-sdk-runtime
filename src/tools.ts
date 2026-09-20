@@ -1,8 +1,7 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type { SDKCustomTool, SDKCustomToolResult } from "@cursor/sdk";
 import { sanitizeSchemaForCursor } from "@oh-my-pi/pi-ai";
 import type { GrantedTool, HostToolResult } from "./contracts.js";
-import { toolNameHash } from "./tool-catalog.js";
 
 const SDK_TOOL_NAME = /^[a-zA-Z][a-zA-Z0-9_-]{0,63}$/;
 
@@ -15,26 +14,7 @@ export class ToolBridgeError extends Error {
 
 export function mapOmpToolName(name: string): string {
 	if (SDK_TOOL_NAME.test(name)) return name;
-	const mapped = `omp_${name.replace(/[^a-zA-Z0-9]+/g, "_").replace(/^_+|_+$/g, "")}`;
-	if (SDK_TOOL_NAME.test(mapped)) return mapped;
-	return `omp_${toolNameHash(name)}`;
-}
-
-export function uniqueSdkToolName(name: string, usedNames: Set<string>): string {
-	let mapped = mapOmpToolName(name);
-	if (!usedNames.has(mapped)) {
-		usedNames.add(mapped);
-		return mapped;
-	}
-	const hashed = `${mapped.slice(0, 55)}_${toolNameHash(name)}`.slice(0, 64);
-	let candidate = hashed;
-	let counter = 2;
-	while (usedNames.has(candidate) || !SDK_TOOL_NAME.test(candidate)) {
-		candidate = `omp_${toolNameHash(`${name}:${counter}`)}`;
-		counter += 1;
-	}
-	usedNames.add(candidate);
-	return candidate;
+	return `omp_${createHash("sha256").update(name).digest("hex").slice(0, 60)}`;
 }
 
 export function hostResultToSdk(result: HostToolResult): SDKCustomToolResult {
@@ -49,6 +29,75 @@ export function assertJsonSchemaObject(name: string, schema: Record<string, unkn
 		throw new ToolBridgeError(`Tool ${name} inputSchema must be a JSON Schema object`);
 	}
 }
+export interface ToolContractDefinition {
+	ompName: string;
+	sdkName: string;
+	description: string;
+	inputSchema: SDKCustomTool["inputSchema"];
+}
+
+export interface ToolContract {
+	definitions: readonly ToolContractDefinition[];
+	ompToSdk: ReadonlyMap<string, string>;
+	sdkToOmp: ReadonlyMap<string, string>;
+	guidance: string;
+	fingerprint: string;
+}
+
+function stableJson(value: unknown): string {
+	if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
+	if (value !== null && typeof value === "object") {
+		const entries = Object.entries(value as Record<string, unknown>)
+			.sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0)
+			.map(([key, item]) => `${JSON.stringify(key)}:${stableJson(item)}`);
+		return `{${entries.join(",")}}`;
+	}
+	return JSON.stringify(value) ?? "null";
+}
+
+export function buildToolContract(grantedTools: readonly GrantedTool[]): ToolContract {
+	const definitions: ToolContractDefinition[] = [];
+	const ompToSdk = new Map<string, string>();
+	const sdkToOmp = new Map<string, string>();
+	for (const tool of [...grantedTools].sort((left, right) => left.name < right.name ? -1 : left.name > right.name ? 1 : 0)) {
+		if (ompToSdk.has(tool.name)) throw new ToolBridgeError(`duplicate granted tool ${tool.name}`);
+		assertJsonSchemaObject(tool.name, tool.inputSchema);
+		const inputSchema = sanitizeSchemaForCursor(tool.inputSchema);
+		assertJsonSchemaObject(tool.name, inputSchema);
+		const sdkName = mapOmpToolName(tool.name);
+		const collision = sdkToOmp.get(sdkName);
+		if (collision) throw new ToolBridgeError(`granted tools ${collision} and ${tool.name} map to the same SDK name ${sdkName}`);
+		const definition = {
+			ompName: tool.name,
+			sdkName,
+			description: tool.description,
+			inputSchema: inputSchema as SDKCustomTool["inputSchema"],
+		};
+		definitions.push(definition);
+		ompToSdk.set(tool.name, sdkName);
+		sdkToOmp.set(sdkName, tool.name);
+	}
+	const serializedDefinitions = stableJson(definitions);
+	const guidance = [
+		"OMP custom tool contract: call only tools granted below through the custom-user-tools namespace.",
+		"Policy: OMP validates, approves, executes, and records every call. Native Cursor tools are unavailable. Pass arguments exactly as defined by the OMP schema; do not translate them to Cursor-native tool arguments.",
+		"Granted OMP tools:",
+		...definitions.map((tool) => [
+			`- SDK name: ${tool.sdkName}`,
+			...(tool.sdkName === tool.ompName ? [] : [`  OMP name: ${tool.ompName}`]),
+			`  Description: ${tool.description}`,
+			`  Input schema: ${stableJson(tool.inputSchema)}`,
+		].join("\n")),
+	].join("\n");
+	return {
+		definitions,
+		ompToSdk,
+		sdkToOmp,
+		guidance,
+		fingerprint: createHash("sha256").update(`omp-custom-tools-v1\0${serializedDefinitions}\0${guidance}`).digest("hex"),
+	};
+}
+
 
 export interface ToolCallDedupe {
 	execute(toolCallId: string | undefined, name: string, args: Record<string, unknown>, run: () => Promise<HostToolResult>): Promise<HostToolResult>;
@@ -98,29 +147,19 @@ export type ToolExecutor = (
 ) => Promise<HostToolResult>;
 
 export function buildCustomTools(
-	grantedTools: readonly GrantedTool[],
+	contract: ToolContract,
 	execute: ToolExecutor,
 	dedupe: ToolCallDedupe,
-	sdkToOmp?: Map<string, string>,
 ): Record<string, SDKCustomTool> {
-	const usedNames = new Set<string>();
 	const tools: Record<string, SDKCustomTool> = {};
-	for (const tool of grantedTools) {
-		if (tool.inputSchema.type !== "object") continue;
-		const sdkName = uniqueSdkToolName(tool.name, usedNames);
-		const inputSchema = sanitizeSchemaForCursor(tool.inputSchema);
-		if (inputSchema.type !== "object") continue;
-		sdkToOmp?.set(sdkName, tool.name);
-		tools[sdkName] = {
+	for (const tool of contract.definitions) {
+		tools[tool.sdkName] = {
 			description: tool.description,
-			inputSchema: inputSchema as SDKCustomTool["inputSchema"],
+			inputSchema: tool.inputSchema,
 			async execute(args, context) {
-				const prepared = prepareGrepArgs(tool.name, asRecord(args));
-				if ("error" in prepared) {
-					return hostResultToSdk({ content: [{ type: "text", text: prepared.error }], isError: true });
-				}
-				const result = await dedupe.execute(context.toolCallId, tool.name, prepared.args, () =>
-					execute(tool.name, prepared.args, context.toolCallId ?? ""),
+				const prepared = asRecord(args);
+				const result = await dedupe.execute(context.toolCallId, tool.ompName, prepared, () =>
+					execute(tool.ompName, prepared, context.toolCallId ?? ""),
 				);
 				return hostResultToSdk(result);
 			},
@@ -139,21 +178,3 @@ function asRecord(value: unknown): Record<string, unknown> {
 	return {};
 }
 
-/** Cursor grepArgs: reject empty pattern before OMP validation; compose path only when glob is set. */
-function prepareGrepArgs(name: string, args: Record<string, unknown>): { args: Record<string, unknown> } | { error: string } {
-	if (name !== "grep") return { args };
-	const pattern = args.pattern;
-	const glob = typeof args.glob === "string" ? args.glob : "";
-	if (typeof pattern !== "string" || !pattern.trim()) {
-		if (glob) {
-			return {
-				error: `grep pattern is required (received an empty pattern). To list files matching "${glob}", pass a non-empty regex (e.g. ".") and set path to that glob, or use the ls/read tool instead.`,
-			};
-		}
-		return { error: "grep pattern is required (received an empty pattern)." };
-	}
-	if (!glob) return { args };
-	const next: Record<string, unknown> = { ...args, path: `${typeof args.path === "string" && args.path ? args.path : "."}/${glob}` };
-	delete next.glob;
-	return { args: next };
-}

@@ -24,10 +24,7 @@ import {
 	__testUtils as resumeTestUtils,
 } from "../../src/session-resume.ts";
 import { __testUtils as scopeTestUtils } from "../../src/session-scope.ts";
-import { __testUtils as nativeHookTestUtils } from "../../src/sdk-native-hook.ts";
 import { createFakeHost } from "./fake-host.ts";
-
-nativeHookTestUtils.setNativeHooked(false);
 
 const CUTPOINTS = [
 	"in-flight",

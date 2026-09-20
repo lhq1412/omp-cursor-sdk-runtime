@@ -1,14 +1,11 @@
 import type { Context, Tool, ToolResultMessage } from "@oh-my-pi/pi-ai";
 import { toolWireSchema } from "@oh-my-pi/pi-ai";
 import type { GrantedTool, HostToolResult } from "./contracts.js";
-import { isHookedOmpTool } from "./sdk-native-hook.js";
 
 export function grantedToolsFromContext(context: Context): GrantedTool[] {
 	const granted: GrantedTool[] = [];
-	const names = (context.tools ?? []).map((tool) => tool.name);
 	for (const tool of context.tools ?? []) {
-		if (tool.name === "web_search") continue;
-		if (tool.native && !isHookedOmpTool(tool.name, names)) continue;
+		if (tool.native) continue;
 		granted.push({
 			name: tool.name,
 			description: descriptionFromTool(tool),
@@ -43,15 +40,10 @@ function formatToolExamples(tool: Tool): string {
 }
 
 function schemaFromTool(tool: Tool): Record<string, unknown> {
-	try {
-		const schema = toolWireSchema(tool);
-		if (schema && typeof schema === "object" && schema.type === "object") return schema;
-	} catch {
-		// Fall through to an open object so the tool is still advertised.
-	}
-	return { type: "object", additionalProperties: true };
+	const schema = toolWireSchema(tool);
+	if (schema && typeof schema === "object" && schema.type === "object") return schema;
+	throw new Error(`OMP tool ${tool.name} does not expose an object input schema`);
 }
-
 export function trailingToolResults(context: Context): ToolResultMessage[] {
 	const results: ToolResultMessage[] = [];
 	for (let index = context.messages.length - 1; index >= 0; index -= 1) {

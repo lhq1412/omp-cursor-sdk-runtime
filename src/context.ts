@@ -8,11 +8,9 @@ import {
 	CURSOR_SDK_API,
 	CURSOR_SDK_PROVIDER_ID,
 	SDK_TOOL_CONTEXT,
-	SDK_TOOL_CONTEXT_WITH_READ,
 } from "./constants.js";
 import { CursorBootstrapBudgetError, CursorRecoveryBudgetError } from "./errors.js";
 import { nativeToolCallId, projectSdkToolCallId } from "./tool-call-id.js";
-import { nativeReadHooked } from "./sdk-native-hook.js";
 
 export type SendMode = "bootstrap" | "incremental";
 
@@ -527,7 +525,13 @@ function validateToolResultRecovery(context: Context): number | undefined {
 }
 
 /** Bootstrap instructions stay in the send text; conversation history is imported natively. */
-export function prepareSendInput(plan: SendPlan, context: Context, limits: ModelInputLimits, targetModelId?: string): PreparedSendInput {
+export function prepareSendInput(
+	plan: SendPlan,
+	context: Context,
+	limits: ModelInputLimits,
+	targetModelId?: string,
+	toolGuidance = "",
+): PreparedSendInput {
 	const current = activeUserInput(context, plan.continueOnly);
 	if (plan.mode === "incremental") {
 		if (estimatedTextTokens(current.text) > inputTextBudget(current, limits)) throwContextOverflow();
@@ -551,14 +555,15 @@ export function prepareSendInput(plan: SendPlan, context: Context, limits: Model
 	}
 	const sanitized = sanitizeSystemPromptForCursor(serializeSystemPrompt(context.systemPrompt));
 	const system = sanitized ? `System instructions from OMP:\n${sanitized}\n\n` : "";
+	const tools = toolGuidance ? `${toolGuidance}\n\n` : "";
+	const toolContext = prior.length > 0 ? `${SDK_TOOL_CONTEXT}\n\n` : "";
 	const budget = inputTextBudget(current, limits);
-	const requiredText = system + current.text;
+	const requiredText = system + tools + toolContext + current.text;
 	if (estimatedTextTokens(requiredText) > budget) {
 		if (recoveryStart !== undefined) throw new CursorRecoveryBudgetError();
 		throwContextOverflow();
 	}
-	const toolContext = prior.length > 0 ? `${nativeReadHooked ? SDK_TOOL_CONTEXT_WITH_READ : SDK_TOOL_CONTEXT}\n\n` : "";
-	const text = system + toolContext + current.text;
+	const text = requiredText;
 	if (estimatedTextTokens(text) + estimatedHistoryTokens(prior, targetModelId) > budget) {
 		if (recoveryStart !== undefined) throw new CursorRecoveryBudgetError();
 		throw new CursorBootstrapBudgetError();

@@ -5,6 +5,7 @@ import type { Context } from "@oh-my-pi/pi-ai";
 import { ConversationStateStructureSchema } from "@oh-my-pi/pi-catalog/discovery/cursor-proto";
 import { projectSourceHistoryUnits } from "../../src/context.ts";
 import { nativeToolCallId } from "../../src/tool-call-id.ts";
+import { mapOmpToolName } from "../../src/tools.ts";
 import {
 	ConversationSummaryArchiveSchema,
 	decodeCheckpointSummaryState,
@@ -278,6 +279,41 @@ describe("ConversationSummaryArchive", () => {
 		expect(resolveEffectiveSummaryCoverage(after!, projectSourceHistoryUnits(messages), messages)).toMatchObject({
 			summary: "trailing newline",
 			summarizedTurnCount: 1,
+		});
+	});
+
+	test("matches summarized tools through the native name projection and keeps the tail", async () => {
+		const item = fixture();
+		const toolCallId = nativeToolCallId("call-1");
+		const ompToolName = "read file";
+		const sdkToolName = mapOmpToolName(ompToolName);
+		expect(sdkToolName).not.toBe(ompToolName);
+		const archive = item.archive({
+			messages: [
+				{ role: "user", content: [{ type: "text", text: "inspect" }] },
+				{ role: "assistant", content: [{ type: "tool-call", toolCallId, toolName: sdkToolName, input: { path: "a" } }] },
+				{ role: "tool", id: toolCallId, content: [{ type: "tool-result", toolCallId, toolName: sdkToolName, result: "one" }] },
+				{ role: "assistant", content: [{ type: "text", text: "final" }] },
+			],
+			summary: "mapped tool",
+			windowTail: 1,
+		});
+		const after = await decodeCheckpointSummaryState(item.store, "agent-x", item.state(2, [archive.reference]));
+		const messages: Context["messages"] = [
+			{ role: "user", content: "inspect", timestamp: 1 } as Context["messages"][number],
+			{
+				...conversation(1)[1],
+				content: [{ type: "toolCall", id: "call-1", name: ompToolName, arguments: { path: "a" } }],
+				timestamp: 2,
+			} as Context["messages"][number],
+			{ role: "toolResult", toolCallId: "call-1", toolName: ompToolName, content: [{ type: "text", text: "one" }], isError: false, timestamp: 3 } as Context["messages"][number],
+			{ ...conversation(1)[1], content: [{ type: "text", text: "final" }], timestamp: 4 } as Context["messages"][number],
+			...conversation(1, 2),
+		];
+		expect(resolveEffectiveSummaryCoverage(after!, projectSourceHistoryUnits(messages), messages)).toMatchObject({
+			summary: "mapped tool",
+			summarizedTurnCount: 1,
+			units: [{ kind: "history-turn", sourceUnitOrdinal: 0 }],
 		});
 	});
 

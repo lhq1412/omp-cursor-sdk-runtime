@@ -22,12 +22,16 @@ describe("OMP tools from context", () => {
 		expect(granted[0]?.inputSchema.type).toBe("object");
 	});
 
-	test("does not bridge web_search as a custom tool", () => {
+	test("bridges web_search as a custom tool while skipping true native markers", () => {
 		const granted = grantedToolsFromContext({
 			messages: [],
-			tools: [tool("read"), tool("web_search")],
+			tools: [
+				tool("read"),
+				tool("web_search"),
+				tool("computer", { native: { type: "computer" } as Tool["native"] }),
+			],
 		});
-		expect(granted.map((item) => item.name)).toEqual(["read"]);
+		expect(granted.map((item) => item.name)).toEqual(["read", "web_search"]);
 	});
 
 	test("preserves exact MCP names and schemas from the authoritative context", () => {

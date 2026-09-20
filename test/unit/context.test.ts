@@ -1,6 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { SDK_TOOL_CONTEXT, SDK_TOOL_CONTEXT_WITH_READ } from "../../src/constants.ts";
-import { nativeReadHooked } from "../../src/sdk-native-hook.ts";
+import { SDK_TOOL_CONTEXT } from "../../src/constants.ts";
 import { activeUserInput, activeUserText, computeContextFingerprint, emptySendState, planSend, prepareSendInput, registerLegacyCursorToolCallIdMigration, type ModelInputLimits } from "../../src/context.ts";
 import { CursorBootstrapBudgetError, CursorRecoveryBudgetError } from "../../src/errors.ts";
 import type { ModelSelection } from "@cursor/sdk";
@@ -259,11 +258,35 @@ describe("send policy", () => {
 		);
 		const prepared = bootstrap(ctx);
 		expect(prepared.history).toEqual(ctx.messages.slice(0, -1));
-		expect(prepared.prompt.text).toBe(`System instructions from OMP:\nYou are an OMP agent with extra instructions.\n\n${nativeReadHooked ? SDK_TOOL_CONTEXT_WITH_READ : SDK_TOOL_CONTEXT}\n\ncontinue that edit`);
+		expect(prepared.prompt.text).toBe(`System instructions from OMP:\nYou are an OMP agent with extra instructions.\n\n${SDK_TOOL_CONTEXT}\n\ncontinue that edit`);
 		expect(prepared.prompt.text).not.toContain("/workspace/important.ts");
 		expect(prepareSendInput({ mode: "incremental", resetAgent: false, reason: "incremental" }, ctx, modelLimits)).toEqual({
 			prompt: { text: "continue that edit" },
 		});
+	});
+
+	test("includes supplied tool guidance only on bootstrap sends", () => {
+		const guidance = "OMP custom tool contract: granted tools listed here.";
+		const first = context(firstUser, ["Keep going."]);
+		const boot = prepareSendInput(planSend(emptySendState(), first), first, modelLimits, undefined, guidance);
+		expect(boot.prompt.text).toContain(guidance);
+		expect(boot.prompt.text).toContain("System instructions from OMP:\nKeep going.");
+		expect(boot.prompt.text).toEndWith("\n\nhi");
+
+		const continued = context([
+			{ role: "user", content: "hi", timestamp: 1 } as Context["messages"][number],
+			{ role: "user", content: "again", timestamp: 2 } as Context["messages"][number],
+		]);
+		const incremental = prepareSendInput(
+			{ mode: "incremental", resetAgent: false, reason: "incremental" },
+			continued,
+			modelLimits,
+			undefined,
+			guidance,
+		);
+		expect(incremental.prompt.text).toBe("again");
+		expect(incremental.prompt.text).not.toContain(guidance);
+		expect(incremental.prompt.text).not.toContain(SDK_TOOL_CONTEXT);
 	});
 
 	test("sanitizes structured OMP prompts and falls back when markers are absent", () => {
@@ -421,8 +444,9 @@ describe("send policy", () => {
 		const withImage = context([{ role: "user", content: [{ type: "text", text: "x".repeat(4000) }, { type: "image", data: "abc", mimeType: "image/png" }], timestamp: 1 }]);
 		expect(() => bootstrap(withImage, limits)).toThrow(/context window exceeded/i);
 		const imported = { ...ctx, messages: [...firstUser, ...ctx.messages] };
-		const required = bootstrap(ctx);
+		const required = bootstrap(imported);
 		const requiredTokens = (Buffer.byteLength(required.prompt.text) + 3) >> 2;
+		expect(required.prompt.text).toContain(SDK_TOOL_CONTEXT);
 		expect(() => bootstrap(imported, { contextWindow: 1024 + limits.maxTokens + requiredTokens + 8, maxTokens: limits.maxTokens })).toThrow(CursorBootstrapBudgetError);
 	});
 

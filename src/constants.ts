@@ -7,8 +7,7 @@ export const DEFAULT_MODEL_ID = "composer-2.5";
 /** OMP context-maintenance reserve; advertised model.maxTokens can be 64k. */
 export const BOOTSTRAP_OUTPUT_RESERVE_TOKENS = 16_384;
 
-export const SDK_TOOL_CONTEXT = "Cursor SDK tool access: use the custom-user-tools namespace for any tools granted in this run. Discover their schemas before invoking them. Native Cursor tools are unavailable. Do not call FetchMcpResource or readMcpResource; memory uses granted mcp__* tools or read memory://.";
-export const SDK_TOOL_CONTEXT_WITH_READ = "Cursor SDK tool access: native `read`, `grep`, `shell`, `edit`, `piWrite`, `glob`, and `ls` are available. Other native Cursor tools are unavailable. Use the custom-user-tools namespace for remaining granted tools. Discover their schemas before invoking them. Do not call FetchMcpResource or readMcpResource; memory uses granted mcp__* tools or read memory://.";
+export const SDK_TOOL_CONTEXT = "Cursor SDK tool access: use only the custom-user-tools namespace for tools granted in this run. Native Cursor tools are unavailable. OMP validates, approves, executes, and records every tool call.";
 
 /**
  * Live probe (2026-09-08): this backend rejects `AgentOptions.systemPrompt`
@@ -31,6 +30,16 @@ export const SDK_NATIVE_DISALLOWED_TOOLS = [
 	"task",
 	"readMcpResource",
 	"listMcpResources",
+	"webSearch",
+	"readLints",
+	"webFetch",
+	"semSearch",
+	"updateTodos",
+	"readTodos",
+	"askQuestion",
+	"await",
+	"generateImage",
+	"applyAgentDiff",
 ] as const;
 
 export const FORBIDDEN_IMPORT_PATTERNS = [

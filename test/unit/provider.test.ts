@@ -20,7 +20,7 @@ import { __testUtils as resumeTestUtils } from "../../src/session-resume.ts";
 import { HOST_BRIDGE_OPTION_KEY } from "../../src/host-option.ts";
 import { createFakeHost } from "../helpers/fake-host.ts";
 import { projectSdkToolCallId } from "../../src/tool-call-id.ts";
-import { __testUtils as nativeHookTestUtils } from "../../src/sdk-native-hook.ts";
+import { mapOmpToolName } from "../../src/tools.ts";
 import { storeRootForScope } from "../../src/store.ts";
 
 const COMPOSER: ModelListItem = {
@@ -158,7 +158,6 @@ function seedCatalog(items: ModelListItem[] = [COMPOSER, GPT], listKeys?: string
 describe("streamCursorRuntime model selection", () => {
 	const temporaryPaths: string[] = [];
 	beforeEach(async () => {
-		nativeHookTestUtils.setNativeHooked(false);
 		runtimeTestUtils.clear();
 		liveRunTestUtils.clear();
 		scopeTestUtils.reset();
@@ -170,7 +169,6 @@ describe("streamCursorRuntime model selection", () => {
 	});
 
 	afterEach(() => {
-		nativeHookTestUtils.resetNativeHooked();
 		runtimeTestUtils.clear();
 		liveRunTestUtils.clear();
 		controlsTestUtils.reset();
@@ -736,10 +734,12 @@ describe("streamCursorRuntime model selection", () => {
 		expect(param(sent[0], "fast")).toBe("false");
 	});
 
-	test("stock context web_search enables native webSearch", async () => {
-		const flags: boolean[] = [];
+	test("granted custom tools reach openAgent as customTools and toolNameMap", async () => {
+		let customTools: string[] = [];
+		let toolNameMap: Array<[string, string]> | undefined;
 		runtimeTestUtils.setOpenAgent(async (input) => {
-			flags.push(Boolean(input.includeWebSearch));
+			customTools = Object.keys(input.customTools);
+			toolNameMap = input.toolNameMap ? [...input.toolNameMap.entries()] : undefined;
 			return {
 				agentId: "agent-1",
 				close() {},
@@ -747,18 +747,24 @@ describe("streamCursorRuntime model selection", () => {
 				async send() { return finishedRun(); },
 			} as unknown as SDKAgent;
 		});
-		await drain(cursorModel("composer-2.5", 1_000_000), userContext("hi", [{
-			name: "web_search",
+		const tool = {
+			name: "read file",
 			description: "search",
 			parameters: { type: "object", properties: { query: { type: "string" } } },
-		} as Tool]), { apiKey: "test-key", cwd: "/tmp/project" });
-		expect(flags).toEqual([true]);
+		} as Tool;
+		await drain(cursorModel("composer-2.5", 1_000_000), userContext("hi", [tool]), {
+			apiKey: "test-key",
+			cwd: "/tmp/project",
+		});
+		const sdkName = mapOmpToolName("read file");
+		expect(customTools).toEqual([sdkName]);
+		expect(toolNameMap).toEqual([["read file", sdkName]]);
 	});
 
-	test("host snapshot without web_search ignores context.tools", async () => {
-		const flags: boolean[] = [];
+	test("host snapshot without tools ignores context.tools", async () => {
+		let customTools: string[] = [];
 		runtimeTestUtils.setOpenAgent(async (input) => {
-			flags.push(Boolean(input.includeWebSearch));
+			customTools = Object.keys(input.customTools);
 			return {
 				agentId: "agent-1",
 				close() {},
@@ -766,16 +772,12 @@ describe("streamCursorRuntime model selection", () => {
 				async send() { return finishedRun(); },
 			} as unknown as SDKAgent;
 		});
-		await drain(cursorModel("composer-2.5", 1_000_000), userContext("hi", [{
-			name: "web_search",
-			description: "search",
-			parameters: { type: "object", properties: { query: { type: "string" } } },
-		} as Tool]), {
+		await drain(cursorModel("composer-2.5", 1_000_000), userContext("hi", [readTool()]), {
 			apiKey: "test-key",
 			cwd: "/tmp/project",
 			[HOST_BRIDGE_OPTION_KEY]: createFakeHost({ tools: [] }),
 		} as SimpleStreamOptions);
-		expect(flags).toEqual([false]);
+		expect(customTools).toEqual([]);
 	});
 
 	test("disableReasoning wins over reasoning and still uses catalog context threshold", async () => {

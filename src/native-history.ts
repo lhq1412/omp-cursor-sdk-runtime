@@ -7,12 +7,33 @@ import { ConversationStateStructureSchema } from "@oh-my-pi/pi-catalog/discovery
 import { pb, toBinary, type ProtoMessage } from "@oh-my-pi/pi-catalog/discovery/protobuf";
 import { nativeToolCallId } from "./tool-call-id.js";
 import type { SourceHistoryUnit } from "./context.js";
+import { mapOmpToolName } from "./tools.js";
 
 /** Project history only; the SDK remains responsible for creating and running agents. */
-export async function buildNativeHistory(history: Context["messages"], selection: ModelSelection) {
+export async function buildNativeHistory(
+	history: Context["messages"],
+	selection: ModelSelection,
+	toolNameMap?: ReadonlyMap<string, string>,
+) {
 	const callIds = new Set<string>();
+	const ompBySdk = new Map<string, string>();
+	const sdkToolName = (ompName: string): string => {
+		const sdkName = toolNameMap?.get(ompName) ?? mapOmpToolName(ompName);
+		const collision = ompBySdk.get(sdkName);
+		if (collision && collision !== ompName) {
+			throw new Error(`Cannot import native history: tools ${collision} and ${ompName} map to ${sdkName}`);
+		}
+		ompBySdk.set(sdkName, ompName);
+		return sdkName;
+	};
 	const messages = history.map((message) => {
-		if (message.role === "toolResult") return { ...message, toolCallId: nativeToolCallId(message.toolCallId) };
+		if (message.role === "toolResult") {
+			return {
+				...message,
+				toolCallId: nativeToolCallId(message.toolCallId),
+				toolName: sdkToolName(message.toolName),
+			};
+		}
 		if (message.role !== "assistant") return message;
 		return {
 			...message,
@@ -20,7 +41,7 @@ export async function buildNativeHistory(history: Context["messages"], selection
 				if (block.type !== "toolCall") return block;
 				if (callIds.has(block.id)) throw new Error("Cannot import native history with duplicate tool call IDs");
 				callIds.add(block.id);
-				return { ...block, id: nativeToolCallId(block.id) };
+				return { ...block, id: nativeToolCallId(block.id), name: sdkToolName(block.name) };
 			}),
 		};
 	});
@@ -417,7 +438,7 @@ function sourceUnitAnchors(unit: SourceHistoryUnit, messages: Context["messages"
 				message.content.some((part) => part.type !== "text")) return [];
 			anchors.push(anchor("tool-result", JSON.stringify([
 				id,
-				message.toolName,
+				mapOmpToolName(message.toolName),
 				// Importer shape: raw texts joined by "\n"; trimmed on both sides.
 				message.content.map((part) => (part as { text: string }).text).join("\n").trim(),
 				message.isError === true,
@@ -430,7 +451,7 @@ function sourceUnitAnchors(unit: SourceHistoryUnit, messages: Context["messages"
 				const id = nativeToolCallId(part.id);
 				if (pendingTools.has(id)) return [];
 				pendingTools.add(id);
-				anchors.push(anchor("tool-call", JSON.stringify([id, part.name, part.arguments ?? {}])));
+				anchors.push(anchor("tool-call", JSON.stringify([id, mapOmpToolName(part.name), part.arguments ?? {}])));
 			} else if (part.type === "text" && part.text.trim()) {
 				anchors.push(anchor("assistant", part.text.trim()));
 			} else if (part.type === "thinking" && typeof part.thinking === "string") {

@@ -6,7 +6,7 @@ import {
 	snapshotHostToolCatalog,
 } from "../../src/tool-catalog.ts";
 import { grantedToolsFromContext } from "../../src/omp-tools.ts";
-import { uniqueSdkToolName } from "../../src/tools.ts";
+import { mapOmpToolName } from "../../src/tools.ts";
 import type { Tool } from "@oh-my-pi/pi-ai";
 import { ownerForRequest, withCursorSessionOwner } from "../../src/session-scope.ts";
 
@@ -179,10 +179,9 @@ describe("host tool catalog", () => {
 		});
 	});
 
-	test("maps long MCP names to unique SDK identifiers", () => {
-		const used = new Set<string>();
-		const first = uniqueSdkToolName("mcp__a_very_long_server_name_and_an_even_longer_tool_name_exceeding_limit", used);
-		const second = uniqueSdkToolName("mcp__a_very_long_server_name_and_an_even_longer_tool_name_exceeding_limit_2", used);
+	test("maps long MCP names to stable unique SDK identifiers", () => {
+		const first = mapOmpToolName("mcp__a_very_long_server_name_and_an_even_longer_tool_name_exceeding_limit");
+		const second = mapOmpToolName("mcp__a_very_long_server_name_and_an_even_longer_tool_name_exceeding_limit_2");
 		expect(first).toMatch(/^[a-zA-Z][a-zA-Z0-9_-]{0,63}$/);
 		expect(second).toMatch(/^[a-zA-Z][a-zA-Z0-9_-]{0,63}$/);
 		expect(first).not.toBe(second);

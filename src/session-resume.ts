@@ -7,7 +7,7 @@ import type { BindingState } from "./contracts.js";
 import { emptySendState, type SendState } from "./context.js";
 import { getCursorSessionOwner, getCursorSessionScopeKey, sessionEvents, type CursorSessionOwner } from "./session-scope.js";
 
-export const RESUME_ENTRY_VERSION = 4;
+export const RESUME_ENTRY_VERSION = 5;
 const MAX_RESUME_CONFIRMATION_BYTES = 64 * 1024;
 
 export interface ResumeStoreIdentity {
@@ -25,7 +25,7 @@ export interface ResumeSessionEntry {
 }
 
 export interface ResumeEntryData {
-	version: 1 | 2 | 3 | 4;
+	version: 1 | 2 | 3 | 4 | 5;
 	runtime: "local";
 	agentId: string;
 	scopeKey: string;
@@ -42,6 +42,7 @@ export interface ResumeEntryData {
 	agentInstanceId?: string;
 	credentialScopeId?: string;
 	persistenceId?: string;
+	toolContractFingerprint?: string;
 }
 
 export interface ResumeScope {
@@ -60,6 +61,7 @@ interface PendingResumeHandle {
 	agentInstanceId: string;
 	cwd: string;
 	credentialScopeId?: string;
+	toolContractFingerprint: string;
 }
 
 interface ResumeState {
@@ -129,7 +131,7 @@ function parseBindingState(value: unknown): BindingState | undefined {
 export function parseResumeEntryData(value: unknown): ResumeEntryData | undefined {
 	const record = asRecord(value);
 	if (!record) return undefined;
-	if (record.version !== 1 && record.version !== 2 && record.version !== 3 && record.version !== 4) return undefined;
+	if (record.version !== 1 && record.version !== 2 && record.version !== 3 && record.version !== 4 && record.version !== 5) return undefined;
 	if (record.runtime !== "local") return undefined;
 	if (
 		!isLocalAgentId(record.agentId) ||
@@ -153,6 +155,7 @@ export function parseResumeEntryData(value: unknown): ResumeEntryData | undefine
 	) {
 		return undefined;
 	}
+	if (record.version >= 5 && (typeof record.toolContractFingerprint !== "string" || !record.toolContractFingerprint)) return undefined;
 	return {
 		version: record.version,
 		runtime: "local",
@@ -177,6 +180,9 @@ export function parseResumeEntryData(value: unknown): ResumeEntryData | undefine
 			? { credentialScopeId: record.credentialScopeId }
 			: {}),
 		...(typeof record.persistenceId === "string" ? { persistenceId: record.persistenceId } : {}),
+		...(typeof record.toolContractFingerprint === "string" && record.toolContractFingerprint
+			? { toolContractFingerprint: record.toolContractFingerprint }
+			: {}),
 	};
 }
 
@@ -375,6 +381,7 @@ export function getMatchingResumeHandle(
 	poolKey: string,
 	credentialScopeId?: string,
 	cwd = getResumeState().cwd,
+	toolContractFingerprint?: string,
 ): ResumeEntryData | undefined {
 	const state = getResumeState();
 	const handle = state.activeHandle;
@@ -387,6 +394,10 @@ export function getMatchingResumeHandle(
 	if (!sameResumeCwd(handle.cwd, cwd)) return undefined;
 	if (handle.compactionGeneration !== state.compactionGeneration) return undefined;
 	if (!handle.credentialScopeId || !credentialScopeId || handle.credentialScopeId !== credentialScopeId) return undefined;
+	if (
+		toolContractFingerprint !== undefined
+		&& (handle.version !== RESUME_ENTRY_VERSION || handle.toolContractFingerprint !== toolContractFingerprint)
+	) return undefined;
 	return {
 		...handle,
 		sendState: { ...handle.sendState },
@@ -405,6 +416,7 @@ export function persistResumeHandle(input: PendingResumeHandle): void {
 		state: input.state,
 		agentInstanceId: input.agentInstanceId,
 		cwd: resolvePath(input.cwd),
+		toolContractFingerprint: input.toolContractFingerprint,
 		...(input.credentialScopeId ? { credentialScopeId: input.credentialScopeId } : {}),
 	};
 }
@@ -432,6 +444,7 @@ function resumeEntryFromPending(pending: PendingResumeHandle): ResumeEntryData {
 		agentInstanceId: pending.agentInstanceId,
 		...(pending.credentialScopeId ? { credentialScopeId: pending.credentialScopeId } : {}),
 		persistenceId: randomUUID(),
+		toolContractFingerprint: pending.toolContractFingerprint,
 	};
 }
 

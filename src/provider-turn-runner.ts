@@ -38,7 +38,6 @@ import {
 import { readSettledCheckpointOccupancy, reconcileSummaryBoundary } from "./native-history.js";
 import { stageCursorCompaction } from "./native-summary-compaction.js";
 import { openJsonlStore } from "./sdk-session.js";
-import { nativeReadHooked, runWithNativeTools } from "./sdk-native-hook.js";
 
 const bridgeOwners = new Map<string, { owner: CursorSessionOwner; signal: AbortSignal; onAbort: () => void }>();
 
@@ -164,11 +163,9 @@ export class ProviderTurnRunner {
 		this.apiKey = requireCursorApiKey(typeof options?.apiKey === "string" ? options.apiKey : undefined);
 		// Overlap executor construction with model discovery and agent open; `send()` awaits the shared lease.
 		if (!this.auxiliary) warmLocalExecutor(cwd, this.apiKey, model.id);
-		const rawGranted = snapshot
+		const grantedTools = snapshot
 			? snapshot.grantedTools
 			: mergeGrantedTools(grantedToolsFromContext(this.context));
-		const includeWebSearch = (snapshot ? rawGranted : this.context.tools)?.some((tool) => tool.name === "web_search") ?? false;
-		const grantedTools = rawGranted.filter((tool) => tool.name !== "web_search");
 		if (this.auxiliary && grantedTools.length > 0) {
 			throw new Error("Cursor SDK tool calls require an OMP request context or an explicit host bridge");
 		}
@@ -205,7 +202,6 @@ export class ProviderTurnRunner {
 			modelLimits: { contextWindow: model.contextWindow, maxTokens: model.maxTokens },
 			context: this.context,
 			grantedTools,
-			includeWebSearch,
 			host,
 			signal: this.abortSignal,
 		});
@@ -264,22 +260,19 @@ export class ProviderTurnRunner {
 			this.assertCurrent();
 		}
 		const starting = startSend(live, () =>
-			withSdkExitSuppressed(() => {
-				const send = () =>
-					agent.send(userPrompt, {
-						model: modelSelection,
-						local: { customTools },
-						onDelta: ({ update }) => {
-							const sink = live.sink;
-							if (!sink || live.cancelled || getRuntimeSlot(prepared.slot.key) !== prepared.slot) return;
-							applyInteractionUpdate(sink.stream, sink.partial, update, live.projection);
-							if (update.type === "summary-started") void live.summaryProbe?.onSummaryStarted(agent.agentId);
-							else if (update.type === "summary-completed") live.summaryProbe?.onSummaryCompleted();
-						},
-					});
-				if (!nativeReadHooked) return send();
-				return runWithNativeTools((name, args, sdkToolCallId) => live.toolExec.execute(name, args, sdkToolCallId), send);
-			}),
+			withSdkExitSuppressed(() =>
+				agent.send(userPrompt, {
+					model: modelSelection,
+					local: { customTools },
+					onDelta: ({ update }) => {
+						const sink = live.sink;
+						if (!sink || live.cancelled || getRuntimeSlot(prepared.slot.key) !== prepared.slot) return;
+						applyInteractionUpdate(sink.stream, sink.partial, update, live.projection);
+						if (update.type === "summary-started") void live.summaryProbe?.onSummaryStarted(agent.agentId);
+						else if (update.type === "summary-completed") live.summaryProbe?.onSummaryCompleted();
+					},
+				}),
+			),
 		);
 		void starting.catch(() => undefined);
 	}
