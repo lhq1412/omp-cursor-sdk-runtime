@@ -2,15 +2,12 @@ import type { AssistantMessage, AssistantMessageEventStream, Model } from "@oh-m
 import type { Api } from "@oh-my-pi/pi-ai";
 import { createAssistantMessageEventStream } from "@oh-my-pi/pi-ai";
 import type { InteractionUpdate, RunResult, TokenUsage } from "@cursor/sdk";
-import type { SummaryBoundaryObservation } from "./native-history.js";
 import { projectSdkToolCallId } from "./tool-call-id.js";
 
 export interface CursorSdkSummary {
 	count: number;
 	status: "running" | "completed";
 	text?: string;
-	checkpointRootBlobId?: string;
-	probe?: SummaryBoundaryObservation;
 }
 
 export interface RunProjection {

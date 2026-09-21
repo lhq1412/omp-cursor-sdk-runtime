@@ -43,15 +43,6 @@ export interface MessageLocator {
 	digest: string;
 }
 
-export interface SourceHistoryUnit {
-	ordinal: number;
-	startMessageIndex: number;
-	endMessageIndex: number;
-	firstMessage: MessageLocator;
-	lastMessage: MessageLocator;
-	kind: "turn" | "compaction-summary";
-	historyRewriteAt?: number;
-}
 
 const NATIVE_HISTORY_FORMAT = "native-checkpoint-v1";
 const CONTEXT_FINGERPRINT_VERSION = 2;
@@ -137,11 +128,6 @@ export function locatorsMatch(left: MessageLocator, right: MessageLocator): bool
 	return true;
 }
 
-function historyRewriteAt(message: unknown): number | undefined {
-	if (!isRecord(message) || message.role !== "user" || typeof message.historyRewriteAt !== "number") return;
-	if (!Number.isFinite(message.historyRewriteAt)) return;
-	return message.historyRewriteAt;
-}
 
 function serializeSystemPrompt(systemPrompt: string | readonly string[] | undefined): string {
 	return typeof systemPrompt === "string" ? systemPrompt : systemPrompt?.join("\n") ?? "";
@@ -351,27 +337,6 @@ function historyUnits(messages: Context["messages"]): Context["messages"][] {
 	return units;
 }
 
-export function projectSourceHistoryUnits(messages: Context["messages"]): SourceHistoryUnit[] {
-	const grouped = historyUnits(messages);
-	let start = 0;
-	return grouped.map((unit, ordinal) => {
-		const startMessageIndex = start;
-		const endMessageIndex = start + unit.length - 1;
-		start += unit.length;
-		const first = unit[0]!;
-		const last = unit[unit.length - 1]!;
-		const rewriteAt = historyRewriteAt(first);
-		return {
-			ordinal,
-			startMessageIndex,
-			endMessageIndex,
-			firstMessage: locatorFor(first),
-			lastMessage: locatorFor(last),
-			kind: rewriteAt !== undefined ? "compaction-summary" : "turn",
-			...(rewriteAt !== undefined ? { historyRewriteAt: rewriteAt } : {}),
-		};
-	});
-}
 
 function canReplayNativeThinking(message: { api?: unknown; provider?: unknown; model?: unknown }, targetModelId: string | undefined): boolean {
 	// Mirror canReplayCursorThinking in the pinned codec. Do not relabel cursor-sdk identity.

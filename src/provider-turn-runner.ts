@@ -35,8 +35,7 @@ import {
 	reconcileRunResult,
 	type CursorAssistantMessage,
 } from "./projector.js";
-import { readSettledCheckpointOccupancy, reconcileSummaryBoundary } from "./native-history.js";
-import { stageCursorCompaction } from "./native-summary-compaction.js";
+import { readSettledCheckpointOccupancy } from "./native-history.js";
 import { openJsonlStore } from "./sdk-session.js";
 
 const bridgeOwners = new Map<string, { owner: CursorSessionOwner; signal: AbortSignal; onAbort: () => void }>();
@@ -231,22 +230,6 @@ export class ProviderTurnRunner {
 		if (!modelSelection) {
 			throw new Error("Cannot send a Cursor SDK turn without a model selection");
 		}
-		if (prepared.nativeRebase && prepared.host) {
-			await prepared.host.commitBinding({
-				version: 1,
-				ompSessionId: prepared.snapshot?.sessionId ?? prepared.slot.scopeKey,
-				agentInstanceId: prepared.agentInstanceId,
-				branchEpoch: prepared.snapshot?.branchEpoch ?? 0,
-				sdkAgentId: agent.agentId,
-				workspaceIdentity: prepared.cwd,
-				credentialScopeId: prepared.slot.credentialScopeId ?? "cursor-sdk",
-				configFingerprint: prepared.snapshot?.configFingerprint ?? "",
-				committedLeafId: prepared.nativeRebase.compactionEntryId,
-				effectiveHistoryDigest: prepared.nativeRebase.effectiveHistoryDigest,
-				state: "committed",
-			});
-			this.assertCurrent();
-		}
 		if (live.checkpointStore) {
 			try {
 				const baseline = await live.checkpointStore.agents.get({ agentId: agent.agentId });
@@ -256,7 +239,6 @@ export class ProviderTurnRunner {
 			} catch {
 				// Unknown previous root: occupancy stays unavailable.
 			}
-			live.summaryProbe?.seed(live.checkpointBaseline?.rootBlobId ?? null);
 			this.assertCurrent();
 		}
 		const starting = startSend(live, () =>
@@ -268,9 +250,7 @@ export class ProviderTurnRunner {
 						const sink = live.sink;
 						if (!sink || live.cancelled || getRuntimeSlot(prepared.slot.key) !== prepared.slot) return;
 						applyInteractionUpdate(sink.stream, sink.partial, update, live.projection);
-						if (update.type === "summary-started") void live.summaryProbe?.onSummaryStarted(agent.agentId);
-						else if (update.type === "summary-completed") live.summaryProbe?.onSummaryCompleted();
-					},
+					}
 				}),
 			),
 		);
@@ -381,48 +361,11 @@ export class ProviderTurnRunner {
 			});
 		}
 		this.assertCurrent();
-		let observation = !live.cancelled ? await live.summaryProbe?.flush() : undefined;
-		if (!observation && !live.cancelled && settledAgent && live.checkpointBaseline) {
-			const store = live.checkpointStore ?? preparedSlot.store;
-			if (store) {
-				observation = await reconcileSummaryBoundary(
-					store,
-					settledAgent.agentId,
-					live.checkpointBaseline.rootBlobId,
-				);
-			}
-		}
 		if (!live.cancelled && settledAgent && getLiveRun(preparedSlot.key) === live &&
 			preparedSlot.agent === settledAgent && live.agent === settledAgent) {
-			if (occupancy) {
-				partial.cursorSdk.contextOccupancy = occupancy;
-			}
-			const summary = live.projection.summary ?? partial.cursorSdk.summary;
-			if (summary) {
-				live.projection.summary = {
-					...summary,
-					...(occupancy ? { checkpointRootBlobId: occupancy.rootBlobId } : {}),
-					...(observation ? { probe: observation } : {}),
-				};
-				projectRunSummary(partial, live.projection);
-			}
-			if (observation) {
-				const store = live.checkpointStore ?? preparedSlot.store;
-				if (store) {
-					await stageCursorCompaction({
-						observation,
-						context: this.context,
-						contextFingerprint: preparedSlot.sendState.contextFingerprint,
-						store,
-						slot: preparedSlot,
-						agentId: settledAgent.agentId,
-						...(this.abortSignal ? { signal: this.abortSignal } : {}),
-					}).catch(() => undefined);
-				}
-				this.assertCurrent();
-			}
+			if (occupancy) partial.cursorSdk.contextOccupancy = occupancy;
+			projectRunSummary(partial, live.projection);
 		}
-		this.assertCurrent();
 		const delivered = deliverWithoutUnendedPreviews(partial, live.projection, new Set());
 		stream.push({ type: "done", reason: "stop", message: delivered });
 		stream.end(delivered);
