@@ -15,6 +15,7 @@ import { createFakeHost } from "../helpers/fake-host.ts";
 import { projectSdkToolCallId } from "../../src/tool-call-id.ts";
 import { mapOmpToolName } from "../../src/tools.ts";
 
+
 const COMPOSER: ModelListItem = {
 	id: "composer-2.5",
 	displayName: "Composer 2.5",

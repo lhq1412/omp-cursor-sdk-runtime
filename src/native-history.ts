@@ -6,6 +6,7 @@ import { buildGrpcRequest } from "@oh-my-pi/pi-ai/providers/cursor";
 import { ConversationStateStructureSchema } from "@oh-my-pi/pi-catalog/discovery/cursor-proto";
 import { toBinary } from "@oh-my-pi/pi-catalog/discovery/protobuf";
 import { nativeToolCallId } from "./tool-call-id.js";
+
 import { mapOmpToolName } from "./tools.js";
 
 /** Project history only; the SDK remains responsible for creating and running agents. */
@@ -57,6 +58,7 @@ export async function buildNativeHistory(
 	projection.blobStore.set(rootBlobId, data);
 	return { blobs: projection.blobStore, rootBlobId };
 }
+
 
 /** Read opaque checkpoint bytes only through the SDK's public, agent-scoped store. */
 export async function readNativeCheckpoint(store: LocalAgentStore, agentId: string) {
