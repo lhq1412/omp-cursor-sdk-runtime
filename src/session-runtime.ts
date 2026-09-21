@@ -18,11 +18,10 @@ import {
 } from "./live-run.js";
 import { trailingToolResults } from "./omp-tools.js";
 import { withSdkExitSuppressed } from "./sdk-exit-guard.js";
-import { createSummaryBoundaryProbe, type SummaryBoundaryProbe } from "./native-history.js";
 import { openAgent, prewarmLocalExecutor, type OpenAgentInput } from "./sdk-session.js";
 import { flushResumeHandleNow, getMatchingResumeHandle, persistResumeHandle, type ResumeStoreIdentity } from "./session-resume.js";
 import { getCursorSessionCwd, getCursorSessionOwner, getCursorSessionScopeKey, withCursorSessionOwner, type CursorSessionOwner } from "./session-scope.js";
-import { observeLocalAgentStore, openScopedJsonlStore, storeRootForScope } from "./store.js";
+import { openScopedJsonlStore, storeRootForScope } from "./store.js";
 import { buildCustomTools, buildToolContract, newBridgeRunId } from "./tools.js";
 import { ompToolCallId } from "./projector.js";
 
@@ -40,26 +39,10 @@ export interface RuntimeSlot {
 	bindingState: BindingState;
 	storeIdentity: ResumeStoreIdentity;
 	store?: LocalAgentStore;
-	summaryProbe?: SummaryBoundaryProbe;
 	preparation?: AbortController;
-	committedContextTail?: MessageLocator;
-	pendingNativeRebase?: PendingNativeRebase;
 }
 
-export interface PendingNativeRebase {
-	materializationId: string;
-	compactionEntryId: string;
-	compactionTimestamp: number;
-	checkpointRootBlobId: string;
-	summaryGeneration: number;
-	archiveHash: string;
-	knownTailLocator?: MessageLocator;
-}
 
-export interface NativeRebaseResult {
-	compactionEntryId: string;
-	effectiveHistoryDigest: string;
-}
 
 const slots = new Map<string, RuntimeSlot>();
 let openAgentImpl: (input: OpenAgentInput) => Promise<SDKAgent> = openAgent;
@@ -172,7 +155,6 @@ export interface PreparedTurn {
 	customTools: Record<string, SDKCustomTool>;
 	prompt?: SDKUserMessage;
 	incremental: boolean;
-	nativeRebase?: NativeRebaseResult;
 }
 
 function attachParkExecutor(live: LiveRun, grantedTools: readonly GrantedTool[], host?: OmpHostBridgeV1): SharedToolExec {
@@ -241,9 +223,6 @@ function persistDirtyAndDisposeAgent(slot: RuntimeSlot): Promise<void> {
 	slot.toolContractFingerprint = undefined;
 	slot.sendState = emptySendState();
 	slot.store = undefined;
-	slot.summaryProbe = undefined;
-	slot.committedContextTail = undefined;
-	slot.pendingNativeRebase = undefined;
 	return agent ? disposeAgent(agent) : Promise.resolve();
 }
 
@@ -267,11 +246,6 @@ function invalidateBindingBeforeSend(slot: RuntimeSlot, agentId: string): void {
 	slot.bindingState = "in-flight";
 }
 
-export function markPersistedHandleDirtyPreservingAgent(slot: RuntimeSlot): void {
-	if (slots.get(slot.key) !== slot) return;
-	const dirty = resumePending(slot, "dirty");
-	if (dirty) persistDirtyHandle(slot, dirty);
-}
 
 function findUniqueMessageIndex(messages: Context["messages"], locator: MessageLocator): number | undefined {
 	const matches: number[] = [];
@@ -281,52 +255,6 @@ function findUniqueMessageIndex(messages: Context["messages"], locator: MessageL
 	return matches.length === 1 ? matches[0] : undefined;
 }
 
-export function attemptNativeCompactionRebase(slot: RuntimeSlot, context: Context): NativeRebaseResult | undefined {
-	const pending = slot.pendingNativeRebase;
-	if (!pending) return;
-	const summaryIndex = context.messages.findIndex((message) => (
-		message.role === "user"
-		&& "historyRewriteAt" in message
-		&& message.historyRewriteAt === pending.compactionTimestamp
-	));
-	if (summaryIndex < 0 || !pending.knownTailLocator) {
-		slot.pendingNativeRebase = undefined;
-		return;
-	}
-	const knownTailIndex = findUniqueMessageIndex(context.messages, pending.knownTailLocator);
-	if (knownTailIndex === undefined || knownTailIndex < summaryIndex) {
-		slot.pendingNativeRebase = undefined;
-		return;
-	}
-	const rebasedPrefix = { ...context, messages: context.messages.slice(0, knownTailIndex + 1) };
-	const rebasedFingerprint = computeContextFingerprint(rebasedPrefix);
-	// Refuse rebase when system prompt changed — keep old sendState so planSend bootstraps.
-	try {
-		const previous = JSON.parse(slot.sendState.contextFingerprint) as { systemHash?: unknown };
-		const next = JSON.parse(rebasedFingerprint) as { systemHash?: unknown };
-		if (
-			typeof previous.systemHash === "string"
-			&& typeof next.systemHash === "string"
-			&& previous.systemHash !== next.systemHash
-		) {
-			slot.pendingNativeRebase = undefined;
-			return;
-		}
-	} catch {
-		slot.pendingNativeRebase = undefined;
-		return;
-	}
-	slot.sendState = {
-		bootstrapped: true,
-		contextFingerprint: rebasedFingerprint,
-		incrementalSendCount: 0,
-	};
-	slot.pendingNativeRebase = undefined;
-	return {
-		compactionEntryId: pending.compactionEntryId,
-		effectiveHistoryDigest: slot.sendState.contextFingerprint,
-	};
-}
 
 export async function prepareTurn(input: OpenRuntimeTurnInput): Promise<PreparedTurn> {
 	input.signal?.throwIfAborted();
@@ -379,18 +307,11 @@ export async function prepareTurn(input: OpenRuntimeTurnInput): Promise<Prepared
 		? undefined
 		: getMatchingResumeHandle(input.agentInstanceId, nextCredential, cwd, toolContract.fingerprint);
 	const sendState = unsafeBinding ? emptySendState() : slot.agent ? slot.sendState : resumeHandle?.sendState ?? emptySendState();
-	const plannedSlot: RuntimeSlot = { ...slot, sendState: { ...sendState } };
-	const nativeRebase = !unsafeBinding && trailing.length === 0 && plannedSlot.pendingNativeRebase
-		? attemptNativeCompactionRebase(plannedSlot, input.context)
-		: undefined;
 	const plan = trailing.length > 0
 		? { mode: "bootstrap" as const, resetAgent: true, reason: "context_divergence" as const }
-		: planSend(plannedSlot.sendState, input.context);
+		: planSend(sendState, input.context);
 	const { prompt, history } = prepareSendInput(plan, input.context, input.modelLimits, modelSelection.id, toolContract.guidance);
-	if (!unsafeBinding) {
-		slot.sendState = { ...plannedSlot.sendState };
-		slot.pendingNativeRebase = plannedSlot.pendingNativeRebase;
-	}
+	if (!unsafeBinding) slot.sendState = { ...sendState };
 
 	slot.preparation?.abort();
 	const preparation = new AbortController();
@@ -431,15 +352,7 @@ export async function prepareTurn(input: OpenRuntimeTurnInput): Promise<Prepared
 		}
 
 		const savedAgentId = slot.agent?.agentId ?? (slot.bindingState === "committed" ? resumeHandle?.agentId : undefined);
-		if (!slot.store || !slot.summaryProbe) {
-			const inner = openScopedJsonlStore(cwd, scopeKey);
-			const summaryProbe = createSummaryBoundaryProbe(inner);
-			slot.summaryProbe = summaryProbe;
-			slot.store = observeLocalAgentStore(inner, (event) => {
-				if (event.kind === "agents.write") summaryProbe.onAgentUpdated(event.agent);
-				else if (event.kind === "runEvents.append") summaryProbe.onRunEvent(event);
-			});
-		}
+		if (!slot.store) slot.store = openScopedJsonlStore(cwd, scopeKey);
 		const store = slot.store;
 		slot.storeIdentity = { version: 1, stateRoot: storeRootForScope(cwd, scopeKey) };
 
@@ -483,7 +396,6 @@ export async function prepareTurn(input: OpenRuntimeTurnInput): Promise<Prepared
 		}
 		live.agent = slot.agent;
 		live.checkpointStore = store;
-		live.summaryProbe = slot.summaryProbe;
 		setLiveRun(slot.key, live);
 		slot.bindingState = "in-flight";
 		slot.cwd = cwd;
@@ -497,7 +409,6 @@ export async function prepareTurn(input: OpenRuntimeTurnInput): Promise<Prepared
 			customTools,
 			prompt,
 			incremental: plan.mode === "incremental",
-			...(nativeRebase ? { nativeRebase } : {}),
 		};
 	} catch (error) {
 		if (slots.get(slot.key) === slot) await persistDirtyAndDisposeAgent(slot);
@@ -512,8 +423,6 @@ export function commitTurn(slot: RuntimeSlot, context: Context, incremental: boo
 		contextFingerprint: computeContextFingerprint(context),
 		incrementalSendCount: incremental ? slot.sendState.incrementalSendCount + 1 : 0,
 	};
-	const last = context.messages.at(-1);
-	slot.committedContextTail = last ? locatorFor(last) : undefined;
 	slot.bindingState = "committed";
 	const pending = resumePending(slot, "committed");
 	if (pending) withCursorSessionOwner(slot.owner, () => persistResumeHandle(pending));
@@ -535,9 +444,6 @@ export function markTurnDirty(slot: RuntimeSlot): void {
 	slot.sendState = emptySendState();
 	slot.toolContractFingerprint = undefined;
 	slot.store = undefined;
-	slot.summaryProbe = undefined;
-	slot.committedContextTail = undefined;
-	slot.pendingNativeRebase = undefined;
 }
 
 export async function finishLiveKeepAgent(slot: RuntimeSlot, reason: string): Promise<void> {

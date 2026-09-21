@@ -52,12 +52,10 @@ describe("session lifecycle", () => {
 		scopeTestUtils.reset();
 	});
 
-	test("cancels auto compact for cursor-sdk and allows manual compact", async () => {
+	test("leaves Cursor SDK automatic and manual compaction to OMP", async () => {
 		const { handlers, ctx } = hooks(CURSOR_SDK_PROVIDER_ID);
-		expect(await emit(handlers, "session_before_compact", ctx)).toBeUndefined();
-		await emit(handlers, "auto_compaction_start", ctx);
-		expect(await emit(handlers, "session_before_compact", ctx)).toEqual({ cancel: true });
-		await emit(handlers, "auto_compaction_end", ctx);
+		expect(handlers.has("auto_compaction_start")).toBe(false);
+		expect(handlers.has("session_before_compact")).toBe(false);
 		expect(await emit(handlers, "session_before_compact", ctx)).toBeUndefined();
 	});
 
