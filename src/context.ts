@@ -176,11 +176,23 @@ export function planSend(sendState: SendState, context: Context): SendPlan {
 	if (context.messages.length < previous.messageCount) {
 		return { mode: "bootstrap", resetAgent: true, reason: "context_divergence" };
 	}
-	if (messagePrefixDigest(context.messages, previous.messageCount) !== previous.prefixDigest) {
-		return { mode: "bootstrap", resetAgent: true, reason: "context_divergence" };
+	if ("prefixDigest" in previous) {
+		if (messagePrefixDigest(context.messages, previous.messageCount) !== previous.prefixDigest) {
+			return { mode: "bootstrap", resetAgent: true, reason: "context_divergence" };
+		}
+	} else {
+		for (let index = 0; index < previous.messageCount; index += 1) {
+			const message = context.messages[index]!;
+			const { role, json } = stableMessageParts(message);
+			if (previous.messageHashes[index] !== hashValue(`${index}:${role}:${json}`)
+				&& previous.messageHashes[index] !== hashValue(`${index}:${message.role}:${JSON.stringify(message)}`)) {
+				return { mode: "bootstrap", resetAgent: true, reason: "context_divergence" };
+			}
+		}
 	}
 	const continuation = context.messages.length === previous.messageCount ? { continueOnly: true as const } : {};
-	if (hashValue(serializeSystemPrompt(context.systemPrompt)) !== previous.systemHash) {
+	// Old formats can prove input was consumed, but never authorize agent reuse.
+	if (!previous.reusable || hashValue(serializeSystemPrompt(context.systemPrompt)) !== previous.systemHash) {
 		return { mode: "bootstrap", resetAgent: true, reason: "context_divergence", ...continuation };
 	}
 	if (context.messages.length > previous.messageCount) {
@@ -191,7 +203,13 @@ export function planSend(sendState: SendState, context: Context): SendPlan {
 	return { mode: "incremental", resetAgent: false, reason: "incremental", ...continuation };
 }
 
-function parseFingerprint(value: string): { systemHash: string; messageCount: number; prefixDigest: string } | undefined {
+type ParsedFingerprint = {
+	systemHash: string;
+	messageCount: number;
+	reusable: boolean;
+} & ({ prefixDigest: string } | { messageHashes: string[] });
+
+function parseFingerprint(value: string): ParsedFingerprint | undefined {
 	try {
 		const parsed = JSON.parse(value) as {
 			format?: unknown;
@@ -199,19 +217,32 @@ function parseFingerprint(value: string): { systemHash: string; messageCount: nu
 			systemHash?: unknown;
 			messageCount?: unknown;
 			prefixDigest?: unknown;
+			messageHashes?: unknown;
 		};
+		if (parsed.format !== NATIVE_HISTORY_FORMAT || typeof parsed.systemHash !== "string") return undefined;
+		if (parsed.formatVersion === CONTEXT_FINGERPRINT_VERSION || parsed.formatVersion === 2) {
+			if (
+				!Number.isSafeInteger(parsed.messageCount)
+				|| (parsed.messageCount as number) < 0
+				|| typeof parsed.prefixDigest !== "string"
+			) return undefined;
+			return {
+				systemHash: parsed.systemHash,
+				messageCount: parsed.messageCount as number,
+				prefixDigest: parsed.prefixDigest,
+				reusable: parsed.formatVersion === CONTEXT_FINGERPRINT_VERSION,
+			};
+		}
 		if (
-			parsed.format !== NATIVE_HISTORY_FORMAT
-			|| parsed.formatVersion !== CONTEXT_FINGERPRINT_VERSION
-			|| typeof parsed.systemHash !== "string"
-			|| !Number.isSafeInteger(parsed.messageCount)
-			|| (parsed.messageCount as number) < 0
-			|| typeof parsed.prefixDigest !== "string"
+			parsed.formatVersion !== undefined
+			|| !Array.isArray(parsed.messageHashes)
+			|| !parsed.messageHashes.every((item) => typeof item === "string")
 		) return undefined;
 		return {
 			systemHash: parsed.systemHash,
-			messageCount: parsed.messageCount as number,
-			prefixDigest: parsed.prefixDigest,
+			messageCount: parsed.messageHashes.length,
+			messageHashes: parsed.messageHashes,
+			reusable: false,
 		};
 	} catch {
 		return undefined;

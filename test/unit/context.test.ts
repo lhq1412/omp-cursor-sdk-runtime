@@ -17,6 +17,20 @@ function bootstrap(ctx: Context, limits: ModelInputLimits = modelLimits, targetM
 	return prepareSendInput(planSend(emptySendState(), ctx), ctx, limits, targetModelId);
 }
 
+function oldFingerprints(ctx: Context): string[] {
+	const current = JSON.parse(computeContextFingerprint(ctx));
+	return [
+		JSON.stringify({ ...current, formatVersion: 2 }),
+		JSON.stringify({
+			format: current.format,
+			systemHash: current.systemHash,
+			messageHashes: ctx.messages.map((message, index) =>
+				new Bun.CryptoHasher("sha256").update(`${index}:${message.role}:${JSON.stringify(message)}`).digest("hex").slice(0, 16),
+			),
+		}),
+	];
+}
+
 const firstUser = [{ role: "user", content: "hi", timestamp: 1 } as Context["messages"][number]];
 
 describe("send policy", () => {
@@ -131,35 +145,25 @@ describe("send policy", () => {
 		});
 	});
 
-	test("old v2 and unversioned fingerprints force a fresh bootstrap", () => {
+	test.each(["user", "developer"] as const)("old fingerprints rebuild without resending the committed final %s", (role) => {
 		const prompt = "<system-conventions>\n# Internal URLs\nHOST_CATALOG\n§ Workflow\nkeep";
 		const ctx = context([
-			{ role: "assistant", content: [{ type: "text", text: "Prior answer" }], timestamp: 1 },
-			{ role: "user", content: "Already executed request", timestamp: 3 },
+			{ role: "assistant", content: [{ type: "text", text: "Prior answer" }], timestamp: 1, completedAt: 2 },
+			{ role, content: "Already executed request", timestamp: 3 },
 		] as Context["messages"], prompt);
-		const current = JSON.parse(computeContextFingerprint(ctx)) as { format: string; systemHash: string };
-		const v2 = { ...JSON.parse(computeContextFingerprint(ctx)), formatVersion: 2 };
-		const legacy = {
-			format: current.format,
-			systemHash: current.systemHash,
-			messageHashes: ctx.messages.map((message, index) =>
-				new Bun.CryptoHasher("sha256").update(`${index}:${message.role}:${JSON.stringify(message)}`).digest("hex").slice(0, 16),
-			),
-		};
-		const flattened = JSON.parse(computeContextFingerprint(ctx)) as Record<string, unknown>;
-		delete flattened.format;
-		for (const fingerprint of [v2, legacy, flattened]) {
+		for (const contextFingerprint of oldFingerprints(ctx)) {
 			const plan = planSend({
 				bootstrapped: true,
-				contextFingerprint: JSON.stringify(fingerprint),
+				contextFingerprint,
 				incrementalSendCount: 20_000,
 			}, ctx);
-			expect(plan).toEqual({ mode: "bootstrap", resetAgent: true, reason: "context_divergence" });
+			expect(plan).toEqual({ mode: "bootstrap", resetAgent: true, reason: "context_divergence", continueOnly: true });
 			const prepared = prepareSendInput(plan, ctx, modelLimits);
-			expect(prepared.history).toEqual(ctx.messages.slice(0, -1));
+			expect(prepared.history).toEqual(ctx.messages);
 			expect(prepared.prompt.text).toContain(prompt);
 			expect(prepared.prompt.text).toContain(SDK_TOOL_CONTEXT);
-			expect(prepared.prompt.text).toContain("Already executed request");
+			expect(prepared.prompt.text).toEndWith(activeUserInput(ctx, true).text);
+			expect(prepared.prompt.text).not.toContain("Already executed request");
 			expect(prepared.prompt.text).not.toContain("Prior answer");
 		}
 		expect(planSend({
@@ -167,6 +171,38 @@ describe("send policy", () => {
 			contextFingerprint: computeContextFingerprint(ctx),
 			incrementalSendCount: 20_000,
 		}, ctx)).toMatchObject({ mode: "incremental", resetAgent: false, continueOnly: true });
+	});
+
+	test.each(["user", "developer"] as const)("old fingerprints rebuild and send only the appended %s input", (role) => {
+		const previous = context([{ role: "user", content: "Already executed request", timestamp: 1 }]);
+		const next = context([...previous.messages, { role, content: "New request", timestamp: 2 }]);
+		for (const contextFingerprint of oldFingerprints(previous)) {
+			const plan = planSend({ bootstrapped: true, contextFingerprint, incrementalSendCount: 1 }, next);
+			expect(plan).toEqual({ mode: "bootstrap", resetAgent: true, reason: "context_divergence" });
+			const prepared = prepareSendInput(plan, next, modelLimits);
+			expect(prepared.history).toEqual(previous.messages);
+			expect(prepared.prompt.text).toEndWith("New request");
+			expect(prepared.prompt.text).not.toContain("Already executed request");
+		}
+	});
+
+	test("old fingerprint identity must match before treating current input as consumed", () => {
+		const previous = context([{ role: "user", content: "A different request", timestamp: 1 }]);
+		const next = context([{ role: "user", content: "Current request", timestamp: 1 }]);
+		const current = JSON.parse(computeContextFingerprint(next));
+		const { format: _format, ...flattened } = current;
+		for (const contextFingerprint of [
+			...oldFingerprints(previous),
+			JSON.stringify(flattened),
+			JSON.stringify({ ...current, formatVersion: 999 }),
+		]) {
+			const plan = planSend({ bootstrapped: true, contextFingerprint, incrementalSendCount: 1 }, next);
+			expect(plan).toEqual({ mode: "bootstrap", resetAgent: true, reason: "context_divergence" });
+			expect(prepareSendInput(plan, next, modelLimits)).toEqual({
+				prompt: { text: "System instructions from OMP:\nsys\n\nCurrent request" },
+				history: [],
+			});
+		}
 	});
 
 	test("rebuilds after a shortened history", () => {

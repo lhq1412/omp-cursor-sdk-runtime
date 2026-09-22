@@ -151,6 +151,20 @@ function seedCommittedHandle(sessionFile: string, context: Context, agentId = "a
 	};
 }
 
+function oldContextFingerprints(ctx: Context): string[] {
+	const current = JSON.parse(computeContextFingerprint(ctx)) as { format: string; systemHash: string };
+	return [
+		JSON.stringify({ ...current, formatVersion: 2 }),
+		JSON.stringify({
+			format: current.format,
+			systemHash: current.systemHash,
+			messageHashes: ctx.messages.map((message, index) =>
+				new Bun.CryptoHasher("sha256").update(`${index}:${message.role}:${JSON.stringify(message)}`).digest("hex").slice(0, 16),
+			),
+		}),
+	];
+}
+
 describe("session runtime", () => {
 	test("child invalidation cannot abort a parent preparation or redirect its committed writer", async () => {
 		runtimeTestUtils.clear();
@@ -627,6 +641,60 @@ describe("session runtime", () => {
 		expect(prepared.incremental).toBe(true);
 		expect(prepared.prompt?.text).toBe("second");
 	});
+
+	test("persisted v2 and legacy handles rebuild without resending consumed input", async () => {
+		const systemPrompt = "keep-system-policy";
+		const committed = "Already executed request";
+		const same = {
+			systemPrompt,
+			messages: [
+				{ role: "assistant", content: [{ type: "text", text: "Prior answer" }], timestamp: 1, completedAt: 2 },
+				{ role: "user", content: committed, timestamp: 3 },
+			],
+		} as Context;
+		const appended = {
+			systemPrompt,
+			messages: [...same.messages, { role: "developer", content: "New request", timestamp: 4 }],
+		} as Context;
+		async function openFrom(fingerprint: string, context: Context) {
+			runtimeTestUtils.clear();
+			liveRunTestUtils.clear();
+			scopeTestUtils.reset();
+			resumeTestUtils.reset();
+			const { sessionFile } = registerResume();
+			seedCommittedHandle(sessionFile, same);
+			resumeTestUtils.state.activeHandle!.sendState.contextFingerprint = fingerprint;
+			resumeTestUtils.state.activeHandle!.sendState.incrementalSendCount = 20_000;
+			const opens: Array<{ savedAgentId?: string }> = [];
+			const histories: Array<Context["messages"] | undefined> = [];
+			runtimeTestUtils.setOpenAgent(async (input) => {
+				opens.push({ savedAgentId: input.savedAgentId });
+				histories.push(input.bootstrapHistory);
+				return fakeAgent("agent-new");
+			});
+			const prepared = await prepareTurn({
+				modelLimits, cwd: "/tmp/project", agentInstanceId: "main", apiKey: "test-key",
+				modelSelection: { id: "composer-2.5" }, context, grantedTools: [],
+			});
+			return { opens, histories, prepared };
+		}
+		for (const fingerprint of oldContextFingerprints(same)) {
+			const identical = await openFrom(fingerprint, same);
+			expect(identical.opens).toEqual([{ savedAgentId: undefined }]);
+			expect(identical.histories).toEqual([same.messages]);
+			expect(identical.prepared.incremental).toBe(false);
+			expect(identical.prepared.prompt?.text).toContain(systemPrompt);
+			expect(identical.prepared.prompt?.text).not.toContain(committed);
+			expect(identical.prepared.prompt?.text).not.toContain("Prior answer");
+			const next = await openFrom(fingerprint, appended);
+			expect(next.opens).toEqual([{ savedAgentId: undefined }]);
+			expect(next.histories).toEqual([same.messages]);
+			expect(next.prepared.incremental).toBe(false);
+			expect(next.prepared.prompt?.text).toEndWith("New request");
+			expect(next.prepared.prompt?.text).not.toContain(committed);
+		}
+	});
+
 
 	test("resumes a matching persisted tool contract and bootstraps history when description or schema changes", async () => {
 		const readTool = { name: "read", description: "read files", inputSchema: { type: "object", properties: { path: { type: "string" } } } };
