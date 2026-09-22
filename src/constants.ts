@@ -13,7 +13,7 @@ export const SDK_TOOL_CONTEXT = "Cursor SDK tool access: use only the custom-use
  * Live probe (2026-09-08): this backend rejects `AgentOptions.systemPrompt`
  * with `[invalid_argument] unknown option '--system-prompt'`.
  * Native replacement stays unsupported; never set AgentOptions.systemPrompt.
- * Bootstrap send text may include sanitized OMP instructions; incremental turns
+ * Bootstrap send text may include complete OMP instructions; incremental turns
  * omit them because the existing agent retains bootstrap.
  */
 export const SYSTEM_PROMPT_REPLACEMENT = "unsupported" as const;

@@ -126,6 +126,27 @@ describe("native history bootstrap", () => {
 		}
 	});
 
+	test("publishes a readable native graph retaining the final historical developer", async () => {
+		const fixture = setup();
+		const agent = await openAgent({
+			...fixture.input,
+			bootstrapHistory: [
+				{ role: "user", content: "Earlier historical user", timestamp: 1 },
+				{ role: "developer", content: "Preserve this final historical developer", timestamp: 2 },
+			],
+		});
+		try {
+			const messages = await Agent.messages.list(agent.agentId, {
+				cwd: fixture.input.cwd, store: fixture.store,
+			});
+			const rendered = JSON.stringify(messages);
+			expect(rendered).toContain("Preserve this final historical developer");
+			expect(rendered).toContain("Earlier historical user");
+		} finally {
+			await agent[Symbol.asyncDispose]();
+		}
+	});
+
 	test("keeps colliding historical call IDs distinct and paired without changing input", async () => {
 		const fixture = setup();
 		const history = [

@@ -45,7 +45,7 @@ export interface MessageLocator {
 
 
 const NATIVE_HISTORY_FORMAT = "native-checkpoint-v1";
-const CONTEXT_FINGERPRINT_VERSION = 2;
+const CONTEXT_FINGERPRINT_VERSION = 3;
 const IMAGE_TOKEN_RESERVE = 4096;
 
 export function registerLegacyCursorToolCallIdMigration(pi: Pick<ExtensionAPI, "on">): void {
@@ -133,19 +133,6 @@ function serializeSystemPrompt(systemPrompt: string | readonly string[] | undefi
 	return typeof systemPrompt === "string" ? systemPrompt : systemPrompt?.join("\n") ?? "";
 }
 
-function sanitizeSystemPromptForCursor(systemPrompt: string): string {
-	if (!systemPrompt.startsWith("<system-conventions>")) return systemPrompt.trim();
-	const toolPolicyStart = systemPrompt.indexOf("\n# Internal URLs\n");
-	if (toolPolicyStart < 0) return systemPrompt.trim();
-	const workflowStart = systemPrompt.indexOf("\n§ Workflow\n", toolPolicyStart);
-	if (workflowStart < 0) return systemPrompt.trim();
-	return [
-		systemPrompt.slice(0, toolPolicyStart).trimEnd(),
-		"OMP host tool catalog and tool policy omitted: Cursor can call only Cursor SDK tools exposed in this run.",
-		systemPrompt.slice(workflowStart).trimStart(),
-	].join("\n\n");
-}
-
 export function computeContextFingerprint(context: Context): string {
 	const systemHash = hashValue(serializeSystemPrompt(context.systemPrompt));
 	const messageCount = context.messages.length;
@@ -189,20 +176,8 @@ export function planSend(sendState: SendState, context: Context): SendPlan {
 	if (context.messages.length < previous.messageCount) {
 		return { mode: "bootstrap", resetAgent: true, reason: "context_divergence" };
 	}
-	if (previous.kind === "digest") {
-		if (messagePrefixDigest(context.messages, previous.messageCount) !== previous.prefixDigest) {
-			return { mode: "bootstrap", resetAgent: true, reason: "context_divergence" };
-		}
-	} else {
-		for (let index = 0; index < previous.messageHashes.length; index += 1) {
-			const message = context.messages[index]!;
-			const { role, json } = stableMessageParts(message);
-			if (hashValue(`${index}:${role}:${json}`) !== previous.messageHashes[index]) {
-				// Older v1 fingerprints include host metadata. Accept only an exact raw-message match.
-				if (previous.messageHashes[index] === hashValue(`${index}:${message.role}:${JSON.stringify(message)}`)) continue;
-				return { mode: "bootstrap", resetAgent: true, reason: "context_divergence" };
-			}
-		}
+	if (messagePrefixDigest(context.messages, previous.messageCount) !== previous.prefixDigest) {
+		return { mode: "bootstrap", resetAgent: true, reason: "context_divergence" };
 	}
 	const continuation = context.messages.length === previous.messageCount ? { continueOnly: true as const } : {};
 	if (hashValue(serializeSystemPrompt(context.systemPrompt)) !== previous.systemHash) {
@@ -216,11 +191,7 @@ export function planSend(sendState: SendState, context: Context): SendPlan {
 	return { mode: "incremental", resetAgent: false, reason: "incremental", ...continuation };
 }
 
-type ParsedFingerprint =
-	| { kind: "digest"; systemHash: string; messageCount: number; prefixDigest: string }
-	| { kind: "legacy"; systemHash: string; messageCount: number; messageHashes: string[] };
-
-function parseFingerprint(value: string): ParsedFingerprint | undefined {
+function parseFingerprint(value: string): { systemHash: string; messageCount: number; prefixDigest: string } | undefined {
 	try {
 		const parsed = JSON.parse(value) as {
 			format?: unknown;
@@ -228,28 +199,19 @@ function parseFingerprint(value: string): ParsedFingerprint | undefined {
 			systemHash?: unknown;
 			messageCount?: unknown;
 			prefixDigest?: unknown;
-			messageHashes?: unknown;
 		};
-		if (parsed.format !== NATIVE_HISTORY_FORMAT || typeof parsed.systemHash !== "string") return undefined;
 		if (
-			parsed.formatVersion === CONTEXT_FINGERPRINT_VERSION
-			&& Number.isSafeInteger(parsed.messageCount)
-			&& (parsed.messageCount as number) >= 0
-			&& typeof parsed.prefixDigest === "string"
-		) {
-			return {
-				kind: "digest",
-				systemHash: parsed.systemHash,
-				messageCount: parsed.messageCount as number,
-				prefixDigest: parsed.prefixDigest,
-			};
-		}
-		if (!Array.isArray(parsed.messageHashes) || !parsed.messageHashes.every((item) => typeof item === "string")) return undefined;
+			parsed.format !== NATIVE_HISTORY_FORMAT
+			|| parsed.formatVersion !== CONTEXT_FINGERPRINT_VERSION
+			|| typeof parsed.systemHash !== "string"
+			|| !Number.isSafeInteger(parsed.messageCount)
+			|| (parsed.messageCount as number) < 0
+			|| typeof parsed.prefixDigest !== "string"
+		) return undefined;
 		return {
-			kind: "legacy",
 			systemHash: parsed.systemHash,
-			messageCount: parsed.messageHashes.length,
-			messageHashes: parsed.messageHashes,
+			messageCount: parsed.messageCount as number,
+			prefixDigest: parsed.prefixDigest,
 		};
 	} catch {
 		return undefined;
@@ -518,8 +480,8 @@ export function prepareSendInput(
 		}
 		if (images.length > 0) current.images = images;
 	}
-	const sanitized = sanitizeSystemPromptForCursor(serializeSystemPrompt(context.systemPrompt));
-	const system = sanitized ? `System instructions from OMP:\n${sanitized}\n\n` : "";
+	const systemText = serializeSystemPrompt(context.systemPrompt).trim();
+	const system = systemText ? `System instructions from OMP:\n${systemText}\n\n` : "";
 	const tools = toolGuidance ? `${toolGuidance}\n\n` : "";
 	const toolContext = prior.length > 0 ? `${SDK_TOOL_CONTEXT}\n\n` : "";
 	const budget = inputTextBudget(current, limits);

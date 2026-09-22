@@ -22,20 +22,6 @@ const deepImportOwners: Record<string, Record<string, readonly string[]>> = {
 	"@oh-my-pi/pi-ai/providers/cursor": {
 		"src/native-history.ts": ["buildGrpcRequest"],
 	},
-	"@oh-my-pi/pi-ai/providers/cursor-pi-args": {
-		"scripts/omp-contract-probe.ts": [
-			"omitUndefinedArgs",
-			"piGrepSkip",
-			"piJoinPath",
-			"piLimit",
-			"piLsPath",
-			"piReadPath",
-			"piReadPathHasRange",
-		],
-	},
-	"@oh-my-pi/pi-ai/providers/cursor/exec-modern": {
-		"scripts/omp-contract-probe.ts": ["buildPiFindResult", "buildPiLsResult"],
-	},
 	"@oh-my-pi/pi-catalog/compat/revision": {
 		"src/catalog.ts": ["parseRevision", "parseRevisionConstraint", "revisionSatisfies"],
 	},

@@ -6,10 +6,11 @@ import { tmpdir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Agent, type InteractionUpdate, type Run, type RunResult, type RunStatus, type SDKAgent, type SDKCustomToolContext } from "@cursor/sdk";
+import type { Context } from "@oh-my-pi/pi-ai";
 import { DEFAULT_MODEL_ID, SDK_TOOL_CONTEXT, SYSTEM_PROMPT_REPLACEMENT } from "../src/constants.ts";
 import { requireCursorApiKey } from "../src/auth.ts";
 import { buildAgentOptions, openAgent, openJsonlStore, type OpenAgentInput } from "../src/sdk-session.ts";
-import { readNativeCheckpoint } from "../src/native-history.ts";
+import { readNativeCheckpoint, readSettledCheckpointOccupancy } from "../src/native-history.ts";
 
 const SELF = fileURLToPath(import.meta.url);
 const SDK_PIN = "1.0.31";
@@ -559,10 +560,14 @@ async function runNativeHistoryProbe(apiKey: string): Promise<boolean> {
 	const cwd = await mkdtemp(join(tmpdir(), "omp-cursor-runtime-probe-"));
 	const store = openJsonlStore(join(cwd, "store"));
 	const calls: Array<{ toolCallId?: string }> = [];
+	const replayed: Array<{ toolCallId?: string }> = [];
 	const echoCalls: Array<{ toolCallId?: string }> = [];
 	const toolEvents: Array<Record<string, unknown>> = [];
 	const results: ProbeResult[] = [];
 	const historyToken = `native-history-${randomUUID()}`;
+	const userEvidence = `final-user-${randomUUID()}`;
+	const developerEvidence = `final-developer-${randomUUID()}`;
+	const completedResult = `completed-result-${randomUUID()}`;
 	const abort = new AbortController();
 	const cancel = () => abort.abort(new Error("Probe cancelled"));
 	const timeout = setTimeout(() => abort.abort(new Error("Probe timed out after 240 seconds")), 240_000);
@@ -587,9 +592,11 @@ async function runNativeHistoryProbe(apiKey: string): Promise<boolean> {
 		finally { abort.signal.removeEventListener("abort", onAbort); }
 	};
 	let previousRoot: string | null | undefined;
+	let importedRoot: string | null | undefined;
 	const observe = async (phase: string, agentId: string, handle?: Run) => {
 		try {
 			const checkpoint = await bounded(readNativeCheckpoint(store, agentId));
+			if (phase === "after-bootstrap") importedRoot = checkpoint.rootBlobId;
 			console.log(`CHECKPOINT ${JSON.stringify({ phase, observedAt: Date.now(), ...checkpoint,
 				rootChanged: previousRoot === undefined ? null : checkpoint.rootBlobId !== previousRoot,
 				runId: handle?.id ?? null, runAgentId: handle?.agentId ?? null, runStatus: handle?.status ?? null })}`);
@@ -650,24 +657,98 @@ async function runNativeHistoryProbe(apiKey: string): Promise<boolean> {
 						return { content: [{ type: "text", text: `echo:${String(args.blob ?? "").length}` }] };
 					},
 				},
+				completed_lookup: {
+					description: "Already completed in imported history. Do not call.",
+					inputSchema: { type: "object", properties: { token: { type: "string" } }, required: ["token"] },
+					execute: async (args, context) => {
+						replayed.push({ toolCallId: context.toolCallId });
+						return { content: [{ type: "text", text: `replayed:${String(args.token ?? "")}` }] };
+					},
+				},
 			},
 		};
 		const options = buildAgentOptions(input);
 		if (options.systemPrompt !== undefined) throw new Error("v1 must not set AgentOptions.systemPrompt");
 		results.push({ name: "systemPrompt", ok: SYSTEM_PROMPT_REPLACEMENT === "unsupported",
-			detail: "GAP AgentOptions.systemPrompt omitted; sanitized OMP instructions are bootstrap text, not native system-role input" });
+			detail: "GAP AgentOptions.systemPrompt omitted; complete OMP instructions are bootstrap text, not native system-role input" });
 		const opening = openAgent({ ...input,
-			bootstrapHistory: [{ role: "user", content: `Remember this history token: ${historyToken}.`, timestamp: 1 }],
+			bootstrapHistory: [
+				{ role: "user", content: `Remember this history token: ${historyToken}.`, timestamp: 1 },
+				{
+					role: "assistant", provider: "openai", model: "original-model", api: "openai-responses", timestamp: 2,
+					content: [
+						{ type: "text", text: "Completed the lookup already." },
+						{ type: "toolCall", id: "probe_done_call", name: "completed_lookup", arguments: { token: "already-done" } },
+					],
+				},
+				{ role: "toolResult", toolCallId: "probe_done_call", toolName: "completed_lookup", content: [{ type: "text", text: completedResult }], isError: false, timestamp: 3 },
+				{ role: "user", content: userEvidence, timestamp: 4 },
+				{ role: "developer", content: developerEvidence, timestamp: 5 },
+			] as Context["messages"],
 		});
 		pendingCleanup.push(opening.catch(() => undefined));
 		agent = await bounded(opening);
 		store.agents.update = updateAgent;
 		await observe("after-bootstrap", agent.agentId);
-		const plain = await send(agent, `${SDK_TOOL_CONTEXT}\n\nReply with the remembered history token. Do not call any tools.`, "plain");
+		let retained = "";
+		try {
+			retained = JSON.stringify(await bounded(Agent.messages.list(agent.agentId, { cwd, store })));
+		} catch (error) {
+			abort.signal.throwIfAborted();
+			results.push({ name: "historyRetention", ok: false, detail: scrub(String(error), apiKey) });
+		}
+		if (retained) {
+			const missing = [
+				["historyToken", historyToken],
+				["assistant", "Completed the lookup already."],
+				["toolCall", "completed_lookup"],
+				["toolResult", completedResult],
+				["finalUser", userEvidence],
+				["finalDeveloper", developerEvidence],
+			].filter(([, text]) => !retained.includes(text)).map(([name]) => name);
+			results.push({
+				name: "historyRetention",
+				ok: missing.length === 0,
+				detail: missing.length === 0 ? "user assistant toolCall toolResult final-user final-developer retained" : `missing=${missing.join(",")}`,
+			});
+		}
+		results.push({
+			name: "importedToolReplay",
+			ok: replayed.length === 0,
+			detail: `callbacks=${replayed.length} ids=${replayed.map((call) => call.toolCallId ?? "<missing>").join(",") || "<none>"}`,
+		});
+		const plain = await send(agent, `${SDK_TOOL_CONTEXT}\n\nReply with the remembered history token. Do not call any tools, including completed_lookup.`, "plain");
 		const plainResult = await bounded(plain.wait());
 		await observe("plain-settled", agent.agentId, plain);
+		const settledId = agent.agentId;
+		const occupancy = await (async () => {
+			if (typeof importedRoot !== "string" || !importedRoot) return undefined;
+			const deadline = Date.now() + WINDOW_MS;
+			for (;;) {
+				const found = await bounded(readSettledCheckpointOccupancy(store, settledId, importedRoot));
+				if (found || Date.now() >= deadline) return found;
+				await bounded(sleep(25));
+			}
+		})();
+		let occupancyDetail = "imported root unavailable";
+		if (occupancy) {
+			occupancyDetail = `usedTokens=${occupancy.usedTokens} maxTokens=${occupancy.maxTokens} root=${occupancy.rootBlobId}`;
+		} else if (typeof importedRoot === "string" && importedRoot) {
+			try {
+				const checkpoint = await bounded(readNativeCheckpoint(store, settledId));
+				occupancyDetail = `unavailable ${JSON.stringify({
+					stable: checkpoint.stable, status: checkpoint.status, activeRunId: checkpoint.activeRunId,
+					rootBlobId: checkpoint.rootBlobId, newRoot: checkpoint.rootBlobId !== importedRoot,
+					tokenDetails: checkpoint.tokenDetails,
+				})}`;
+			} catch (error) {
+				abort.signal.throwIfAborted();
+				occupancyDetail = `unavailable ${scrub(String(error), apiKey)}`;
+			}
+		}
+		results.push({ name: "settledOccupancy", ok: Boolean(occupancy && occupancy.usedTokens > 0 && occupancy.maxTokens > 0 && occupancy.rootBlobId !== importedRoot), detail: occupancyDetail });
 		results.push({ name: "nativeHistory", ok: plainResult.status === "finished" && Boolean(plainResult.result?.includes(historyToken)), detail: formatRun(plainResult, apiKey) });
-		const toolRun = await send(agent, "Call ping with token alpha exactly once, then reply with the remembered history token. Do not use any other tool.", "ping");
+		const toolRun = await send(agent, "Call ping with token alpha exactly once, then reply with the remembered history token. Do not call completed_lookup or any other tool.", "ping");
 		const toolResult = toolRun.wait();
 		const first = await bounded(Promise.race([toolPaused.then(() => "paused" as const), toolResult.then(() => "finished" as const)]));
 		if (first === "paused") await observe("tool-paused", agent.agentId, toolRun);
@@ -690,13 +771,13 @@ async function runNativeHistoryProbe(apiKey: string): Promise<boolean> {
 		pendingCleanup.push(resuming.then((late) => { if (abort.signal.aborted) return late[Symbol.asyncDispose](); }).catch(() => undefined));
 		resumed = await bounded(resuming);
 		await observe("resumed-baseline", resumed.agentId);
-		const follow = await send(resumed, "Reply with the remembered history token. Do not call any tools.", "resume");
+		const follow = await send(resumed, "Reply with the remembered history token. Do not call any tools, including completed_lookup.", "resume");
 		const followResult = await bounded(follow.wait());
 		await observe("resume-settled", resumed.agentId, follow);
-		results.push({ name: "resume", ok: followResult.status === "finished" && Boolean(followResult.result?.includes(historyToken)) && calls.length === 1,
-			detail: `${formatRun(followResult, apiKey)} agentId=${resumed.agentId}` });
+		results.push({ name: "resume", ok: followResult.status === "finished" && Boolean(followResult.result?.includes(historyToken)) && calls.length === 1 && replayed.length === 0,
+			detail: `${formatRun(followResult, apiKey)} agentId=${resumed.agentId} replayed=${replayed.length}` });
 		const blob = `probe-blob-${"z".repeat(256)}`;
-		const echoRun = await send(resumed, `Call echo_blob exactly once with blob set to this exact string, then stop. Do not call ping.\n${blob}`, "echo");
+		const echoRun = await send(resumed, `Call echo_blob exactly once with blob set to this exact string, then stop. Do not call ping or completed_lookup.\n${blob}`, "echo");
 		const echoResult = await bounded(echoRun.wait());
 		await observe("echo-settled", resumed.agentId, echoRun);
 		console.log(`ARG_EVENTS ${JSON.stringify(toolEvents)}`);
@@ -706,6 +787,11 @@ async function runNativeHistoryProbe(apiKey: string): Promise<boolean> {
 			name: "customToolArgEvents",
 			ok: echoResult.status === "finished" && echoCalls.length >= 1,
 			detail: `ping ${summarizeArgEvents(pingEvents, calls.map((call) => call.toolCallId))} echo ${summarizeArgEvents(echoEvents, echoCalls.map((call) => call.toolCallId))} ${formatRun(echoResult, apiKey)}`,
+		});
+		results.push({
+			name: "completedToolNotReplayed",
+			ok: replayed.length === 0,
+			detail: `callbacks=${replayed.length} ids=${replayed.map((call) => call.toolCallId ?? "<missing>").join(",") || "<none>"}`,
 		});
 	} finally {
 		store.agents.update = updateAgent;
