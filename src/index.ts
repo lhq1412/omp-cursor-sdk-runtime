@@ -36,6 +36,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 					await callbacks.onPrompt({
 						message: "Paste a Cursor SDK API key from Cursor Dashboard → API Keys",
 						placeholder: "crsr_...",
+						secret: true,
 					})
 				).trim();
 				if (!apiKey) throw new Error("A Cursor SDK API key is required.");

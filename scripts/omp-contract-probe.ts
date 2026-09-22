@@ -2,17 +2,7 @@ import { deepStrictEqual, strictEqual } from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import type { ModelSelection } from "@cursor/sdk";
-import { Effort, toolWireSchema, type Context, type Tool, type ToolResultMessage } from "@oh-my-pi/pi-ai";
-import {
-	omitUndefinedArgs,
-	piGrepSkip,
-	piJoinPath,
-	piLimit,
-	piLsPath,
-	piReadPath,
-	piReadPathHasRange,
-} from "@oh-my-pi/pi-ai/providers/cursor-pi-args";
-import { buildPiFindResult, buildPiLsResult } from "@oh-my-pi/pi-ai/providers/cursor/exec-modern";
+import { Effort, toolWireSchema, type Context, type Tool } from "@oh-my-pi/pi-ai";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import {
 	ConversationStateStructureSchema,
@@ -53,85 +43,6 @@ for (const packageName of ompPackages) {
 	strictEqual(installed.version, expected, label(`${packageName} installed version must match manifest ${expected}`));
 	versions[packageName] = expected;
 }
-
-same([
-	piReadPath("fixture.ts"),
-	piReadPath("fixture.ts", 2, 3),
-	piReadPath("fixture.ts", 0),
-	piReadPath("fixture.ts", undefined, 4),
-	piReadPath("fixture.ts:raw", 2.9, 3.9),
-	piReadPath("fixture.ts", 1, 0),
-], ["fixture.ts", "fixture.ts:raw:2+3", "fixture.ts:raw:1-", "fixture.ts:raw:1+4", "fixture.ts:raw:2+3", null], "piReadPath fixtures changed");
-same([
-	piReadPathHasRange("fixture.ts"),
-	piReadPathHasRange("fixture.ts:raw"),
-	piReadPathHasRange("fixture.ts:5"),
-	piReadPathHasRange("fixture.ts:raw:5+2"),
-	piReadPathHasRange("fixture.ts:5-8:raw"),
-	piReadPathHasRange("fixture.ts:0"),
-], [false, false, true, true, true, false], "piReadPathHasRange fixtures changed");
-same([piGrepSkip(), piGrepSkip(0), piGrepSkip(-1), piGrepSkip(3.9)], [undefined, undefined, undefined, 3], "piGrepSkip fixtures changed");
-same([piLimit(undefined), piLimit(0), piLimit(-2), piLimit(3.9)], [undefined, 1, 1, 3], "piLimit fixtures changed");
-same([piLsPath(undefined), piLsPath(""), piLsPath("."), piLsPath("src")], [".", ".", ".", "src"], "piLsPath fixtures changed");
-same([
-	piJoinPath(undefined, "*.ts"),
-	piJoinPath(".", "*.ts"),
-	piJoinPath("src", "nested/*.ts").replaceAll("\\", "/"),
-	piJoinPath("src", "/absolute/*.ts"),
-], ["*.ts", "*.ts", "src/nested/*.ts", "/absolute/*.ts"], "piJoinPath fixtures changed");
-same(omitUndefinedArgs({ absent: undefined, zero: 0, no: false, empty: "", nil: null }), { zero: 0, no: false, empty: "", nil: null }, "omitUndefinedArgs fixtures changed");
-
-const piFindResult = buildPiFindResult({
-	role: "toolResult",
-	toolCallId: "find-fixture",
-	toolName: "glob",
-	content: [{ type: "text", text: "src/a.ts" }],
-	isError: false,
-	details: {
-		resultLimitReached: 25,
-		truncation: {
-			truncated: true,
-			truncatedBy: "bytes",
-			totalLines: 3,
-			outputLines: 1,
-			outputBytes: 8,
-		},
-	},
-	timestamp: 1,
-} satisfies ToolResultMessage);
-invariant(piFindResult.result.case === "success", "buildPiFindResult success case changed");
-same([
-	piFindResult.result.value.output,
-	piFindResult.result.value.resultLimitReached,
-	piFindResult.result.value.truncation?.truncated,
-	piFindResult.result.value.truncation?.truncatedBy,
-], ["src/a.ts", 25, true, "bytes"], "buildPiFindResult metadata changed");
-
-const piLsResult = buildPiLsResult({
-	role: "toolResult",
-	toolCallId: "ls-fixture",
-	toolName: "read",
-	content: [{ type: "text", text: "src/" }],
-	isError: false,
-	details: { meta: { limits: { resultLimit: { reached: 10 } } } },
-	timestamp: 1,
-} satisfies ToolResultMessage);
-invariant(piLsResult.result.case === "success", "buildPiLsResult success case changed");
-same([
-	piLsResult.result.value.output,
-	piLsResult.result.value.entryLimitReached,
-], ["src/", 10], "buildPiLsResult metadata changed");
-
-const piFindError = buildPiFindResult({
-	role: "toolResult",
-	toolCallId: "find-error-fixture",
-	toolName: "glob",
-	content: [{ type: "text", text: "denied" }],
-	isError: true,
-	timestamp: 1,
-} satisfies ToolResultMessage);
-invariant(piFindError.result.case === "error", "buildPiFindResult error case changed");
-strictEqual(piFindError.result.value.error, "denied", label("buildPiFindResult error text changed"));
 
 const bundledModel = getBundledModel("anthropic", "claude-sonnet-4-5");
 invariant(bundledModel?.id === "claude-sonnet-4-5", "getBundledModel must return the requested bundled model");

@@ -32,9 +32,10 @@ const ITEMS: ModelListItem[] = [{ id: "composer-2.5", displayName: "Composer 2.5
 type ToolEvent = { toolCallId: string; toolName: string };
 type RequestEvent = { cwd: string; sessionId: string; sessionFile: string | undefined };
 type HostSdkToolResult = {
-	content: Array<{ type: string; text?: string }>;
+	content: Array<{ type: string; text?: string; data?: string; mimeType?: string }>;
 	isError?: boolean;
 };
+type ToolEndEvent = { toolCallId: string; toolName: string; result: unknown; isError: boolean };
 type SpeculationHook = {
 	execute(context: { toolCall: { id: string } }, signal: AbortSignal): Promise<unknown>;
 };
@@ -45,6 +46,7 @@ type AgentToolWithSpeculation = {
 };
 interface CreateHostOptions {
 	onToolStart?: (event: ToolEvent) => void;
+	onToolEnd?: (event: ToolEndEvent) => void;
 	settings?: Parameters<typeof Settings.isolated>[0];
 	agentRegistry?: AgentRegistry;
 	agentId?: string;
@@ -71,6 +73,18 @@ function hostResult(result: SDKCustomToolResult): HostSdkToolResult {
 		throw new Error("Cursor SDK custom tool callback did not return host content");
 	}
 	return result as HostSdkToolResult;
+}
+
+function schemaProperties(tool: { inputSchema: unknown } | undefined, name: string): Record<string, unknown> {
+	const schema = tool?.inputSchema;
+	if (!schema || typeof schema !== "object" || Array.isArray(schema) || !("properties" in schema)) {
+		throw new Error(`${name} was not advertised as an object schema`);
+	}
+	const properties = schema.properties;
+	if (!properties || typeof properties !== "object" || Array.isArray(properties)) {
+		throw new Error(`${name} schema has no properties`);
+	}
+	return Object.fromEntries(Object.entries(properties));
 }
 
 function textOf(result: SDKCustomToolResult): string {
@@ -165,6 +179,14 @@ async function createHost(label: string, toolNames: string[], options: CreateHos
 			const observed = { toolCallId: event.toolCallId, toolName: event.toolName };
 			toolStarts.push(observed);
 			options.onToolStart?.(observed);
+		});
+		pi.on("tool_execution_end", event => {
+			options.onToolEnd?.({
+				toolCallId: event.toolCallId,
+				toolName: event.toolName,
+				result: event.result,
+				isError: event.isError,
+			});
 		});
 	};
 	const { session } = await createAgentSession({
@@ -575,5 +597,127 @@ describe("OMP 18.2 host compatibility", () => {
 		expect(runtimeTestUtils.slots.get(mainSlot.key)).toBe(mainSlot);
 		expect(mainSlot.agent?.agentId).toBe("aux-agent-1");
 		expect(readFileSync(mainSessionFile, "utf8")).toBe(mainJournal);
+	});
+
+	test("installed grants keep disabled find out and pass live bash, edit, read, and eval contracts", async () => {
+		const captured: SDKCustomToolResult[] = [];
+		const ends: ToolEndEvent[] = [];
+		let customTools: NonNullable<NonNullable<SendOptions["local"]>["customTools"]> | undefined;
+		runtimeTestUtils.setOpenAgent(async () => ({
+			agentId: "contract-agent",
+			async [Symbol.asyncDispose]() {},
+			async send(_message: SDKUserMessage, options?: SendOptions) {
+				customTools = options?.local?.customTools;
+				if (!customTools?.read || !customTools.bash || !customTools.edit || !customTools.eval || !customTools.glob) {
+					throw new Error("Cursor SDK fake did not receive the installed OMP grant");
+				}
+				if (customTools.find) throw new Error("disabled find was granted");
+				const pending = [
+					customTools.read.execute({ path: "wide.txt" }, { toolCallId: "read-wide" }),
+					customTools.read.execute({ path: "dot.png" }, { toolCallId: "read-image" }),
+					customTools.bash.execute({ command: "printf kept" }, { toolCallId: "bash-kept" }),
+				];
+				return run(async () => {
+					captured.push(...await Promise.all(pending));
+					return finished("contracts");
+				});
+			},
+		}) as unknown as SDKAgent);
+
+		const fixture = await createHost("contracts", ["read", "bash", "edit", "eval", "find", "glob"], {
+			settings: {
+				"edit.mode": "patch",
+				"eval.js": false,
+				"tools.speculativeExecution.enabled": false,
+			},
+			onToolEnd(event) {
+				ends.push(event);
+			},
+		});
+		fixtures.push(fixture);
+		writeFileSync(join(fixture.cwd, "wide.txt"), Array.from({ length: 3001 }, (_, index) =>
+			index === 0 ? "HEAD-MARKER" : index === 3000 ? "TAIL-MARKER" : "line",
+		).join("\n"));
+		writeFileSync(join(fixture.cwd, "dot.png"), Buffer.from(
+			"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==",
+			"base64",
+		));
+
+		await fixture.session.prompt("exercise installed tool contracts");
+		await fixture.session.waitForIdle();
+		if (!customTools) throw new Error("OMP did not send custom tools");
+		expect(Object.keys(customTools).sort()).toEqual(fixture.session.agent.state.tools.map(item => item.name).sort());
+		expect(customTools.find).toBeUndefined();
+		expect(schemaProperties(customTools.bash, "bash")).not.toHaveProperty("env");
+		expect(textOf(captured[2]!)).toContain("kept");
+
+		const editTool = fixture.session.agent.state.tools.find(item => item.name === "edit");
+		if (!editTool) throw new Error("OMP did not mount edit");
+		expect(customTools.edit.description).toContain(editTool.description);
+		const editExample = editTool.examples?.[0];
+		if (!editExample || typeof editExample.caption !== "string") throw new Error("patch edit did not expose an example");
+		expect(customTools.edit.description).toContain(editExample.caption);
+		const editProperties = schemaProperties(customTools.edit, "edit");
+		expect(editProperties).toHaveProperty("path");
+		expect(editProperties).toHaveProperty("edits");
+		expect(editProperties).not.toHaveProperty("old_string");
+
+		const evalTool = fixture.session.agent.state.tools.find(item => item.name === "eval");
+		if (!evalTool?.description) throw new Error("OMP did not mount eval guidance");
+		expect(customTools.eval.description).toContain(evalTool.description);
+		const evalCaption = evalTool.examples?.[0]?.caption;
+		if (typeof evalCaption === "string") expect(customTools.eval.description).toContain(evalCaption);
+		const evalProperties = schemaProperties(customTools.eval, "eval");
+		expect(evalProperties).toHaveProperty("language");
+		expect(evalProperties).toHaveProperty("code");
+
+		expect(textOf(captured[0]!)).toContain("HEAD-MARKER");
+		expect(textOf(captured[0]!)).not.toContain("TAIL-MARKER");
+		const wide = ends.find(event => event.toolName === "read" && JSON.stringify(event.result).includes("HEAD-MARKER"));
+		if (!wide || !wide.result || typeof wide.result !== "object" || !("details" in wide.result)) {
+			throw new Error("wide read did not finish with details");
+		}
+		const details = wide.result.details;
+		if (!details || typeof details !== "object" || Array.isArray(details) || !("truncation" in details)) {
+			throw new Error("wide read did not report truncation stats");
+		}
+		const truncation = details.truncation;
+		if (!truncation || typeof truncation !== "object" || Array.isArray(truncation)) {
+			throw new Error("wide read truncation stats are unreadable");
+		}
+		expect(truncation).not.toHaveProperty("content");
+
+		const image = hostResult(captured[1]!).content.find(block => block.type === "image");
+		expect(typeof image?.data).toBe("string");
+		expect(image?.data).not.toBe("");
+		expect(image?.mimeType).toMatch(/^image\//);
+	});
+
+	test("enabled find stays distinct from glob and does not widen the grant", async () => {
+		let customTools: NonNullable<NonNullable<SendOptions["local"]>["customTools"]> | undefined;
+		runtimeTestUtils.setOpenAgent(async () => ({
+			agentId: "find-agent",
+			async [Symbol.asyncDispose]() {},
+			async send(_message: SDKUserMessage, options?: SendOptions) {
+				customTools = options?.local?.customTools;
+				return run(async () => finished("find"));
+			},
+		}) as unknown as SDKAgent);
+
+		const fixture = await createHost("find-on", ["find", "glob", "read"], {
+			settings: { "find.enabled": true },
+		});
+		fixtures.push(fixture);
+		await fixture.session.prompt("list find");
+		await fixture.session.waitForIdle();
+		if (!customTools?.find || !customTools.glob) throw new Error("enabled find or glob was not granted");
+		expect(Object.keys(customTools).sort()).toEqual(fixture.session.agent.state.tools.map(item => item.name).sort());
+		expect(customTools.find).not.toBe(customTools.glob);
+		const findProperties = schemaProperties(customTools.find, "find");
+		expect(findProperties).toHaveProperty("query");
+		expect(findProperties).toHaveProperty("grep_keywords");
+		const findTool = fixture.session.agent.state.tools.find(item => item.name === "find");
+		if (!findTool?.description) throw new Error("OMP did not mount find");
+		expect(customTools.find.description).toContain(findTool.description);
 	});
 });

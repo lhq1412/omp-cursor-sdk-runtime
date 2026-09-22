@@ -17,6 +17,20 @@ function bootstrap(ctx: Context, limits: ModelInputLimits = modelLimits, targetM
 	return prepareSendInput(planSend(emptySendState(), ctx), ctx, limits, targetModelId);
 }
 
+function oldFingerprints(ctx: Context): string[] {
+	const current = JSON.parse(computeContextFingerprint(ctx));
+	return [
+		JSON.stringify({ ...current, formatVersion: 2 }),
+		JSON.stringify({
+			format: current.format,
+			systemHash: current.systemHash,
+			messageHashes: ctx.messages.map((message, index) =>
+				new Bun.CryptoHasher("sha256").update(`${index}:${message.role}:${JSON.stringify(message)}`).digest("hex").slice(0, 16),
+			),
+		}),
+	];
+}
+
 const firstUser = [{ role: "user", content: "hi", timestamp: 1 } as Context["messages"][number]];
 
 describe("send policy", () => {
@@ -131,38 +145,64 @@ describe("send policy", () => {
 		});
 	});
 
-	test("migrates exact legacy fingerprints without replaying committed input or accepting changed history", () => {
+	test.each(["user", "developer"] as const)("old fingerprints rebuild without resending the committed final %s", (role) => {
+		const prompt = "<system-conventions>\n# Internal URLs\nHOST_CATALOG\n§ Workflow\nkeep";
 		const ctx = context([
-			{
-				role: "assistant", content: [{ type: "text", text: "Prior answer" }], timestamp: 1,
-				completedAt: 2, contextSnapshot: { promptTokens: 100, nonMessageTokens: 10 },
-			},
-			{ role: "user", content: "Already executed request", timestamp: 3 },
-		] as Context["messages"]);
-		const legacy = JSON.parse(computeContextFingerprint(ctx));
-		delete legacy.formatVersion;
-		delete legacy.messageCount;
-		delete legacy.prefixDigest;
-		legacy.messageHashes = ctx.messages.map((message, index) =>
-			new Bun.CryptoHasher("sha256").update(`${index}:${message.role}:${JSON.stringify(message)}`).digest("hex").slice(0, 16),
-		);
-		const state = { bootstrapped: true, contextFingerprint: JSON.stringify(legacy), incrementalSendCount: 1 };
-		const plan = planSend(state, ctx);
-		expect(plan).toMatchObject({ mode: "incremental", resetAgent: false, continueOnly: true });
-		expect(prepareSendInput(plan, ctx, modelLimits).prompt.text).not.toContain("Already executed request");
-		const mature = planSend({ ...state, incrementalSendCount: 20_000 }, ctx);
-		expect(mature).toMatchObject({ mode: "incremental", resetAgent: false, continueOnly: true });
-		expect(prepareSendInput(mature, ctx, modelLimits).history).toBeUndefined();
-		const appended = context([...ctx.messages, { role: "user", content: "New request", timestamp: 4 }]);
-		const next = planSend(state, appended);
-		expect(next.mode).toBe("incremental");
-		expect(prepareSendInput(next, appended, modelLimits).prompt.text).toBe("New request");
-		const changed = structuredClone(ctx);
-		changed.messages[1] = { role: "user", content: "Different request", timestamp: 3 };
-		expect(planSend(state, changed)).toMatchObject({ mode: "bootstrap", reason: "context_divergence" });
-		expect(planSend(state, { ...ctx, systemPrompt: "Changed policy" })).toMatchObject({
-			mode: "bootstrap", reason: "context_divergence", continueOnly: true,
-		});
+			{ role: "assistant", content: [{ type: "text", text: "Prior answer" }], timestamp: 1, completedAt: 2 },
+			{ role, content: "Already executed request", timestamp: 3 },
+		] as Context["messages"], prompt);
+		for (const contextFingerprint of oldFingerprints(ctx)) {
+			const plan = planSend({
+				bootstrapped: true,
+				contextFingerprint,
+				incrementalSendCount: 20_000,
+			}, ctx);
+			expect(plan).toEqual({ mode: "bootstrap", resetAgent: true, reason: "context_divergence", continueOnly: true });
+			const prepared = prepareSendInput(plan, ctx, modelLimits);
+			expect(prepared.history).toEqual(ctx.messages);
+			expect(prepared.prompt.text).toContain(prompt);
+			expect(prepared.prompt.text).toContain(SDK_TOOL_CONTEXT);
+			expect(prepared.prompt.text).toEndWith(activeUserInput(ctx, true).text);
+			expect(prepared.prompt.text).not.toContain("Already executed request");
+			expect(prepared.prompt.text).not.toContain("Prior answer");
+		}
+		expect(planSend({
+			bootstrapped: true,
+			contextFingerprint: computeContextFingerprint(ctx),
+			incrementalSendCount: 20_000,
+		}, ctx)).toMatchObject({ mode: "incremental", resetAgent: false, continueOnly: true });
+	});
+
+	test.each(["user", "developer"] as const)("old fingerprints rebuild and send only the appended %s input", (role) => {
+		const previous = context([{ role: "user", content: "Already executed request", timestamp: 1 }]);
+		const next = context([...previous.messages, { role, content: "New request", timestamp: 2 }]);
+		for (const contextFingerprint of oldFingerprints(previous)) {
+			const plan = planSend({ bootstrapped: true, contextFingerprint, incrementalSendCount: 1 }, next);
+			expect(plan).toEqual({ mode: "bootstrap", resetAgent: true, reason: "context_divergence" });
+			const prepared = prepareSendInput(plan, next, modelLimits);
+			expect(prepared.history).toEqual(previous.messages);
+			expect(prepared.prompt.text).toEndWith("New request");
+			expect(prepared.prompt.text).not.toContain("Already executed request");
+		}
+	});
+
+	test("old fingerprint identity must match before treating current input as consumed", () => {
+		const previous = context([{ role: "user", content: "A different request", timestamp: 1 }]);
+		const next = context([{ role: "user", content: "Current request", timestamp: 1 }]);
+		const current = JSON.parse(computeContextFingerprint(next));
+		const { format: _format, ...flattened } = current;
+		for (const contextFingerprint of [
+			...oldFingerprints(previous),
+			JSON.stringify(flattened),
+			JSON.stringify({ ...current, formatVersion: 999 }),
+		]) {
+			const plan = planSend({ bootstrapped: true, contextFingerprint, incrementalSendCount: 1 }, next);
+			expect(plan).toEqual({ mode: "bootstrap", resetAgent: true, reason: "context_divergence" });
+			expect(prepareSendInput(plan, next, modelLimits)).toEqual({
+				prompt: { text: "System instructions from OMP:\nsys\n\nCurrent request" },
+				history: [],
+			});
+		}
 	});
 
 	test("rebuilds after a shortened history", () => {
@@ -289,25 +329,55 @@ describe("send policy", () => {
 		expect(incremental.prompt.text).not.toContain(SDK_TOOL_CONTEXT);
 	});
 
-	test("sanitizes structured OMP prompts and falls back when markers are absent", () => {
+	test("preserves the joined OMP prompt and only trims outer whitespace", () => {
 		const structured = [
 			"<system-conventions>",
 			"Stay in this prefix.",
 			"# Internal URLs",
-			"HOST_CATALOG must vanish",
+			"HOST_CATALOG must remain",
 			"§ Workflow",
 			"Keep this workflow.",
 		].join("\n");
 		const text = bootstrap(context(firstUser, structured)).prompt.text;
-		expect(text).toContain("Stay in this prefix.");
-		expect(text).toContain("Keep this workflow.");
-		expect(text).not.toContain("HOST_CATALOG");
-
-		const unmarked = "  Be terse. Extra.  ";
-		expect(bootstrap(context(firstUser, unmarked)).prompt.text).toContain("Be terse. Extra.");
-
+		expect(text).toBe(`System instructions from OMP:\n${structured}\n\nhi`);
+		expect(bootstrap(context(firstUser, "  Be terse. Extra.  ")).prompt.text).toBe(
+			"System instructions from OMP:\nBe terse. Extra.\n\nhi",
+		);
+		expect(bootstrap(context(firstUser, "  \n  ")).prompt.text).toBe("hi");
 		const incomplete = "<system-conventions>\n# Internal URLs\nHOST_CATALOG stays\nno workflow marker";
 		expect(bootstrap(context(firstUser, incomplete)).prompt.text).toContain(incomplete);
+
+		const padded = context(firstUser, "  policy  ");
+		const trimmed = context(firstUser, "policy");
+		expect(bootstrap(padded).prompt.text).toBe(bootstrap(trimmed).prompt.text);
+		expect(computeContextFingerprint(padded)).not.toBe(computeContextFingerprint(trimmed));
+
+		const changed = context(firstUser, structured.replace("HOST_CATALOG must remain", "HOST_CATALOG changed"));
+		expect(bootstrap(changed).prompt.text).toContain("HOST_CATALOG changed");
+		expect(planSend({
+			bootstrapped: true,
+			contextFingerprint: computeContextFingerprint(context(firstUser, structured)),
+			incrementalSendCount: 0,
+		}, changed)).toEqual({
+			mode: "bootstrap", resetAgent: true, reason: "context_divergence", continueOnly: true,
+		});
+		expect(prepareSendInput(
+			{ mode: "incremental", resetAgent: false, reason: "incremental" },
+			context(firstUser, structured),
+			modelLimits,
+		).prompt.text).toBe("hi");
+
+		const withHistory = context([
+			{ role: "user", content: "earlier", timestamp: 1 } as Context["messages"][number],
+			{ role: "user", content: "now", timestamp: 2 } as Context["messages"][number],
+		], structured);
+		const prepared = bootstrap(withHistory);
+		expect(prepared.history).toEqual(withHistory.messages.slice(0, -1));
+		expect(prepared.prompt.text).toBe(`System instructions from OMP:\n${structured}\n\n${SDK_TOOL_CONTEXT}\n\nnow`);
+		expect(prepared.prompt.text).not.toContain("earlier");
+
+		const bulky = `<system-conventions>\nprefix\n# Internal URLs\n${"x".repeat(20_000)}\n§ Workflow\nkeep`;
+		expect(() => bootstrap(context(firstUser, bulky), { contextWindow: 6000, maxTokens: 500 })).toThrow(/context window exceeded/i);
 	});
 	test("uses the final developer instruction including images instead of an earlier user", () => {
 		const ctx = context([
@@ -478,20 +548,6 @@ describe("send policy", () => {
 		expect(prepareSendInput({ mode: "incremental", resetAgent: false, reason: "incremental" }, uncompressed, limits).prompt.images).toHaveLength(1);
 	});
 
-	test("invalidates flattened fingerprints and hashes raw instructions before sanitation", () => {
-		const ctx = context(firstUser, "<system-conventions>\n# Internal URLs\nold catalog\n§ Workflow\nKeep going.");
-		const fingerprint = JSON.parse(computeContextFingerprint(ctx));
-		delete fingerprint.format;
-		expect(planSend({ bootstrapped: true, contextFingerprint: JSON.stringify(fingerprint), incrementalSendCount: 0 }, ctx)).toEqual({
-			mode: "bootstrap", resetAgent: true, reason: "context_divergence",
-		});
-		const changed = context(firstUser, "<system-conventions>\n# Internal URLs\nnew catalog\n§ Workflow\nKeep going.");
-		expect(bootstrap(changed).prompt).toEqual(bootstrap(ctx).prompt);
-		expect(planSend({ bootstrapped: true, contextFingerprint: computeContextFingerprint(ctx), incrementalSendCount: 0 }, changed)).toEqual({
-			mode: "bootstrap", resetAgent: true, reason: "context_divergence", continueOnly: true,
-		});
-	});
-
 	test("preserves joined system text fingerprint semantics", () => {
 		const ctx = context(firstUser, ["first", "second"]);
 		const equivalent = context(firstUser, "first\nsecond");
@@ -510,7 +566,7 @@ describe("send policy", () => {
 		expect(longFingerprint.length).toBe(shortFingerprint.length + 3);
 		expect(JSON.parse(longFingerprint)).toMatchObject({
 			format: "native-checkpoint-v1",
-			formatVersion: 2,
+			formatVersion: 3,
 			messageCount: 1_000,
 		});
 

@@ -151,6 +151,20 @@ function seedCommittedHandle(sessionFile: string, context: Context, agentId = "a
 	};
 }
 
+function oldContextFingerprints(ctx: Context): string[] {
+	const current = JSON.parse(computeContextFingerprint(ctx)) as { format: string; systemHash: string };
+	return [
+		JSON.stringify({ ...current, formatVersion: 2 }),
+		JSON.stringify({
+			format: current.format,
+			systemHash: current.systemHash,
+			messageHashes: ctx.messages.map((message, index) =>
+				new Bun.CryptoHasher("sha256").update(`${index}:${message.role}:${JSON.stringify(message)}`).digest("hex").slice(0, 16),
+			),
+		}),
+	];
+}
+
 describe("session runtime", () => {
 	test("child invalidation cannot abort a parent preparation or redirect its committed writer", async () => {
 		runtimeTestUtils.clear();
@@ -626,6 +640,181 @@ describe("session runtime", () => {
 		expect(histories).toEqual([undefined]);
 		expect(prepared.incremental).toBe(true);
 		expect(prepared.prompt?.text).toBe("second");
+	});
+
+	test("persisted v2 and legacy handles rebuild without resending consumed input", async () => {
+		const systemPrompt = "keep-system-policy";
+		const committed = "Already executed request";
+		const same = {
+			systemPrompt,
+			messages: [
+				{ role: "assistant", content: [{ type: "text", text: "Prior answer" }], timestamp: 1, completedAt: 2 },
+				{ role: "user", content: committed, timestamp: 3 },
+			],
+		} as Context;
+		const appended = {
+			systemPrompt,
+			messages: [...same.messages, { role: "developer", content: "New request", timestamp: 4 }],
+		} as Context;
+		async function openFrom(fingerprint: string, context: Context) {
+			runtimeTestUtils.clear();
+			liveRunTestUtils.clear();
+			scopeTestUtils.reset();
+			resumeTestUtils.reset();
+			const { sessionFile } = registerResume();
+			seedCommittedHandle(sessionFile, same);
+			resumeTestUtils.state.activeHandle!.sendState.contextFingerprint = fingerprint;
+			resumeTestUtils.state.activeHandle!.sendState.incrementalSendCount = 20_000;
+			const opens: Array<{ savedAgentId?: string }> = [];
+			const histories: Array<Context["messages"] | undefined> = [];
+			runtimeTestUtils.setOpenAgent(async (input) => {
+				opens.push({ savedAgentId: input.savedAgentId });
+				histories.push(input.bootstrapHistory);
+				return fakeAgent("agent-new");
+			});
+			const prepared = await prepareTurn({
+				modelLimits, cwd: "/tmp/project", agentInstanceId: "main", apiKey: "test-key",
+				modelSelection: { id: "composer-2.5" }, context, grantedTools: [],
+			});
+			return { opens, histories, prepared };
+		}
+		for (const fingerprint of oldContextFingerprints(same)) {
+			const identical = await openFrom(fingerprint, same);
+			expect(identical.opens).toEqual([{ savedAgentId: undefined }]);
+			expect(identical.histories).toEqual([same.messages]);
+			expect(identical.prepared.incremental).toBe(false);
+			expect(identical.prepared.prompt?.text).toContain(systemPrompt);
+			expect(identical.prepared.prompt?.text).not.toContain(committed);
+			expect(identical.prepared.prompt?.text).not.toContain("Prior answer");
+			const next = await openFrom(fingerprint, appended);
+			expect(next.opens).toEqual([{ savedAgentId: undefined }]);
+			expect(next.histories).toEqual([same.messages]);
+			expect(next.prepared.incremental).toBe(false);
+			expect(next.prepared.prompt?.text).toEndWith("New request");
+			expect(next.prepared.prompt?.text).not.toContain(committed);
+		}
+	});
+
+
+	test("resumes a matching persisted tool contract and bootstraps history when description or schema changes", async () => {
+		const readTool = { name: "read", description: "read files", inputSchema: { type: "object", properties: { path: { type: "string" } } } };
+		const firstContext = userContext("already-executed-request");
+		const secondContext = {
+			messages: [
+				firstContext.messages[0]!,
+				{ role: "user", content: "new-request-after-resume", timestamp: 2 } as Context["messages"][number],
+			],
+		} as Context;
+		async function resumeWith(nextTools: GrantedTool[]) {
+			runtimeTestUtils.clear();
+			liveRunTestUtils.clear();
+			scopeTestUtils.reset();
+			resumeTestUtils.reset();
+			const { sessionFile } = registerResume();
+			seedCommittedHandle(sessionFile, firstContext, "agent-old", [readTool]);
+			expect(JSON.parse(resumeTestUtils.state.activeHandle!.sendState.contextFingerprint).formatVersion).toBe(3);
+			const host = createFakeHost({ cwd: "/tmp/project", tools: ["read"] });
+			const opens: Array<{ savedAgentId?: string }> = [];
+			const histories: Array<Context["messages"] | undefined> = [];
+			runtimeTestUtils.setOpenAgent(async (input) => {
+				opens.push({ savedAgentId: input.savedAgentId });
+				histories.push(input.bootstrapHistory);
+				return fakeAgent(input.savedAgentId ?? "agent-new");
+			});
+			const prepared = await prepareTurn({
+				modelLimits, cwd: "/tmp/project", agentInstanceId: "main", apiKey: "test-key",
+				modelSelection: { id: "composer-2.5" }, context: secondContext, grantedTools: nextTools, host,
+			});
+			return { prepared, opens, histories, host };
+		}
+
+		const matched = await resumeWith([readTool]);
+		expect(matched.opens).toEqual([{ savedAgentId: "agent-old" }]);
+		expect(matched.histories).toEqual([undefined]);
+		expect(matched.prepared.incremental).toBe(true);
+		expect(matched.prepared.continuing).toBe(false);
+		expect(matched.prepared.prompt?.text).toBe("new-request-after-resume");
+		const resumed = matched.prepared.customTools.read;
+		expect(resumed?.description).toBe("read files");
+		await expect(resumed!.execute({ path: "kept.ts" }, { toolCallId: "sdk-live-1" })).resolves.toMatchObject({
+			isError: false,
+			content: [{ type: "text", text: "ok:read" }],
+		});
+		expect(matched.host.calls).toEqual([{ name: "read", args: { path: "kept.ts" }, toolCallId: "sdk-live-1" }]);
+
+		for (const nextTools of [
+			[{ ...readTool, description: "read files carefully" }],
+			[{ ...readTool, inputSchema: { type: "object", properties: { path: { type: "string" }, encoding: { type: "string" } } } }],
+		]) {
+			const changed = await resumeWith(nextTools);
+			expect(changed.opens).toEqual([{ savedAgentId: undefined }]);
+			expect(changed.histories).toEqual([firstContext.messages]);
+			expect(changed.prepared.incremental).toBe(false);
+			expect(changed.prepared.prompt?.text).toContain("new-request-after-resume");
+			expect(changed.prepared.prompt?.text).not.toContain("already-executed-request");
+			expect(changed.prepared.customTools.read?.description).toBe(nextTools[0]!.description);
+			expect(changed.host.calls).toEqual([]);
+		}
+	});
+
+	test("parked result mismatch stays fail closed beside a matching committed tool handle", async () => {
+		runtimeTestUtils.clear();
+		liveRunTestUtils.clear();
+		scopeTestUtils.reset();
+		resumeTestUtils.reset();
+		const { sessionFile } = registerResume();
+		const tools = [{ name: "read", description: "read files", inputSchema: { type: "object", properties: { path: { type: "string" } } } }];
+		const context = userContext("already-executed-request");
+		seedCommittedHandle(sessionFile, context, "agent-old", tools);
+		const host = createFakeHost({ cwd: "/tmp/project", tools: ["read"] });
+		const opened: Array<string | undefined> = [];
+		runtimeTestUtils.setOpenAgent(async (input) => {
+			opened.push(input.savedAgentId);
+			return fakeAgent(input.savedAgentId ?? "agent-new");
+		});
+		const first = await prepareTurn({
+			modelLimits, cwd: "/tmp/project", agentInstanceId: "main", apiKey: "test-key",
+			modelSelection: { id: "composer-2.5" }, context, grantedTools: tools, host,
+		});
+		const parked = Promise.withResolvers<HostToolResult>();
+		const rejection = parked.promise.catch((error) => error);
+		first.live.parked.push({
+			name: "read",
+			args: { path: "a.ts" },
+			sdkToolCallId: "sdk-call-1",
+			ompToolCallId: "call-1",
+			yielded: true,
+			resolve: parked.resolve,
+			reject: parked.reject,
+		});
+		const mismatched: Context = {
+			messages: [
+				context.messages[0]!,
+				{
+					role: "assistant",
+					content: [{ type: "toolCall", id: "call-1", name: "read", arguments: { path: "a.ts" } }],
+					timestamp: 2,
+				},
+				{
+					role: "toolResult",
+					toolCallId: "stale-call",
+					toolName: "read",
+					content: [{ type: "text", text: "stale" }],
+					isError: false,
+					timestamp: 3,
+				},
+			],
+		} as Context;
+		await expect(prepareTurn({
+			modelLimits, cwd: "/tmp/project", agentInstanceId: "main", apiKey: "test-key",
+			modelSelection: { id: "composer-2.5" }, context: mismatched, grantedTools: tools, host,
+		})).rejects.toThrow(/do not match/);
+		expect(opened).toEqual(["agent-old"]);
+		expect(await rejection).toBeInstanceOf(Error);
+		expect(getLiveRun(first.slot.key)).toBeUndefined();
+		expect(first.live.cancelled).toBe(true);
+		expect(first.slot.bindingState).toBe("dirty");
+		expect(host.calls).toEqual([]);
 	});
 
 	test("does not resume a committed handle whose cwd differs from this turn", async () => {

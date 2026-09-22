@@ -722,6 +722,153 @@ describe("provider session events reject parked work", () => {
 		await handlers.get("session_switch")?.[0]?.({ type: "session_switch", reason: "new" }, ctx);
 		expectAborted(await bounded(pending));
 	});
+
+	const READ_TOKEN = "export const answer = 42";
+	const DROPPED_PREFIX = "obsolete request about vanished.ts";
+
+	function readParkContext(): Context {
+		return {
+			messages: [{ role: "user", content: "Read a.ts and report the token", timestamp: 1 }],
+			tools: [{ name: "read", description: "read a file", parameters: { type: "object", properties: { path: { type: "string" } } } } as Tool],
+		};
+	}
+
+	async function compactParkedRead(handlers: Map<string, Array<(event: unknown, ctx: unknown) => unknown>>, ctx: unknown) {
+		const parked = await bounded(collect({ apiKey: "test-key", cwd, onPayload: scopeTestUtils.bindRequest }, readParkContext()));
+		const terminal = expectOneTerminal(parked);
+		expect(terminal).toMatchObject({ type: "done", reason: "toolUse" });
+		if (terminal.type !== "done") throw new Error("expected toolUse");
+		const call = terminal.message.content.find((block) => block.type === "toolCall");
+		if (call?.type !== "toolCall") throw new Error("expected parked tool call");
+		const live = getLiveRun(runtime.runtimeKey());
+		expect(live?.parked).toHaveLength(1);
+		const rejected = Promise.withResolvers<void>();
+		let resumed = false;
+		const callback = live!.parked[0]!;
+		const previous = callback.reject.bind(callback);
+		callback.reject = (error) => {
+			previous(error);
+			rejected.resolve();
+		};
+		callback.resolve = () => { resumed = true; };
+		for (const handler of handlers.get("session_compact") ?? []) {
+			await handler({
+				type: "session_compact",
+				reason: "new",
+				compactionEntry: { type: "compaction", id: "c1", parentId: "u1" },
+			}, ctx);
+		}
+		await bounded(rejected.promise);
+		expect(getMatchingResumeHandle("main", undefined, cwd)).toBeUndefined();
+		const summary = `Completed read of a.ts. Token: ${READ_TOKEN}. Dropped prefix: ${DROPPED_PREFIX}`;
+		const effective: Context = {
+			messages: [
+				{ role: "compactionSummary", summary, tokensBefore: 64, timestamp: 0 } as Context["messages"][number],
+				readParkContext().messages[0]!,
+				terminal.message,
+				{
+					role: "toolResult",
+					toolCallId: call.id,
+					toolName: call.name,
+					content: [{ type: "text", text: READ_TOKEN }],
+					isError: false,
+					timestamp: 3,
+				},
+				{ role: "user", content: "Recall the token without reading again", timestamp: 4 },
+			],
+			tools: readParkContext().tools,
+		};
+		return { effective, resumed: () => resumed };
+	}
+
+	test("compact after a completed read imports the summary and retained tail on a fresh agent without replay", async () => {
+		const { handlers, ctx } = hooks();
+		let executions = 0;
+		const opens: Array<{ savedAgentId?: string; history?: Context["messages"]; prompt?: unknown }> = [];
+		runtime.__testUtils.setOpenAgent(async (input) => {
+			const record = { savedAgentId: input.savedAgentId, history: input.bootstrapHistory, prompt: undefined as unknown };
+			opens.push(record);
+			return {
+				agentId: `agent-${opens.length}`,
+				async [Symbol.asyncDispose]() {},
+				async send(message: unknown, options?: SendOptions) {
+					record.prompt = message;
+					const tool = options?.local?.customTools?.read;
+					if (opens.length === 1 && tool) {
+						executions += 1;
+						void tool.execute({ path: "a.ts" }, { toolCallId: "call-read" }).catch(() => undefined);
+						return await new Promise<Run>(() => undefined);
+					}
+					return { supports: () => false, wait: async () => ({ status: "finished", result: "continued" }) } as unknown as Run;
+				},
+			} as unknown as SDKAgent;
+		});
+		const { effective, resumed } = await compactParkedRead(handlers, ctx);
+		const next = await bounded(collect({ apiKey: "test-key", cwd, onPayload: scopeTestUtils.bindRequest }, effective));
+		const imported = effective.messages.slice(0, -1);
+		expect(opens).toHaveLength(2);
+		expect(opens[1]).toMatchObject({ savedAgentId: undefined, history: imported });
+		expect(JSON.stringify(imported)).toContain(READ_TOKEN);
+		expect(imported.some((message) => message.role === "user" && message.content === DROPPED_PREFIX)).toBe(false);
+		expect(JSON.stringify(opens[1]?.prompt)).toContain("Recall the token without reading again");
+		expect(JSON.stringify(opens[1]?.prompt)).not.toContain(READ_TOKEN);
+		expect(JSON.stringify(opens[1]?.prompt)).not.toContain("Read a.ts and report the token");
+		expect(next.some((event) => event.type === "toolcall_start")).toBe(false);
+		expect(expectOneTerminal(next)).toMatchObject({ type: "done", reason: "stop", message: { content: [{ type: "text", text: "continued" }] } });
+		expect(executions).toBe(1);
+		expect(resumed()).toBe(false);
+	});
+
+	test("aborting the post-compact continuation does not resume or replay the completed read", async () => {
+		const { handlers, ctx } = hooks();
+		let executions = 0;
+		const opens: Array<{ savedAgentId?: string; history?: Context["messages"]; prompt?: unknown }> = [];
+		const entered = deferred<void>();
+		const release = deferred<Run>();
+		runtime.__testUtils.setOpenAgent(async (input) => {
+			const record = { savedAgentId: input.savedAgentId, history: input.bootstrapHistory, prompt: undefined as unknown };
+			opens.push(record);
+			return {
+				agentId: `agent-${opens.length}`,
+				async [Symbol.asyncDispose]() {},
+				async send(message: unknown, options?: SendOptions) {
+					record.prompt = message;
+					const tool = options?.local?.customTools?.read;
+					if (opens.length === 1 && tool) {
+						executions += 1;
+						void tool.execute({ path: "a.ts" }, { toolCallId: "call-read" }).catch(() => undefined);
+						return await new Promise<Run>(() => undefined);
+					}
+					if (opens.length === 2) {
+						entered.resolve();
+						return await release.promise;
+					}
+					return { supports: () => false, wait: async () => ({ status: "finished", result: "continued" }) } as unknown as Run;
+				},
+			} as unknown as SDKAgent;
+		});
+		const { effective, resumed } = await compactParkedRead(handlers, ctx);
+		const imported = effective.messages.slice(0, -1);
+		const controller = new AbortController();
+		const pending = collect({ apiKey: "test-key", cwd, signal: controller.signal, onPayload: scopeTestUtils.bindRequest }, effective);
+		await awaitEntered(entered.promise, pending);
+		controller.abort();
+		expectAborted(await bounded(pending));
+		expect(opens[1]).toMatchObject({ savedAgentId: undefined, history: imported });
+		expect(JSON.stringify(opens[1]?.prompt)).not.toContain(READ_TOKEN);
+		expect(executions).toBe(1);
+		expect(resumed()).toBe(false);
+
+		const followUp = collect({ apiKey: "test-key", cwd, onPayload: scopeTestUtils.bindRequest }, effective);
+		release.resolve({ supports: () => false, wait: async () => ({ status: "cancelled", result: "stale compact" }) } as unknown as Run);
+		const events = await bounded(followUp);
+		expect(opens[2]).toMatchObject({ savedAgentId: undefined, history: imported });
+		expect(expectOneTerminal(events)).toMatchObject({ type: "done", reason: "stop" });
+		expect(JSON.stringify(events)).not.toContain("stale compact");
+		expect(events.some((event) => event.type === "toolcall_start")).toBe(false);
+		expect(executions).toBe(1);
+		expect(resumed()).toBe(false);
+	});
 });
 
 describe("provider grant fail-closed", () => {
