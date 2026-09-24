@@ -699,6 +699,28 @@ describe("streamCursorRuntime model selection", () => {
 		expect(customTools).toEqual([]);
 	});
 
+	test("auxiliary turn with context.tools strips SDK customTools instead of failing", async () => {
+		let customTools: string[] = [];
+		runtimeTestUtils.setOpenAgent(async (input) => {
+			customTools = Object.keys(input.customTools);
+			return {
+				agentId: "aux-1",
+				close() {},
+				async [Symbol.asyncDispose]() {},
+				async send() { return finishedRun(); },
+			} as unknown as SDKAgent;
+		});
+		const events = [];
+		for await (const event of streamCursorRuntime(cursorModel("composer-2.5", 200_000), userContext("hi", [readTool()]), {
+			apiKey: "test-key",
+			cwd: "/tmp/project",
+		})) {
+			events.push(event);
+		}
+		expect(customTools).toEqual([]);
+		expect(events.at(-1)).toMatchObject({ type: "done", reason: "stop" });
+	});
+
 	test.each(["disableReasoning", "forceReasoningOff"] as const)("%s wins over reasoning and still uses catalog context threshold", async (offOption) => {
 		const created: ModelSelection[] = [];
 		const sent: ModelSelection[] = [];

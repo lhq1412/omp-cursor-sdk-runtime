@@ -34,6 +34,8 @@ export interface CursorModelMetadata {
 	supportsFast: boolean;
 	defaultFast: boolean;
 	supportsReasoning: boolean;
+	/** Mandatory-reasoning models clamp thinking-off to the lowest supported effort. */
+	requiresEffort?: boolean;
 	thinkingLevelMap?: ThinkingLevelMap;
 	/** SDK id written for effort levels: `effort` or `reasoning_effort`. */
 	effortParameterId?: string;
@@ -161,6 +163,11 @@ function cursorContextWindowFloor(modelId: string): number | undefined {
 	}
 	if (identity.class === "openai" && revisionMatches(identity.revision, ">=5.6 <5.7")) return 272_000;
 	return undefined;
+}
+
+// ponytail: Local SDK 1.0.32 rejects Grok 4.7 500k; delete when live probe passes.
+function isRejectedLocalContext(baseModelId: string, context: string): boolean {
+	return normalizeParamValue(context) === "500k" && /^grok-4\.7($|[-@])/i.test(baseModelId);
 }
 
 function advertisedContextWindow(
@@ -296,7 +303,7 @@ function getEffortParameter(item: ModelListItem): ModelParameterDefinition | und
 	return getParameter(item, "effort") ?? getParameter(item, "reasoning_effort");
 }
 
-function getThinkingLevelMap(item: ModelListItem): ThinkingLevelMap | undefined {
+function getThinkingLevelMap(item: ModelListItem): { map: ThinkingLevelMap; requiresEffort: boolean } | undefined {
 	const reasoningParameter = getParameter(item, "reasoning");
 	const effortParameter = getEffortParameter(item);
 	const thinkingParameter = getParameter(item, "thinking");
@@ -304,16 +311,19 @@ function getThinkingLevelMap(item: ModelListItem): ThinkingLevelMap | undefined 
 	if (!valueParameter) return undefined;
 	if (valueParameter.id === "thinking" && hasBooleanValues(valueParameter)) {
 		return {
-			off: getParameterValue(valueParameter, "false"),
-			minimal: null,
-			low: null,
-			medium: null,
-			high: getParameterValue(valueParameter, "true"),
-			xhigh: null,
-			max: null,
+			map: {
+				off: getParameterValue(valueParameter, "false"),
+				minimal: null,
+				low: null,
+				medium: null,
+				high: getParameterValue(valueParameter, "true"),
+				xhigh: null,
+				max: null,
+			},
+			requiresEffort: false,
 		};
 	}
-	return {
+	const map: ThinkingLevelMap = {
 		off:
 			getParameterValue(reasoningParameter, "none") ??
 			getParameterValue(reasoningParameter, "off") ??
@@ -327,6 +337,33 @@ function getThinkingLevelMap(item: ModelListItem): ThinkingLevelMap | undefined 
 		xhigh: mapComparableLevel(valueParameter, Effort.XHigh),
 		max: mapComparableLevel(valueParameter, Effort.Max),
 	};
+	let requiresEffort = false;
+	if (map.off == null) {
+		const effortId = effortParameter?.id ?? (valueParameter.id === "reasoning" ? valueParameter.id : undefined);
+		if (effortId) {
+			const variants = item.variants ?? [];
+			const omitsEffort = variants.length > 0 && variants.some(
+				(variant) => !(variant.params ?? []).some((param) => param.id === effortId),
+			);
+			if (omitsEffort) {
+				map.off = "";
+			} else {
+				let floor: string | null = null;
+				for (const effort of OMP_THINKING_EFFORTS) {
+					const value = map[effort];
+					if (value != null) {
+						floor = value;
+						break;
+					}
+				}
+				if (floor != null) {
+					map.off = floor;
+					requiresEffort = true;
+				}
+			}
+		}
+	}
+	return { map, requiresEffort };
 }
 
 function getSupportedThinkingEfforts(thinkingLevelMap: ThinkingLevelMap | undefined): Effort[] {
@@ -368,7 +405,8 @@ function deleteParam(params: ModelParameterValue[], id: string): void {
 
 function toMetadata(identity: SelectionIdentity, defaultParams: ModelParameterValue[]): CursorModelMetadata {
 	const { model, context, contextTiers, piModelId } = identity;
-	const thinkingLevelMap = getThinkingLevelMap(model);
+	const thinking = getThinkingLevelMap(model);
+	const thinkingLevelMap = thinking?.map;
 	const supportedThinkingEfforts = getSupportedThinkingEfforts(thinkingLevelMap);
 	const effortParameter = getEffortParameter(model);
 	const effectiveContext = context ?? contextTiers?.extended.value ?? getParamValue(defaultParams, "context");
@@ -392,6 +430,7 @@ function toMetadata(identity: SelectionIdentity, defaultParams: ModelParameterVa
 		supportsFast: getParameter(model, "fast") !== undefined,
 		defaultFast: fastValue === "true",
 		supportsReasoning: supportedThinkingEfforts.length > 0,
+		...(thinking?.requiresEffort ? { requiresEffort: true } : {}),
 		...(thinkingLevelMap ? { thinkingLevelMap } : {}),
 		...(effortParameter ? { effortParameterId: effortParameter.id } : {}),
 		parameterIds: {
@@ -450,6 +489,7 @@ function toModelConfig(metadata: CursorModelMetadata, name: string): ProviderMod
 				thinking: {
 					mode: "effort" as const,
 					efforts: getSupportedThinkingEfforts(metadata.thinkingLevelMap),
+					...(metadata.requiresEffort ? { requiresEffort: true } : {}),
 				},
 			}
 			: {}),
@@ -551,6 +591,11 @@ function applyThinkingLevel(
 	const mapped = metadata.thinkingLevelMap?.[level];
 	if (mapped === undefined || mapped === null) return;
 	if (level === "off") {
+		if (mapped === "") {
+			if (metadata.effortParameterId) deleteParam(params, metadata.effortParameterId);
+			else if (metadata.parameterIds.reasoning) deleteParam(params, "reasoning");
+			return;
+		}
 		if (metadata.parameterIds.thinking && mapped === "false") {
 			setParam(params, "thinking", mapped);
 			if (metadata.effortParameterId) deleteParam(params, metadata.effortParameterId);
@@ -620,6 +665,12 @@ export function buildModelSelection(
 	applyThinkingLevel(metadata, params, thinkingLevel);
 	if (metadata.supportsFast && options.fastEnabled !== undefined) {
 		setParam(params, "fast", options.fastEnabled ? "true" : "false");
+	}
+	const context = getParamValue(params, "context");
+	if (context && isRejectedLocalContext(metadata.baseModelId, context)) {
+		throw new Error(
+			`Cursor Local SDK currently rejects ${metadata.baseModelId} ${context}; disable Extended Context.`,
+		);
 	}
 	return params.length > 0 ? { id: metadata.baseModelId, params } : { id: metadata.baseModelId };
 }
