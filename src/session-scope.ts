@@ -39,9 +39,20 @@ export function withCursorSessionOwner<T>(owner: CursorSessionOwner, run: () => 
 	return context.run(owner, run);
 }
 
-/** Unbound requests never inherit a session just because its routing id matches. */
+/** Unbound requests: stable conversationKey/sessionId reuses a non-persistent side scope; bare ephemeral stays one-shot. */
 export function ownerForRequest(sessionId?: string, cwd?: string): CursorSessionOwner {
-	return createOwner(sessionId, undefined, cwd);
+	if (!sessionId) return createOwner(undefined, undefined, cwd);
+	const scopeKey = `${EPHEMERAL_SESSION_SCOPE_PREFIX}${sessionId}`;
+	const existing = owners.get(scopeKey);
+	if (existing) {
+		if (cwd) existing.cwd = cwd;
+		existing.sessionId = sessionId;
+		return existing;
+	}
+	const owner = createOwner(sessionId, undefined, cwd);
+	owner.scopeKey = scopeKey;
+	owners.set(scopeKey, owner);
+	return owner;
 }
 
 export function ownerForContext(ctx: ExtensionContext): CursorSessionOwner {

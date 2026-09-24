@@ -593,7 +593,8 @@ describe("OMP 18.3 host compatibility", () => {
 			{ agentId: "aux-agent-2", savedAgentId: undefined },
 		]);
 		expect(main.requests).toHaveLength(1);
-		expect(disposed).toContain("aux-agent-2");
+		// conversationKey/sessionId side turns keep process-local lineage; main binding stays intact.
+		expect(disposed.has("aux-agent-2")).toBe(false);
 		expect(runtimeTestUtils.slots.get(mainSlot.key)).toBe(mainSlot);
 		expect(mainSlot.agent?.agentId).toBe("aux-agent-1");
 		expect(readFileSync(mainSessionFile, "utf8")).toBe(mainJournal);

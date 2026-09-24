@@ -148,6 +148,9 @@ describe("identity mapping", () => {
 		expect(buildModelSelection("grok-4.7-max", "off", { extendedContextEnabled: false }).params).toEqual(
 			expect.arrayContaining([{ id: "context", value: "256k" }]),
 		);
+		expect(() => buildModelSelection("grok-4.7-max", "off", { extendedContextEnabled: true })).toThrow(
+			/rejects grok-4\.7-max 500k; disable Extended Context/,
+		);
 		expect(getModelMetadata("grok-4.5-max")?.contextWindow).toBe(1_000_000);
 		expect(getModelMetadata("grok-4.5-max")?.extendedContext?.standardContextWindow).toBe(256_000);
 		expect(getModelMetadata("default")?.contextWindow).toBe(256_000);
@@ -345,8 +348,8 @@ describe("thinking selection", () => {
 		expect(buildModelSelection("bool-only", "high").params).toEqual([{ id: "thinking", value: "true" }]);
 		expect(buildModelSelection("missing", "high")).toEqual({ id: "missing" });
 	});
-	test("reasoning_effort-only writes effort id and leaves off at variant default", () => {
-		__testUtils.registerModelItems([
+	test("reasoning_effort-only clamps off to lowest effort and marks requiresEffort", () => {
+		const models = __testUtils.registerModelItems([
 			item({
 				id: "grok-effort",
 				parameters: [param("reasoning_effort", ["low", "medium", "high", "xhigh"])],
@@ -356,11 +359,14 @@ describe("thinking selection", () => {
 		const metadata = getModelMetadata("grok-effort");
 		expect(metadata?.effortParameterId).toBe("reasoning_effort");
 		expect(metadata?.parameterIds.effort).toBe(true);
+		expect(metadata?.requiresEffort).toBe(true);
+		expect(metadata?.thinkingLevelMap?.off).toBe("low");
+		expect(models[0]?.thinking).toMatchObject({ mode: "effort", requiresEffort: true, efforts: ["low", "medium", "high", "xhigh"] });
 		expect(buildModelSelection("grok-effort", "high").params).toEqual([
 			{ id: "reasoning_effort", value: "high" },
 		]);
 		expect(buildModelSelection("grok-effort", "off").params).toEqual([
-			{ id: "reasoning_effort", value: "medium" },
+			{ id: "reasoning_effort", value: "low" },
 		]);
 	});
 });

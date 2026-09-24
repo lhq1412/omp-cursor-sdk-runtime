@@ -151,7 +151,8 @@ export class ProviderTurnRunner {
 			stream.push({ type: "error", reason: aborted ? "aborted" : "error", error: partial });
 			stream.end(partial);
 		} finally {
-			if (this.auxiliary && this.owner) await disposeRuntimeForScope(this.owner.scopeKey);
+			// One-shot ephemeral only; conversationKey/sessionId side turns keep process-local lineage.
+			if (this.auxiliary && this.owner && !this.owner.sessionId) await disposeRuntimeForScope(this.owner.scopeKey);
 		}
 	}
 
@@ -162,12 +163,12 @@ export class ProviderTurnRunner {
 		this.apiKey = requireCursorApiKey(typeof options?.apiKey === "string" ? options.apiKey : undefined);
 		// Overlap executor construction with model discovery and agent open; `send()` awaits the shared lease.
 		if (!this.auxiliary) warmLocalExecutor(cwd, this.apiKey, model.id);
-		const grantedTools = snapshot
-			? snapshot.grantedTools
-			: mergeGrantedTools(grantedToolsFromContext(this.context));
-		if (this.auxiliary && grantedTools.length > 0) {
-			throw new Error("Cursor SDK tool calls require an OMP request context or an explicit host bridge");
-		}
+		// OMP side turns keep tool schemas for prompt cache but never execute; strip SDK customTools.
+		const grantedTools = this.auxiliary
+			? []
+			: snapshot
+				? snapshot.grantedTools
+				: mergeGrantedTools(grantedToolsFromContext(this.context));
 		stream.push({ type: "start", partial });
 
 		let modelSelection: ModelSelection | undefined;
