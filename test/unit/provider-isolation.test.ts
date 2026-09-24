@@ -329,7 +329,7 @@ describe("provider session isolation through host hooks", () => {
 		expect(resumeRecords(child.file)).toEqual([expect.objectContaining({ state: "committed", agentId: "agent-2", sessionId: "child", sessionFile: child.file })]);
 	});
 
-	test("a no-hook title with the parent's routing sessionId keeps side lineage without consuming parked run or resume writer", async () => {
+	test("a no-hook title with the parent's routing sessionId is disposable and cannot consume its parked run or resume writer", async () => {
 		installAgents();
 		const parent = await session("parent");
 		const initial = userContext("parent input", [READ]);
@@ -340,7 +340,7 @@ describe("provider session isolation through host hooks", () => {
 		await new Promise<void>((resolve) => setImmediate(resolve));
 		await parent.emit("turn_end");
 		expect(readFileSync(parent.file, "utf8")).toBe(beforeTitle);
-		expect(disposals).toEqual([]);
+		expect(disposals).toEqual(["agent-2"]);
 		expect(cancellations).not.toContain("agent-1");
 		expect(toolResults).toEqual([]);
 		expectAnswer(await collect(next, parent.options), JSON.stringify({ content: [{ type: "text", text: "parent file contents" }], isError: false }));

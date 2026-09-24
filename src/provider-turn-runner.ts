@@ -151,8 +151,7 @@ export class ProviderTurnRunner {
 			stream.push({ type: "error", reason: aborted ? "aborted" : "error", error: partial });
 			stream.end(partial);
 		} finally {
-			// One-shot ephemeral only; conversationKey/sessionId side turns keep process-local lineage.
-			if (this.auxiliary && this.owner && !this.owner.sessionId) await disposeRuntimeForScope(this.owner.scopeKey);
+			if (this.auxiliary && this.owner) await disposeRuntimeForScope(this.owner.scopeKey);
 		}
 	}
 

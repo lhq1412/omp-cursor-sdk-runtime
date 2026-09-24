@@ -54,3 +54,31 @@ test("request hooks retain their session across interleaved callbacks and routin
 	expect(firstTitle.persistent).toBe(false);
 	scopeTestUtils.reset();
 });
+
+test("ownerForRequest stays isolated from sessionId-only main owners", async () => {
+	scopeTestUtils.reset();
+	const handlers = new Map<string, (event: never, ctx: ExtensionContext) => unknown>();
+	registerCursorSessionScope({
+		on(event: string, handler: (event: never, ctx: ExtensionContext) => unknown) {
+			handlers.set(event, handler);
+		},
+	} as Pick<ExtensionAPI, "on">);
+	const main = {
+		cwd: "/tmp/main",
+		sessionManager: { getSessionFile: () => undefined, getSessionId: () => "side-key" },
+	} as ExtensionContext;
+	const request = await captureCursorRequestOwner(async () => {
+		await handlers.get("before_provider_request")!({} as never, main);
+	});
+	const mainOwner = request.owner!;
+	expect(mainOwner.persistent).toBe(true);
+	expect(mainOwner.scopeKey).toBe(`${scopeTestUtils.EPHEMERAL_SESSION_SCOPE_PREFIX}side-key`);
+
+	const side = ownerForRequest("side-key", "/tmp/aux");
+	expect(side).not.toBe(mainOwner);
+	expect(side.scopeKey).not.toBe(mainOwner.scopeKey);
+	expect(side.persistent).toBe(false);
+	expect(mainOwner.cwd).toBe("/tmp/main");
+	expect(mainOwner.persistent).toBe(true);
+	scopeTestUtils.reset();
+});
