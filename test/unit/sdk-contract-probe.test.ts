@@ -4,6 +4,7 @@ import {
 	WINDOW_MS,
 	awaitDeadline,
 	awaitPreparation,
+	isRetryableNativeProbeFailure,
 	observePromise,
 	scrub,
 } from "../../scripts/sdk-contract-probe.ts";
@@ -79,4 +80,20 @@ test("capability observation keeps the ten-second window", async () => {
 test("empty API keys do not corrupt missing-key diagnostics", () => {
 	expect(scrub("CURSOR_API_KEY is required", "")).toBe("CURSOR_API_KEY is required");
 	expect(scrub("failed with secret-key", "secret-key")).toBe("failed with <redacted>");
+});
+
+test("only isolated custom-tool Agent Looping failures are retried", () => {
+	expect(isRetryableNativeProbeFailure([
+		{ name: "customToolArgEvents", ok: false, detail: "status=error error=Agent Looping Detected" },
+	])).toBe(true);
+	expect(isRetryableNativeProbeFailure([
+		{ name: "customToolArgEvents", ok: false, detail: "error=Agent Looping Detected" },
+		{ name: "resume", ok: false, detail: "agent id changed" },
+	])).toBe(false);
+	expect(isRetryableNativeProbeFailure([
+		{ name: "customToolArgEvents", ok: false, detail: "tool callback not observed" },
+	])).toBe(false);
+	expect(isRetryableNativeProbeFailure([
+		{ name: "customToolArgEvents", ok: true, detail: "ok" },
+	])).toBe(false);
 });
