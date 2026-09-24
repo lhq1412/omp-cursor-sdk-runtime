@@ -26,6 +26,21 @@ interface ProbeResult {
 	detail: string;
 }
 
+interface NativeProbeOutcome {
+	ok: boolean;
+	/** True when only known transient model failures failed (safe to retry once). */
+	retryable: boolean;
+}
+
+/** Sole customToolArgEvents failure from SDK agent-looping is retryable; other FAILs are not. */
+export function isRetryableNativeProbeFailure(results: readonly ProbeResult[]): boolean {
+	const failed = results.filter((result) => !result.ok);
+	return failed.length > 0 && failed.every((result) =>
+		result.name === "customToolArgEvents"
+			&& /Agent Looping|repeating response pattern/i.test(result.detail),
+	);
+}
+
 type CaseKind = "cancel" | "dispose";
 type Phase = "setup" | "pending" | "late-release" | "cleanup";
 type Outcome =
@@ -556,7 +571,7 @@ async function spawnCancellationChild(kind: CaseKind, apiKey: string): Promise<n
 	}
 }
 
-async function runNativeHistoryProbe(apiKey: string): Promise<boolean> {
+async function runNativeHistoryProbe(apiKey: string): Promise<NativeProbeOutcome> {
 	const cwd = await mkdtemp(join(tmpdir(), "omp-cursor-runtime-probe-"));
 	const store = openJsonlStore(join(cwd, "store"));
 	const calls: Array<{ toolCallId?: string }> = [];
@@ -814,11 +829,9 @@ async function runNativeHistoryProbe(apiKey: string): Promise<boolean> {
 		}
 	}
 	for (const result of results) console.log(`${result.ok ? "PASS" : "FAIL"} ${result.name}: ${result.detail}`);
-	if (results.some((result) => !result.ok)) {
-		process.exitCode = 1;
-		return false;
-	}
-	return true;
+	const failed = results.filter((result) => !result.ok);
+	if (failed.length === 0) return { ok: true, retryable: false };
+	return { ok: false, retryable: isRetryableNativeProbeFailure(results) };
 }
 
 async function main(): Promise<void> {
@@ -832,8 +845,15 @@ async function main(): Promise<void> {
 		return;
 	}
 	const apiKey = requireCursorApiKey();
-	const passed = await runNativeHistoryProbe(apiKey);
-	if (!passed) return;
+	let outcome = await runNativeHistoryProbe(apiKey);
+	if (!outcome.ok && outcome.retryable) {
+		console.log("RETRY native-history probe once after transient model failure");
+		outcome = await runNativeHistoryProbe(apiKey);
+	}
+	if (!outcome.ok) {
+		process.exitCode = 1;
+		return;
+	}
 	for (const kind of ["cancel", "dispose"] as const) {
 		const code = await spawnCancellationChild(kind, apiKey);
 		if (code !== 0) process.exitCode = 2;
