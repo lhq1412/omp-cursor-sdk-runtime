@@ -11,15 +11,15 @@ This is a separate adapter from [lhq1412/omp-cursor-sdk](https://github.com/lhq1
 Pinned baselines:
 
 - Package `0.4.0`
-- OMP `18.2.8` (all four direct OMP packages exact-pinned)
-- `@cursor/sdk` `1.0.31`
-- Direct history-codec dependency: `@oh-my-pi/pi-catalog` `18.2.8`
+- OMP `18.3.0` (all four direct OMP packages exact-pinned)
+- `@cursor/sdk` `1.0.32`
+- Direct history-codec dependency: `@oh-my-pi/pi-catalog` `18.3.0`
 
 Native checkpoint conversion is coupled to these fixed versions, not a promise of compatibility with arbitrary OMP or SDK releases.
 
 ## Requirements
 
-- OMP 18.2.8
+- OMP 18.3.0
 - Bun 1.3.14 or newer (OMP and the extension runtime)
 - Node.js 22.19 or newer (maintenance scripts)
 - a Cursor SDK API key from Cursor Dashboard → API Keys
@@ -210,7 +210,7 @@ OMP packages are Bun-targeted, so runtime tests use Bun. GitHub Actions runs `np
 
 Real-host tests cover concurrent request owners, abort/retry, same-directory subagents, unscoped auxiliary completions, custom-tool execution counts, and park/resume correlation. Every tool must execute once through OMP; the adapter does not use Cursor-native speculation or executors.
 
-Current package is `0.4.0` on OMP 18.2.8 and SDK 1.0.31. Keep the private credential-scoped model cache separate from OMP's selector cache. Freeze contracts before changing the baseline; do not bundle session-binding or compaction redesigns into a pin bump. Real host cache, request-owner, grant, tool, and lifecycle tests remain the 18.2 gate. Pin-only compatibility stays patch; further session/tool/compaction semantic changes still need a minor bump. A missing or failed live SDK probe is not validated support and blocks release.
+Current package is `0.4.0` on OMP 18.3.0 and SDK 1.0.32. Keep the private credential-scoped model cache separate from OMP's selector cache. Freeze contracts before changing the baseline; do not bundle session-binding or compaction redesigns into a pin bump. Real host cache, request-owner, grant, tool, and lifecycle tests remain the 18.3 gate. Pin-only compatibility stays patch; further session/tool/compaction semantic changes still need a minor bump. A missing or failed live SDK probe is not validated support and blocks release.
 
 The manual release workflow reuses the complete CI workflow before changing the version, pushing a tag, or creating a release. An absent dedicated SDK secret or a failed probe therefore blocks publication; local verification alone does not bypass that gate.
 

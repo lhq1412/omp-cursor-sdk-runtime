@@ -3,6 +3,7 @@ import type { Api } from "@oh-my-pi/pi-ai";
 import { createAssistantMessageEventStream } from "@oh-my-pi/pi-ai";
 import type { InteractionUpdate, RunResult, TokenUsage } from "@cursor/sdk";
 import { projectSdkToolCallId } from "./tool-call-id.js";
+import { snapshotJsonObject } from "./tools.js";
 
 export interface CursorSdkSummary {
 	count: number;
@@ -113,7 +114,7 @@ function mcpCustomCall(update: InteractionUpdate): { callId: string; sdkName: st
 	const sdkName = update.toolCall.args.toolName;
 	if (!sdkName) return;
 	const inner = update.toolCall.args.args;
-	const args = inner && typeof inner === "object" && !Array.isArray(inner) ? inner : {};
+	const args = inner && typeof inner === "object" && !Array.isArray(inner) ? snapshotJsonObject(inner).snapshot : {};
 	return { callId: update.callId, sdkName, args };
 }
 
@@ -202,23 +203,25 @@ export function applyToolCall(
 	if (contentIndex >= 0) {
 		const block = partial.content[contentIndex];
 		if (block.type !== "toolCall") return;
+		const snap = snapshotJsonObject(toolCall.arguments);
 		block.id = id;
 		block.name = toolCall.name;
-		block.arguments = toolCall.arguments;
-		stream.push({ type: "toolcall_delta", contentIndex, delta: JSON.stringify(block.arguments), partial });
+		block.arguments = snap.snapshot;
+		stream.push({ type: "toolcall_delta", contentIndex, delta: snap.json, partial });
 		stream.push({ type: "toolcall_end", contentIndex, toolCall: block, partial });
 		if (projection) {
 			(projection.previews ??= new Map()).set(id, { contentIndex, ended: true });
 		}
 		return;
 	}
+	const snap = snapshotJsonObject(toolCall.arguments);
 	endLastOpenBlock(stream, partial);
-	partial.content.push({ type: "toolCall", id, name: toolCall.name, arguments: toolCall.arguments });
+	partial.content.push({ type: "toolCall", id, name: toolCall.name, arguments: snap.snapshot });
 	contentIndex = partial.content.length - 1;
 	const block = partial.content[contentIndex];
 	if (block.type !== "toolCall") return;
 	stream.push({ type: "toolcall_start", contentIndex, partial });
-	stream.push({ type: "toolcall_delta", contentIndex, delta: JSON.stringify(block.arguments), partial });
+	stream.push({ type: "toolcall_delta", contentIndex, delta: snap.json, partial });
 	stream.push({ type: "toolcall_end", contentIndex, toolCall: block, partial });
 	if (projection) {
 		(projection.previews ??= new Map()).set(id, { contentIndex, ended: true });

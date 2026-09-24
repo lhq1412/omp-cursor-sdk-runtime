@@ -141,6 +141,54 @@ describe("custom tools", () => {
 		]);
 	});
 
+	test("detaches callback arguments from the SDK object", async () => {
+		const source = { path: "a.ts" };
+		let seen: Record<string, unknown> | undefined;
+		const tools = buildCustomTools(
+			buildToolContract([{ name: "read", description: "read", inputSchema: { type: "object" } }]),
+			async (_name, args) => {
+				seen = args;
+				source.path = "mutated";
+				return { content: [{ type: "text", text: "ok" }], isError: false };
+			},
+			createToolCallDedupe("run-1"),
+		);
+		await tools.read.execute(source, { toolCallId: "call-1" });
+		expect(seen).toEqual({ path: "a.ts" });
+		expect(seen).not.toBe(source);
+	});
+
+	test("does not run a callback when arguments are not a JSON object", async () => {
+		let ran = false;
+		const tools = buildCustomTools(
+			buildToolContract([{ name: "read", description: "read", inputSchema: { type: "object" } }]),
+			async () => {
+				ran = true;
+				return { content: [{ type: "text", text: "ok" }], isError: false };
+			},
+			createToolCallDedupe("run-1"),
+		);
+		const cyclic: Record<string, unknown> = {};
+		cyclic.self = cyclic;
+		await expect(tools.read.execute(cyclic, { toolCallId: "call-cyclic" })).rejects.toThrow();
+		const boxed = { toJSON: () => 1 };
+		await expect(tools.read.execute(boxed, { toolCallId: "call-boxed" })).rejects.toBeInstanceOf(ToolBridgeError);
+		expect(ran).toBe(false);
+	});
+
+	test("returns exact text and image content from the tool callback", async () => {
+		const image = { type: "image" as const, data: "iVBORw0KGgo=", mimeType: "image/png" };
+		const tools = buildCustomTools(
+			buildToolContract([{ name: "read", description: "read", inputSchema: { type: "object" } }]),
+			async () => ({ content: [{ type: "text", text: "caption" }, image], isError: false }),
+			createToolCallDedupe("run-1"),
+		);
+		await expect(tools.read.execute({}, { toolCallId: "call-img" })).resolves.toEqual({
+			content: [{ type: "text", text: "caption" }, image],
+			isError: false,
+		});
+	});
+
 	test("projects combinators out of advertised custom-tool schemas", () => {
 		const tools = buildCustomTools(
 			buildToolContract([{

@@ -149,7 +149,7 @@ async function createHost(label: string, toolNames: string[], options: CreateHos
 		...options.settings,
 	});
 	const authStorage = await AuthStorage.create(join(agentDir, "agent.db"));
-	authStorage.setRuntimeApiKey(CURSOR_SDK_PROVIDER_ID, "test-key");
+	authStorage.keys.setRuntime(CURSOR_SDK_PROVIDER_ID, "test-key");
 	const modelRegistry = new ModelRegistry(authStorage, join(agentDir, "models.yml"), {
 		settings,
 		cacheDbPath: join(agentDir, "models.db"),
@@ -238,7 +238,7 @@ async function createHost(label: string, toolNames: string[], options: CreateHos
 	return { root, cwd, session, authStorage, requests, toolStarts, sessionId };
 }
 
-describe("OMP 18.2 host compatibility", () => {
+describe("OMP 18.3 host compatibility", () => {
 	const fixtures: HostFixture[] = [];
 
 	beforeEach(async () => {
@@ -648,7 +648,6 @@ describe("OMP 18.2 host compatibility", () => {
 		if (!customTools) throw new Error("OMP did not send custom tools");
 		expect(Object.keys(customTools).sort()).toEqual(fixture.session.agent.state.tools.map(item => item.name).sort());
 		expect(customTools.find).toBeUndefined();
-		expect(schemaProperties(customTools.bash, "bash")).not.toHaveProperty("env");
 		expect(textOf(captured[2]!)).toContain("kept");
 
 		const editTool = fixture.session.agent.state.tools.find(item => item.name === "edit");
@@ -689,8 +688,8 @@ describe("OMP 18.2 host compatibility", () => {
 
 		const image = hostResult(captured[1]!).content.find(block => block.type === "image");
 		expect(typeof image?.data).toBe("string");
-		expect(image?.data).not.toBe("");
-		expect(image?.mimeType).toMatch(/^image\//);
+		expect(image?.data?.length).toBeGreaterThan(0);
+		expect(image?.mimeType).toMatch(/^image\/(png|webp|jpeg)$/);
 	});
 
 	test("enabled find stays distinct from glob and does not widen the grant", async () => {

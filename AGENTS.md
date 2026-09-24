@@ -77,7 +77,7 @@ There is no build, lint, formatter or start script. OMP loads TypeScript directl
 
 ## Runtime/Tooling Preferences
 
-Use **Bun ≥1.3.14** for OMP/runtime tests; Node alone is not the supported test executor. The manifest also requires **Node ≥22.19.0**. Use **npm** for repository installs and lockfile updates; the npm lockfile is canonical. Current exact runtime pins are `@cursor/sdk` **1.0.31** and `@oh-my-pi/pi-ai`, `@oh-my-pi/pi-catalog`, `@oh-my-pi/pi-coding-agent`, `@oh-my-pi/pi-utils` **18.2.8**. Treat upgrades as SDK/host contract changes, not routine version bumps.
+Use **Bun ≥1.3.14** for OMP/runtime tests; Node alone is not the supported test executor. The manifest also requires **Node ≥22.19.0**. Use **npm** for repository installs and lockfile updates; the npm lockfile is canonical. Current exact runtime pins are `@cursor/sdk` **1.0.32** and `@oh-my-pi/pi-ai`, `@oh-my-pi/pi-catalog`, `@oh-my-pi/pi-coding-agent`, `@oh-my-pi/pi-utils` **18.3.0**. Treat upgrades as SDK/host contract changes, not routine version bumps.
 
 ## Testing & QA
 

@@ -35,6 +35,8 @@ export interface CursorModelMetadata {
 	defaultFast: boolean;
 	supportsReasoning: boolean;
 	thinkingLevelMap?: ThinkingLevelMap;
+	/** SDK id written for effort levels: `effort` or `reasoning_effort`. */
+	effortParameterId?: string;
 	parameterIds: {
 		context: boolean;
 		reasoning: boolean;
@@ -104,6 +106,8 @@ let state: CatalogState = { key: undefined, metadata: new Map() };
 const catalogsByCredential = new Map<string, Map<string, CursorModelMetadata>>();
 const modelIdsByCredential = new Map<string, string[]>();
 const LOCAL_MODEL_CATALOG_ENV = "CURSOR_SDK_LOCAL_MODEL_CATALOG_JSON";
+/** Last catalog JSON this process published. A different value is caller-owned. */
+let ownedLocalCatalogJson: string | undefined;
 let listModelsImpl: ListModels | undefined;
 let catalogMutation: Promise<void> = Promise.resolve();
 let composerFallbackMetadata: Map<string, CursorModelMetadata> | undefined;
@@ -152,7 +156,7 @@ function cursorContextWindowFloor(modelId: string): number | undefined {
 	if (identity.class === "anthropic" && identity.family === "opus" && revisionMatches(identity.revision, ">=5 <6")) {
 		return 300_000;
 	}
-	if (identity.class === "xai" && identity.family === "grok" && revisionMatches(identity.revision, ">=4.5 <4.7")) {
+	if (identity.class === "xai" && identity.family === "grok" && revisionMatches(identity.revision, ">=4.5 <4.8")) {
 		return 256_000;
 	}
 	if (identity.class === "openai" && revisionMatches(identity.revision, ">=5.6 <5.7")) return 272_000;
@@ -288,9 +292,13 @@ function mapComparableLevel(
 	return getParameterValue(parameter, level);
 }
 
+function getEffortParameter(item: ModelListItem): ModelParameterDefinition | undefined {
+	return getParameter(item, "effort") ?? getParameter(item, "reasoning_effort");
+}
+
 function getThinkingLevelMap(item: ModelListItem): ThinkingLevelMap | undefined {
 	const reasoningParameter = getParameter(item, "reasoning");
-	const effortParameter = getParameter(item, "effort");
+	const effortParameter = getEffortParameter(item);
 	const thinkingParameter = getParameter(item, "thinking");
 	const valueParameter = effortParameter ?? reasoningParameter ?? thinkingParameter;
 	if (!valueParameter) return undefined;
@@ -309,6 +317,8 @@ function getThinkingLevelMap(item: ModelListItem): ThinkingLevelMap | undefined 
 		off:
 			getParameterValue(reasoningParameter, "none") ??
 			getParameterValue(reasoningParameter, "off") ??
+			getParameterValue(effortParameter, "none") ??
+			getParameterValue(effortParameter, "off") ??
 			getParameterValue(thinkingParameter, "false"),
 		minimal: mapComparableLevel(valueParameter, Effort.Minimal),
 		low: mapComparableLevel(valueParameter, Effort.Low),
@@ -360,6 +370,7 @@ function toMetadata(identity: SelectionIdentity, defaultParams: ModelParameterVa
 	const { model, context, contextTiers, piModelId } = identity;
 	const thinkingLevelMap = getThinkingLevelMap(model);
 	const supportedThinkingEfforts = getSupportedThinkingEfforts(thinkingLevelMap);
+	const effortParameter = getEffortParameter(model);
 	const effectiveContext = context ?? contextTiers?.extended.value ?? getParamValue(defaultParams, "context");
 	const fastValue = getParamValue(defaultParams, "fast")?.toLowerCase();
 	const extendedContext = contextTiers
@@ -382,10 +393,11 @@ function toMetadata(identity: SelectionIdentity, defaultParams: ModelParameterVa
 		defaultFast: fastValue === "true",
 		supportsReasoning: supportedThinkingEfforts.length > 0,
 		...(thinkingLevelMap ? { thinkingLevelMap } : {}),
+		...(effortParameter ? { effortParameterId: effortParameter.id } : {}),
 		parameterIds: {
 			context: getParameter(model, "context") !== undefined,
 			reasoning: getParameter(model, "reasoning") !== undefined,
-			effort: getParameter(model, "effort") !== undefined,
+			effort: getEffortParameter(model) !== undefined,
 			thinking: getParameter(model, "thinking") !== undefined,
 			fast: getParameter(model, "fast") !== undefined,
 		},
@@ -414,7 +426,10 @@ function getReferencePriceModel(modelId: string) {
 	return undefined;
 }
 
-function toModelConfig(metadata: CursorModelMetadata, name: string): ProviderModelConfig {
+function toModelConfig(metadata: CursorModelMetadata, name: string): ProviderModelConfig & {
+	maxContextWindow?: number;
+	omitMaxOutputTokens: true;
+} {
 	const reference = getReferencePriceModel(metadata.baseModelId);
 	const { input, output, cacheRead, cacheWrite } = reference?.cost ?? ZERO_COST;
 	const cost: ModelCost = { input, output, cacheRead, cacheWrite };
@@ -422,7 +437,11 @@ function toModelConfig(metadata: CursorModelMetadata, name: string): ProviderMod
 		// Base-mode reference only: preserve the SDK threshold, not the vendor's tier pricing.
 		cost.longContext = { ...cost, inputThreshold: metadata.extendedContext.standardContextWindow };
 	}
-	const config = {
+	// OMP 18.3 finalizeCustomModel copies omitMaxOutputTokens and drops maxContextWindow
+	// on dynamic rows. Advertising the extended window here keeps selection and budget
+	// intact; the long-context threshold is what OMP caps when extended context is off.
+	const extendedWindow = metadata.extendedContext ? metadata.contextWindow : undefined;
+	return {
 		id: metadata.piModelId,
 		name,
 		reasoning: metadata.supportsReasoning,
@@ -437,9 +456,10 @@ function toModelConfig(metadata: CursorModelMetadata, name: string): ProviderMod
 		input: [...TEXT_AND_IMAGE_INPUT],
 		cost,
 		contextWindow: metadata.contextWindow,
+		...(extendedWindow !== undefined ? { maxContextWindow: extendedWindow } : {}),
 		maxTokens: FALLBACK_MAX_TOKENS,
+		omitMaxOutputTokens: true,
 	};
-	return config;
 }
 
 function getModelName(item: Pick<ModelListItem, "id" | "displayName">, context?: string): string {
@@ -488,7 +508,18 @@ function registerModelItems(items: readonly ModelListItem[], key?: string, sourc
 function publishLocalModelCatalog(): void {
 	const ids = new Set<string>();
 	for (const list of modelIdsByCredential.values()) for (const id of list) ids.add(id);
-	process.env[LOCAL_MODEL_CATALOG_ENV] = JSON.stringify([...ids].map((id) => ({ id })));
+	const next = JSON.stringify([...ids].map((id) => ({ id })));
+	const current = process.env[LOCAL_MODEL_CATALOG_ENV];
+	if (current && current !== ownedLocalCatalogJson) return;
+	ownedLocalCatalogJson = next;
+	process.env[LOCAL_MODEL_CATALOG_ENV] = next;
+}
+
+function clearOwnedLocalCatalog(): void {
+	if (process.env[LOCAL_MODEL_CATALOG_ENV] === ownedLocalCatalogJson) {
+		delete process.env[LOCAL_MODEL_CATALOG_ENV];
+	}
+	ownedLocalCatalogJson = undefined;
 }
 
 function hydrateFallbackIfEmpty(): void {
@@ -522,18 +553,22 @@ function applyThinkingLevel(
 	if (level === "off") {
 		if (metadata.parameterIds.thinking && mapped === "false") {
 			setParam(params, "thinking", mapped);
-			deleteParam(params, "effort");
+			if (metadata.effortParameterId) deleteParam(params, metadata.effortParameterId);
 			return;
 		}
 		if (metadata.parameterIds.reasoning) {
 			setParam(params, "reasoning", mapped);
 			return;
 		}
+		if (metadata.effortParameterId) {
+			setParam(params, metadata.effortParameterId, mapped);
+			return;
+		}
 		return;
 	}
-	if (metadata.parameterIds.effort) {
+	if (metadata.effortParameterId) {
 		if (metadata.parameterIds.thinking) setParam(params, "thinking", "true");
-		setParam(params, "effort", mapped);
+		setParam(params, metadata.effortParameterId, mapped);
 		return;
 	}
 	if (metadata.parameterIds.reasoning) {
@@ -641,7 +676,7 @@ export const __testUtils = {
 		state = { key: undefined, metadata: new Map() };
 		catalogsByCredential.clear();
 		modelIdsByCredential.clear();
-		delete process.env[LOCAL_MODEL_CATALOG_ENV];
+		clearOwnedLocalCatalog();
 		listModelsImpl = undefined;
 		catalogMutation = Promise.resolve();
 		cacheRoot = null;

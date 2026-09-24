@@ -139,6 +139,49 @@ describe("projector", () => {
 		expect(JSON.parse(argumentsJson)).toEqual({ path: "a.ts" });
 	});
 
+	test("keeps preview and finalized arguments after the SDK object changes", async () => {
+		const model = {
+			id: "composer-2.5",
+			provider: CURSOR_SDK_PROVIDER_ID,
+			api: CURSOR_SDK_API,
+		} as Model<Api>;
+		const stream = createAssistantMessageEventStream();
+		const partial = createEmptyAssistantMessage(model);
+		const projection: RunProjection = { answerText: "", allowToolPreview: true, sdkToOmp: new Map([["read", "read"]]) };
+		const previewArgs = { path: "a.ts" };
+		applyInteractionUpdate(stream, partial, mcpUpdate("tool-call-started", "call-1", "read", previewArgs), projection);
+		previewArgs.path = "mutated-preview";
+		expect(partial.content[0]).toMatchObject({ type: "toolCall", arguments: { path: "a.ts" } });
+		const finalArgs = { path: "b.ts" };
+		applyToolCall(stream, partial, { id: "call-1", name: "read", arguments: finalArgs }, projection);
+		finalArgs.path = "mutated-final";
+		expect(partial.content[0]).toMatchObject({ type: "toolCall", arguments: { path: "b.ts" } });
+		stream.end(partial);
+		let delta = "";
+		for await (const event of stream) {
+			if (event.type === "toolcall_delta") delta += event.delta;
+		}
+		expect(delta).toBe(JSON.stringify({ path: "b.ts" }));
+		expect(JSON.parse(delta)).toEqual(partial.content[0]?.type === "toolCall" ? partial.content[0].arguments : undefined);
+	});
+
+	test("does not retain unserializable tool arguments", () => {
+		const model = {
+			id: "composer-2.5",
+			provider: CURSOR_SDK_PROVIDER_ID,
+			api: CURSOR_SDK_API,
+		} as Model<Api>;
+		const stream = createAssistantMessageEventStream();
+		const partial = createEmptyAssistantMessage(model);
+		const projection: RunProjection = { answerText: "", allowToolPreview: true, sdkToOmp: new Map([["read", "read"]]) };
+		const cyclic: Record<string, unknown> = { path: "a.ts" };
+		cyclic.self = cyclic;
+		expect(() => applyInteractionUpdate(stream, partial, mcpUpdate("tool-call-started", "call-1", "read", cyclic), projection)).toThrow();
+		expect(partial.content).toEqual([]);
+		expect(() => applyToolCall(stream, partial, { id: "call-2", name: "read", arguments: cyclic })).toThrow();
+		expect(partial.content).toEqual([]);
+	});
+
 	test("does not preview unmapped MCP tools and drops unmatched previews", () => {
 		const model = {
 			id: "composer-2.5",

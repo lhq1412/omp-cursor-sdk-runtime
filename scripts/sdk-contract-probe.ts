@@ -13,7 +13,7 @@ import { buildAgentOptions, openAgent, openJsonlStore, type OpenAgentInput } fro
 import { readNativeCheckpoint, readSettledCheckpointOccupancy } from "../src/native-history.ts";
 
 const SELF = fileURLToPath(import.meta.url);
-const SDK_PIN = "1.0.31";
+const SDK_PIN = "1.0.32";
 export const WINDOW_MS = 10_000;
 export const SETUP_MS = 60_000;
 const CHILD_MS = 180_000;

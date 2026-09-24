@@ -41,7 +41,7 @@ import { openJsonlStore } from "./sdk-session.js";
 const bridgeOwners = new Map<string, { owner: CursorSessionOwner; signal: AbortSignal; onAbort: () => void }>();
 
 function selectionForTurn(model: Model<Api>, apiKey: string, options?: SimpleStreamOptions): ModelSelection {
-	const thinkingLevel = options?.disableReasoning ? "off" : (options?.reasoning ?? "off");
+	const thinkingLevel = options?.disableReasoning || options?.forceReasoningOff ? "off" : (options?.reasoning ?? "off");
 	const metadata = getModelMetadata(model.id, apiKey);
 	const standard = metadata?.extendedContext?.standardContextWindow;
 	return buildModelSelection(model.id, thinkingLevel, {

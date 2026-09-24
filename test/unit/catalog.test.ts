@@ -103,6 +103,12 @@ describe("identity mapping", () => {
 			item({ id: "grok-4.5", variants: defaultVariant([]) }),
 			item({ id: "grok-4.6", variants: defaultVariant([]) }),
 			item({ id: "grok-4.20", variants: defaultVariant([]) }),
+			item({ id: "grok-4.7", variants: defaultVariant([]) }),
+			item({
+				id: "grok-4.7-max",
+				parameters: [param("context", ["256k", "500k"])],
+				variants: defaultVariant([{ id: "context", value: "500k" }]),
+			}),
 			item({
 				id: "grok-4.5-max",
 				parameters: [param("context", ["256k", "1m"])],
@@ -136,6 +142,12 @@ describe("identity mapping", () => {
 		expect(getModelMetadata("grok-4.5")?.contextWindow).toBe(256_000);
 		expect(getModelMetadata("grok-4.6")?.contextWindow).toBe(256_000);
 		expect(getModelMetadata("grok-4.20")?.contextWindow).toBe(200_000);
+		expect(getModelMetadata("grok-4.7")?.contextWindow).toBe(256_000);
+		expect(getModelMetadata("grok-4.7-max")?.contextWindow).toBe(500_000);
+		expect(getModelMetadata("grok-4.7-max")?.extendedContext?.standardContextWindow).toBe(256_000);
+		expect(buildModelSelection("grok-4.7-max", "off", { extendedContextEnabled: false }).params).toEqual(
+			expect.arrayContaining([{ id: "context", value: "256k" }]),
+		);
 		expect(getModelMetadata("grok-4.5-max")?.contextWindow).toBe(1_000_000);
 		expect(getModelMetadata("grok-4.5-max")?.extendedContext?.standardContextWindow).toBe(256_000);
 		expect(getModelMetadata("default")?.contextWindow).toBe(256_000);
@@ -333,6 +345,24 @@ describe("thinking selection", () => {
 		expect(buildModelSelection("bool-only", "high").params).toEqual([{ id: "thinking", value: "true" }]);
 		expect(buildModelSelection("missing", "high")).toEqual({ id: "missing" });
 	});
+	test("reasoning_effort-only writes effort id and leaves off at variant default", () => {
+		__testUtils.registerModelItems([
+			item({
+				id: "grok-effort",
+				parameters: [param("reasoning_effort", ["low", "medium", "high", "xhigh"])],
+				variants: defaultVariant([{ id: "reasoning_effort", value: "medium" }]),
+			}),
+		]);
+		const metadata = getModelMetadata("grok-effort");
+		expect(metadata?.effortParameterId).toBe("reasoning_effort");
+		expect(metadata?.parameterIds.effort).toBe(true);
+		expect(buildModelSelection("grok-effort", "high").params).toEqual([
+			{ id: "reasoning_effort", value: "high" },
+		]);
+		expect(buildModelSelection("grok-effort", "off").params).toEqual([
+			{ id: "reasoning_effort", value: "medium" },
+		]);
+	});
 });
 
 describe("fast and fallback", () => {
@@ -371,6 +401,29 @@ describe("fast and fallback", () => {
 		expect(getModelMetadata("composer-2.5")?.supportsReasoning).toBe(false);
 	});
 });
+
+
+describe("raw model config", () => {
+	test("two-tier rows keep extended contextWindow with omitMaxOutputTokens and maxContextWindow", () => {
+		const models = __testUtils.registerModelItems([
+			item({
+				id: "gpt-5.5",
+				parameters: [param("context", ["272k", "1m"])],
+				variants: defaultVariant([{ id: "context", value: "1m" }]),
+			}),
+		]);
+		expect(models).toHaveLength(1);
+		expect(models[0]).toMatchObject({
+			id: "gpt-5.5",
+			contextWindow: 1_000_000,
+			maxContextWindow: 1_000_000,
+			maxTokens: 64_000,
+			omitMaxOutputTokens: true,
+			cost: { longContext: { inputThreshold: 272_000 } },
+		});
+	});
+});
+
 
 describe("hydration", () => {
 	test("failed live refresh keeps the last catalog and redacts the key", async () => {
@@ -473,6 +526,38 @@ describe("hydration", () => {
 		expect(getModelMetadata("gpt-5.5")).toBeUndefined();
 		expect(buildModelSelection("missing", "high")).toEqual({ id: "missing" });
 		expect(buildModelSelection("missing", "high", { apiKey: "unhydrated-key" })).toEqual({ id: "missing" });
+	});
+
+	test("local catalog env is replaced only when this process owns it", async () => {
+		const env = "CURSOR_SDK_LOCAL_MODEL_CATALOG_JSON";
+		const previous = process.env[env];
+		try {
+			process.env[env] = JSON.stringify([{ id: "foreign" }]);
+			__testUtils.setListModels(async () => [item({ id: "owned-a", variants: defaultVariant([]) })]);
+			await fetchCursorModels("env-key");
+			expect(process.env[env]).toBe(JSON.stringify([{ id: "foreign" }]));
+
+			delete process.env[env];
+			__testUtils.resetCatalog();
+			__testUtils.setListModels(async () => [item({ id: "owned-a", variants: defaultVariant([]) })]);
+			await fetchCursorModels("env-key");
+			const owned = process.env[env];
+			expect(owned).toBe(JSON.stringify([{ id: "owned-a" }]));
+
+			__testUtils.setListModels(async () => [item({ id: "owned-b", variants: defaultVariant([]) })]);
+			await fetchCursorModels("env-key");
+			expect(process.env[env]).toBe(JSON.stringify([{ id: "owned-b" }]));
+
+			__testUtils.resetCatalog();
+			expect(process.env[env]).toBeUndefined();
+
+			process.env[env] = owned!;
+			__testUtils.resetCatalog();
+			expect(process.env[env]).toBe(owned);
+		} finally {
+			if (previous === undefined) delete process.env[env];
+			else process.env[env] = previous;
+		}
 	});
 });
 
