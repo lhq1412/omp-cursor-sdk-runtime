@@ -100,7 +100,17 @@ export function buildToolContract(grantedTools: readonly GrantedTool[]): ToolCon
 
 
 export interface ToolCallDedupe {
-	execute(toolCallId: string | undefined, name: string, args: Record<string, unknown>, run: () => Promise<HostToolResult>): Promise<HostToolResult>;
+	execute(toolCallId: string | undefined, name: string, args: Record<string, unknown>, run: (args: Record<string, unknown>) => Promise<HostToolResult>): Promise<HostToolResult>;
+}
+
+export function snapshotJsonObject(value: unknown): { json: string; snapshot: Record<string, unknown> } {
+	const json = JSON.stringify(value);
+	if (typeof json !== "string") throw new ToolBridgeError("tool arguments are not JSON-serializable");
+	const parsed: unknown = JSON.parse(json);
+	if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+		throw new ToolBridgeError("tool arguments are not a JSON object");
+	}
+	return { json, snapshot: parsed as Record<string, unknown> };
 }
 
 /** Dedupes one SDK custom-tool callback by SDK-native toolCallId, not the OMP projection. */
@@ -114,7 +124,7 @@ export function createToolCallDedupe(bridgeRunId: string): ToolCallDedupe {
 				throw new ToolBridgeError("custom tool callback is missing toolCallId");
 			}
 			const key = `${bridgeRunId}:${toolCallId}`;
-			const argsJson = JSON.stringify(args);
+			const { json: argsJson, snapshot } = snapshotJsonObject(args);
 			const previous = completed.get(key);
 			if (previous) {
 				if (previous.name !== name || previous.argsJson !== argsJson) {
@@ -129,7 +139,7 @@ export function createToolCallDedupe(bridgeRunId: string): ToolCallDedupe {
 				}
 				return pending.promise;
 			}
-			const next = run().then((result) => {
+			const next = run(snapshot).then((result) => {
 				completed.set(key, { name, argsJson, result });
 				inflight.delete(key);
 				return result;
@@ -158,8 +168,8 @@ export function buildCustomTools(
 			inputSchema: tool.inputSchema,
 			async execute(args, context) {
 				const prepared = asRecord(args);
-				const result = await dedupe.execute(context.toolCallId, tool.ompName, prepared, () =>
-					execute(tool.ompName, prepared, context.toolCallId ?? ""),
+				const result = await dedupe.execute(context.toolCallId, tool.ompName, prepared, (snapshot) =>
+					execute(tool.ompName, snapshot, context.toolCallId ?? ""),
 				);
 				return hostResultToSdk(result);
 			},

@@ -100,13 +100,13 @@ describe("OMP runtime ModelManager compatibility", () => {
 		await rm(root, { recursive: true, force: true });
 	});
 
-	async function createHost(): Promise<ModelRegistry> {
+	async function createHost(settings: Settings = Settings.isolated()): Promise<ModelRegistry> {
 		const auth = await AuthStorage.create(join(root, `auth-${authStores.length}.db`));
-		auth.setRuntimeApiKey(CURSOR_SDK_PROVIDER_ID, KEY);
+		auth.keys.setRuntime(CURSOR_SDK_PROVIDER_ID, KEY);
 		authStores.push(auth);
 		const registry = new ModelRegistry(auth, join(root, "models.yml"), {
 			cacheDbPath: hostCachePath,
-			settings: Settings.isolated(),
+			settings,
 		});
 		registry.registerProvider(registration.name, registration.config, registration.sourceId);
 		return registry;
@@ -188,6 +188,19 @@ describe("OMP runtime ModelManager compatibility", () => {
 		};
 		expect(created).toEqual([expected]);
 		expect(sent).toEqual([expected]);
+	});
+
+	test("finalized dynamic rows keep extended contextWindow and omitMaxOutputTokens", async () => {
+		catalogTestUtils.setListModels(async () => [OLD_MODEL]);
+		const registry = await createHost(Settings.isolated({ extendedContext: true }));
+		await registry.refreshRuntimeProviders();
+		const model = registry.find(CURSOR_SDK_PROVIDER_ID, OLD_MODEL.id);
+		if (!model) throw new Error("OMP did not materialize the two-tier Cursor SDK model");
+		expect(model.contextWindow).toBe(1_000_000);
+		expect(model.maxTokens).toBe(64_000);
+		expect(model.omitMaxOutputTokens).toBe(true);
+		expect(model.cost.longContext?.inputThreshold).toBe(200_000);
+		expect("maxContextWindow" in model).toBe(false);
 	});
 
 	test("a successful live catalog that removed the selected model rejects the stale selection", async () => {

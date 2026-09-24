@@ -563,6 +563,57 @@ describe("streamCursorRuntime model selection", () => {
 		await expect(toolGate.promise).rejects.toThrow(/host aborted/);
 	});
 
+	test("wait tool interrupt does not cancel the live SDK run", async () => {
+		const host = createFakeHost({ tools: ["wait"], cwd: "/tmp/project", sessionId: "wait-sess" });
+		const waitEntered = Promise.withResolvers<void>();
+		const waitResult = Promise.withResolvers<{ content: { type: "text"; text: string }[]; isError: boolean }>();
+		let cancelDuringWait = 0;
+		let waitFinished = false;
+		host.executeTool = async (name) => {
+			if (name !== "wait") throw new Error(`unexpected ${name}`);
+			waitEntered.resolve();
+			return waitResult.promise;
+		};
+		runtimeTestUtils.setOpenAgent(async () => ({
+			agentId: "wait-agent-1",
+			close() {},
+			async [Symbol.asyncDispose]() {},
+			async send(_message, options) {
+				const wait = options?.local?.customTools?.wait;
+				if (!wait) throw new Error("wait tool missing");
+				const pending = wait.execute({}, { toolCallId: "wait-1" });
+				return {
+					supports(capability: string) {
+						return capability === "cancel";
+					},
+					async cancel() {
+						if (!waitFinished) cancelDuringWait++;
+					},
+					async wait() {
+						await waitEntered.promise;
+						waitResult.reject(new Error("Wait interrupted by message."));
+						await pending.catch(() => undefined);
+						waitFinished = true;
+						return { status: "finished", result: "continued" } as RunResult;
+					},
+				} as unknown as Run;
+			},
+		} as SDKAgent));
+		const waitTool = {
+			name: "wait",
+			description: "wait",
+			parameters: { type: "object", properties: {} },
+		} as Tool;
+		const events = await drain(cursorModel("composer-2.5", 200_000), userContext("park wait", [waitTool]), {
+			apiKey: "test-key",
+			cwd: "/tmp/project",
+			[HOST_BRIDGE_OPTION_KEY]: host,
+		} as SimpleStreamOptions);
+		expect(events.at(-1)).toMatchObject({ type: "done", reason: "stop" });
+		expect(cancelDuringWait).toBe(0);
+		expect(host.bindings).toHaveLength(1);
+	});
+
 	test("ungranted tools are not advertised and host executeTool rejects them", async () => {
 		const host = createFakeHost({ tools: ["read"] });
 		let names: string[] = [];
@@ -648,21 +699,24 @@ describe("streamCursorRuntime model selection", () => {
 		expect(customTools).toEqual([]);
 	});
 
-	test("disableReasoning wins over reasoning and still uses catalog context threshold", async () => {
+	test.each(["disableReasoning", "forceReasoningOff"] as const)("%s wins over reasoning and still uses catalog context threshold", async (offOption) => {
 		const created: ModelSelection[] = [];
 		const sent: ModelSelection[] = [];
 		installCapturingAgent(created, sent);
 		const model = cursorModel("composer-2.5", 200_000);
-		const expected = buildModelSelection("composer-2.5", "off", {
-			apiKey: "test-key",
-			fastEnabled: false,
-			extendedContextEnabled: false,
-		});
+		const expected: ModelSelection = {
+			id: "composer-2.5",
+			params: [
+				{ id: "fast", value: "false" },
+				{ id: "context", value: "200k" },
+				{ id: "reasoning", value: "none" },
+			],
+		};
 		await drain(model, userContext("hi"), {
 			apiKey: "test-key",
 			cwd: "/tmp/project",
 			reasoning: Effort.High,
-			disableReasoning: true,
+			[offOption]: true,
 		});
 		expect(created).toEqual([expected]);
 		expect(sent).toEqual([expected]);

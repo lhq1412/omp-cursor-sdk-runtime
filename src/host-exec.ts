@@ -32,7 +32,7 @@ export function createSharedToolExec(
 			if (!grantedNames.has(name)) {
 				throw new ToolBridgeError(`tool ${name} is not granted`);
 			}
-			const result = await dedupe.execute(toolCallId, name, args, () => run(name, args, toolCallId));
+			const result = await dedupe.execute(toolCallId, name, args, (snapshot) => run(name, snapshot, toolCallId));
 			executed.add(`${bridgeRunId}:${toolCallId}`);
 			return result;
 		},
