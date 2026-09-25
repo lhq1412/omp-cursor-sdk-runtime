@@ -664,6 +664,75 @@ describe("session runtime", () => {
 		expect(prepared.prompt?.text).not.toContain(committed);
 	});
 
+	test("failed pre-send tool-fingerprint rebuild keeps consumption across retry and restart", async () => {
+		const tools = [{ name: "read", description: "read files", inputSchema: { type: "object" } }];
+		const committed = "Already executed request";
+		const same = userContext(committed);
+		const appended = {
+			messages: [
+				same.messages[0]!,
+				{ role: "user", content: "New request", timestamp: 2 } as Context["messages"][number],
+			],
+		} as Context;
+
+		async function prepareOnce(openImpl: Parameters<typeof runtimeTestUtils.setOpenAgent>[0], context: Context) {
+			const opens: Array<{ savedAgentId?: string }> = [];
+			const histories: Array<Context["messages"] | undefined> = [];
+			runtimeTestUtils.setOpenAgent(async (input) => {
+				opens.push({ savedAgentId: input.savedAgentId });
+				histories.push(input.bootstrapHistory);
+				return openImpl(input);
+			});
+			const prepared = await prepareTurn({
+				modelLimits, cwd: "/tmp/project", agentInstanceId: "main", apiKey: "test-key",
+				modelSelection: { id: "composer-2.5" }, context, grantedTools: tools,
+			});
+			return { prepared, opens, histories };
+		}
+
+		runtimeTestUtils.clear();
+		liveRunTestUtils.clear();
+		scopeTestUtils.reset();
+		resumeTestUtils.reset();
+		const { sessionFile, appended: journal } = registerResume();
+		seedCommittedHandle(sessionFile, same, "agent-old", tools);
+		resumeTestUtils.state.activeHandle!.toolContractFingerprint = "omp-custom-tools-v1-stale";
+		const committedBefore = structuredClone(resumeTestUtils.state.activeHandle);
+
+		await expect(prepareOnce(async () => {
+			throw new Error("openAgent boom");
+		}, same)).rejects.toThrow(/openAgent boom/);
+		expect(resumeTestUtils.state.activeHandle).toEqual(committedBefore);
+		expect(resumeTestUtils.state.activeHandle?.state).toBe("committed");
+		expect(journal.some((entry) => (entry.data as { state?: string }).state === "dirty")).toBe(false);
+
+		liveRunTestUtils.clear();
+		const retry = await prepareOnce(async () => fakeAgent("agent-retry"), same);
+		expect(retry.opens).toEqual([{ savedAgentId: undefined }]);
+		expect(retry.histories).toEqual([same.messages]);
+		expect(retry.prepared.prompt?.text).toContain("Continue the conversation from where it left off.");
+		expect(retry.prepared.prompt?.text).not.toContain(committed);
+
+		// Simulate process restart: drop in-memory runtime, keep the journal committed handle.
+		runtimeTestUtils.clear();
+		liveRunTestUtils.clear();
+		expect(resumeTestUtils.state.activeHandle?.state).toBe("committed");
+		expect(resumeTestUtils.state.activeHandle?.toolContractFingerprint).toBe("omp-custom-tools-v1-stale");
+		const afterRestart = await prepareOnce(async () => fakeAgent("agent-restart"), same);
+		expect(afterRestart.opens).toEqual([{ savedAgentId: undefined }]);
+		expect(afterRestart.histories).toEqual([same.messages]);
+		expect(afterRestart.prepared.prompt?.text).toContain("Continue the conversation from where it left off.");
+		expect(afterRestart.prepared.prompt?.text).not.toContain(committed);
+
+		runtimeTestUtils.clear();
+		liveRunTestUtils.clear();
+		const withAppend = await prepareOnce(async () => fakeAgent("agent-append"), appended);
+		expect(withAppend.opens).toEqual([{ savedAgentId: undefined }]);
+		expect(withAppend.histories).toEqual([same.messages]);
+		expect(withAppend.prepared.prompt?.text).toContain("New request");
+		expect(withAppend.prepared.prompt?.text).not.toContain(committed);
+	});
+
 	test("creates a new agent and bootstraps history when cwd or credentials change", async () => {
 		runtimeTestUtils.clear();
 		liveRunTestUtils.clear();

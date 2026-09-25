@@ -256,6 +256,18 @@ function findUniqueMessageIndex(messages: Context["messages"], locator: MessageL
 }
 
 
+/** Dispose the in-memory agent without journaling dirty over a still-valid committed consumption record. */
+function disposeAgentKeepJournalConsumption(slot: RuntimeSlot): Promise<void> {
+	const agent = slot.agent;
+	slot.agent = undefined;
+	slot.bindingState = "dirty";
+	slot.createCwd = undefined;
+	slot.credentialScopeId = undefined;
+	slot.toolContractFingerprint = undefined;
+	slot.store = undefined;
+	return agent ? disposeAgent(agent) : Promise.resolve();
+}
+
 export async function prepareTurn(input: OpenRuntimeTurnInput): Promise<PreparedTurn> {
 	input.signal?.throwIfAborted();
 	const scopeKey = getCursorSessionScopeKey();
@@ -303,6 +315,8 @@ export async function prepareTurn(input: OpenRuntimeTurnInput): Promise<Prepared
 	const identityMismatch = agentConfigMismatch(slot, cwd, nextCredential);
 	const toolMismatch = Boolean(slot.agent) && slot.toolContractFingerprint !== toolContract.fingerprint;
 	const unsafeBinding = Boolean(slot.agent) && (slot.bindingState !== "committed" || identityMismatch || toolMismatch);
+	// Tool-fingerprint-only rebuild: keep journal committed consumption until a new binding is sent.
+	const toolFingerprintRebuild = toolMismatch && !identityMismatch && slot.bindingState === "committed";
 	// Agent reuse requires an exact tool-contract fingerprint match.
 	const resumeHandle = unsafeBinding
 		? undefined
@@ -353,7 +367,10 @@ export async function prepareTurn(input: OpenRuntimeTurnInput): Promise<Prepared
 		if (slots.get(slot.key) !== slot) throw new Error("Cursor SDK preparation was superseded");
 	};
 	try {
-		if (unsafeBinding) void persistDirtyAndDisposeAgent(slot);
+		if (unsafeBinding) {
+			if (toolFingerprintRebuild) void disposeAgentKeepJournalConsumption(slot);
+			else void persistDirtyAndDisposeAgent(slot);
+		}
 		if (existingLive) {
 			await disposeLiveRun(slot.key, "OMP started a new user turn", false);
 			assertCurrent();
@@ -366,17 +383,16 @@ export async function prepareTurn(input: OpenRuntimeTurnInput): Promise<Prepared
 			slot.storeIdentity = resumeHandle.storeIdentity ?? slot.storeIdentity;
 			slot.toolContractFingerprint = resumeHandle.toolContractFingerprint;
 		} else if (!slot.agent) {
-			if (preservedSendState && !plan.resetAgent) {
-				slot.sendState = preservedSendState;
-			} else if (!plan.resetAgent && !resumeHandle && consumptionHandle) {
-				slot.sendState = { ...consumptionHandle.sendState };
+			if (!resumeHandle && !identityMismatch && (preservedSendState || consumptionHandle)) {
+				slot.sendState = preservedSendState ?? { ...consumptionHandle!.sendState };
 			} else {
 				slot.sendState = emptySendState();
 			}
 		}
 		if (plan.resetAgent) {
 			if (slot.agent) {
-				void persistDirtyAndDisposeAgent(slot);
+				if (toolFingerprintRebuild) void disposeAgentKeepJournalConsumption(slot);
+				else void persistDirtyAndDisposeAgent(slot);
 			} else if (resumeHandle) {
 				persistDirtyHandle(slot, resumeHandle);
 				slot.bindingState = "dirty";
@@ -384,21 +400,9 @@ export async function prepareTurn(input: OpenRuntimeTurnInput): Promise<Prepared
 				slot.credentialScopeId = undefined;
 				slot.toolContractFingerprint = undefined;
 				slot.sendState = emptySendState();
-			} else if (consumptionHandle) {
-				persistDirtyHandle(slot, {
-					agentId: consumptionHandle.agentId,
-					sendState: consumptionHandle.sendState,
-					storeIdentity: consumptionHandle.storeIdentity,
-					credentialScopeId: consumptionHandle.credentialScopeId,
-					cwd: consumptionHandle.cwd,
-					toolContractFingerprint: consumptionHandle.toolContractFingerprint,
-				});
-				slot.bindingState = "dirty";
-				slot.createCwd = undefined;
-				slot.credentialScopeId = undefined;
-				slot.toolContractFingerprint = undefined;
-				slot.sendState = emptySendState();
 			}
+			// Tool-fingerprint-only rebuild from a journal committed handle: do not dirty it
+			// before send. A failed open must still be able to read consumption on retry.
 		}
 
 		const savedAgentId = slot.agent?.agentId ?? (slot.bindingState === "committed" ? resumeHandle?.agentId : undefined);
@@ -461,7 +465,16 @@ export async function prepareTurn(input: OpenRuntimeTurnInput): Promise<Prepared
 			incremental: plan.mode === "incremental",
 		};
 	} catch (error) {
-		if (slots.get(slot.key) === slot) await persistDirtyAndDisposeAgent(slot);
+		if (slots.get(slot.key) === slot) {
+			// Pre-send tool rebuild: dispose the new agent without journaling dirty over committed consumption.
+			if (toolFingerprintRebuild || (!resumeHandle && consumptionHandle && !identityMismatch)) {
+				await disposeAgentKeepJournalConsumption(slot);
+				const consumption = preservedSendState ?? (consumptionHandle ? { ...consumptionHandle.sendState } : undefined);
+				if (consumption) slot.sendState = consumption;
+			} else {
+				await persistDirtyAndDisposeAgent(slot);
+			}
+		}
 		throw error;
 	}
 }
