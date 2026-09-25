@@ -29,12 +29,14 @@ describe("custom tools", () => {
 		expect(first.definitions.map((tool) => tool.sdkName)).toEqual(["read", hashedSdkName("read file"), "write"]);
 		expect(first.fingerprint).toBe(second.fingerprint);
 		expect(first.guidance).toBe(second.guidance);
-		expect(first.guidance).toContain("SDK name: read");
-		expect(first.guidance).toContain(`SDK name: ${hashedSdkName("read file")}`);
-		expect(first.guidance).toContain("OMP name: read file");
+		expect(first.guidance).toContain("- read");
+		expect(first.guidance).toContain(`- ${hashedSdkName("read file")} (OMP name: read file)`);
+		expect(first.guidance).not.toContain("Description:");
+		expect(first.guidance).not.toContain("Input schema:");
 		expect(first.guidance).toContain("Pass arguments exactly as defined by the OMP schema");
 		expect(first.ompToSdk.get("read file")).toBe(hashedSdkName("read file"));
 		expect(first.sdkToOmp.get(hashedSdkName("read file"))).toBe("read file");
+		expect(first.definitions.find((tool) => tool.ompName === "read")?.description).toBe("read");
 	});
 
 	test("fails closed on invalid or colliding schemas", () => {

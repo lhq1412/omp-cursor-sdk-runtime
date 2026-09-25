@@ -10,6 +10,6 @@
     "allowImportingTsExtensions": true,
     "noEmit": true
   },
-  "include": ["src", "scripts/omp-contract-probe.ts"],
+  "include": ["src", "scripts/omp-contract-probe.ts", "scripts/tool-guidance-probe.ts"],
   "exclude": ["node_modules", "dist", "test"]
 }

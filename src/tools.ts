@@ -81,21 +81,25 @@ export function buildToolContract(grantedTools: readonly GrantedTool[]): ToolCon
 	const guidance = [
 		"OMP custom tool contract: call only tools granted below through the custom-user-tools namespace.",
 		"Policy: OMP validates, approves, executes, and records every call. Native Cursor tools are unavailable. Pass arguments exactly as defined by the OMP schema; do not translate them to Cursor-native tool arguments.",
-		"Granted OMP tools:",
-		...definitions.map((tool) => [
-			`- SDK name: ${tool.sdkName}`,
-			...(tool.sdkName === tool.ompName ? [] : [`  OMP name: ${tool.ompName}`]),
-			`  Description: ${tool.description}`,
-			`  Input schema: ${stableJson(tool.inputSchema)}`,
-		].join("\n")),
+		"Granted SDK tool names:",
+		...definitions.map((tool) => (
+			tool.sdkName === tool.ompName
+				? `- ${tool.sdkName}`
+				: `- ${tool.sdkName} (OMP name: ${tool.ompName})`
+		)),
 	].join("\n");
 	return {
 		definitions,
 		ompToSdk,
 		sdkToOmp,
 		guidance,
-		fingerprint: createHash("sha256").update(`omp-custom-tools-v1\0${serializedDefinitions}\0${guidance}`).digest("hex"),
+		fingerprint: createHash("sha256").update(`omp-custom-tools-v2\0${serializedDefinitions}\0${guidance}`).digest("hex"),
 	};
+}
+
+/** Conservative input-budget reserve for formal custom-tool declarations (not SDK-exact tokens). */
+export function estimateFormalToolDefinitionTokens(definitions: readonly ToolContractDefinition[]): number {
+	return (Buffer.byteLength(stableJson(definitions), "utf8") + 3) >> 2;
 }
 
 

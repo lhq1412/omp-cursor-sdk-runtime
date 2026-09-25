@@ -489,6 +489,7 @@ export function prepareSendInput(
 	limits: ModelInputLimits,
 	targetModelId?: string,
 	toolGuidance = "",
+	formalToolDefinitionReserveTokens = 0,
 ): PreparedSendInput {
 	const current = activeUserInput(context, plan.continueOnly);
 	if (plan.mode === "incremental") {
@@ -517,12 +518,13 @@ export function prepareSendInput(
 	const toolContext = prior.length > 0 ? `${SDK_TOOL_CONTEXT}\n\n` : "";
 	const budget = inputTextBudget(current, limits);
 	const requiredText = system + tools + toolContext + current.text;
-	if (estimatedTextTokens(requiredText) > budget) {
+	const definitionReserve = Math.max(0, formalToolDefinitionReserveTokens);
+	if (estimatedTextTokens(requiredText) + definitionReserve > budget) {
 		if (recoveryStart !== undefined) throw new CursorRecoveryBudgetError();
 		throwContextOverflow();
 	}
 	const text = requiredText;
-	if (estimatedTextTokens(text) + estimatedHistoryTokens(prior, targetModelId) > budget) {
+	if (estimatedTextTokens(text) + estimatedHistoryTokens(prior, targetModelId) + definitionReserve > budget) {
 		if (recoveryStart !== undefined) throw new CursorRecoveryBudgetError();
 		throw new CursorBootstrapBudgetError();
 	}

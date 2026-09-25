@@ -329,6 +329,22 @@ describe("send policy", () => {
 		expect(incremental.prompt.text).not.toContain(SDK_TOOL_CONTEXT);
 	});
 
+	test("counts formal tool-definition reserve separately from guidance text", () => {
+		const guidance = "short guidance";
+		const first = context(firstUser, ["sys"]);
+		const hugeReserve = modelLimits.contextWindow;
+		expect(() => prepareSendInput(
+			planSend(emptySendState(), first),
+			first,
+			modelLimits,
+			undefined,
+			guidance,
+			hugeReserve,
+		)).toThrow(/exceed the model input budget/);
+		const ok = prepareSendInput(planSend(emptySendState(), first), first, modelLimits, undefined, guidance, 1);
+		expect(ok.prompt.text).toContain(guidance);
+	});
+
 	test("preserves the joined OMP prompt and only trims outer whitespace", () => {
 		const structured = [
 			"<system-conventions>",

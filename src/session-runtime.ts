@@ -22,7 +22,7 @@ import { openAgent, prewarmLocalExecutor, type OpenAgentInput } from "./sdk-sess
 import { flushResumeHandleNow, getMatchingResumeHandle, persistResumeHandle, type ResumeStoreIdentity } from "./session-resume.js";
 import { getCursorSessionCwd, getCursorSessionOwner, getCursorSessionScopeKey, withCursorSessionOwner, type CursorSessionOwner } from "./session-scope.js";
 import { openScopedJsonlStore, storeRootForScope } from "./store.js";
-import { buildCustomTools, buildToolContract, newBridgeRunId } from "./tools.js";
+import { buildCustomTools, buildToolContract, estimateFormalToolDefinitionTokens, newBridgeRunId } from "./tools.js";
 import { ompToolCallId } from "./projector.js";
 
 export interface RuntimeSlot {
@@ -300,17 +300,47 @@ export async function prepareTurn(input: OpenRuntimeTurnInput): Promise<Prepared
 		throw new Error("Cannot open a Cursor SDK agent without a model selection");
 	}
 
-	const configMismatch = agentConfigMismatch(slot, cwd, nextCredential)
-		|| Boolean(slot.agent) && slot.toolContractFingerprint !== toolContract.fingerprint;
-	const unsafeBinding = Boolean(slot.agent) && (slot.bindingState !== "committed" || configMismatch);
+	const identityMismatch = agentConfigMismatch(slot, cwd, nextCredential);
+	const toolMismatch = Boolean(slot.agent) && slot.toolContractFingerprint !== toolContract.fingerprint;
+	const unsafeBinding = Boolean(slot.agent) && (slot.bindingState !== "committed" || identityMismatch || toolMismatch);
+	// Agent reuse requires an exact tool-contract fingerprint match.
 	const resumeHandle = unsafeBinding
 		? undefined
 		: getMatchingResumeHandle(input.agentInstanceId, nextCredential, cwd, toolContract.fingerprint);
-	const sendState = unsafeBinding ? emptySendState() : slot.agent ? slot.sendState : resumeHandle?.sendState ?? emptySendState();
-	const plan = trailing.length > 0
+	// Consumed-input identity is separate: keep sendState across tool-fingerprint-only rebuilds.
+	const consumptionHandle = getMatchingResumeHandle(input.agentInstanceId, nextCredential, cwd);
+	const preservedSendState = (
+		Boolean(slot.agent)
+		&& slot.bindingState === "committed"
+		&& !identityMismatch
+	) ? { ...slot.sendState } : undefined;
+	const sendState = (() => {
+		if (Boolean(slot.agent) && slot.bindingState !== "committed") return emptySendState();
+		if (identityMismatch) return emptySendState();
+		if (slot.agent) return { ...slot.sendState };
+		return resumeHandle?.sendState ?? consumptionHandle?.sendState ?? emptySendState();
+	})();
+	let plan = trailing.length > 0
 		? { mode: "bootstrap" as const, resetAgent: true, reason: "context_divergence" as const }
 		: planSend(sendState, input.context);
-	const { prompt, history } = prepareSendInput(plan, input.context, input.modelLimits, modelSelection.id, toolContract.guidance);
+	const willReuseAgent = (Boolean(slot.agent) && !unsafeBinding) || Boolean(resumeHandle);
+	if (!willReuseAgent && plan.mode === "incremental") {
+		// Re-import natively; keep continueOnly so consumed input is not resent.
+		plan = {
+			mode: "bootstrap",
+			resetAgent: true,
+			reason: "context_divergence",
+			...(plan.continueOnly ? { continueOnly: true as const } : {}),
+		};
+	}
+	const { prompt, history } = prepareSendInput(
+		plan,
+		input.context,
+		input.modelLimits,
+		modelSelection.id,
+		toolContract.guidance,
+		estimateFormalToolDefinitionTokens(toolContract.definitions),
+	);
 	if (!unsafeBinding) slot.sendState = { ...sendState };
 
 	slot.preparation?.abort();
@@ -336,13 +366,33 @@ export async function prepareTurn(input: OpenRuntimeTurnInput): Promise<Prepared
 			slot.storeIdentity = resumeHandle.storeIdentity ?? slot.storeIdentity;
 			slot.toolContractFingerprint = resumeHandle.toolContractFingerprint;
 		} else if (!slot.agent) {
-			slot.sendState = emptySendState();
+			if (preservedSendState && !plan.resetAgent) {
+				slot.sendState = preservedSendState;
+			} else if (!plan.resetAgent && !resumeHandle && consumptionHandle) {
+				slot.sendState = { ...consumptionHandle.sendState };
+			} else {
+				slot.sendState = emptySendState();
+			}
 		}
 		if (plan.resetAgent) {
 			if (slot.agent) {
 				void persistDirtyAndDisposeAgent(slot);
 			} else if (resumeHandle) {
 				persistDirtyHandle(slot, resumeHandle);
+				slot.bindingState = "dirty";
+				slot.createCwd = undefined;
+				slot.credentialScopeId = undefined;
+				slot.toolContractFingerprint = undefined;
+				slot.sendState = emptySendState();
+			} else if (consumptionHandle) {
+				persistDirtyHandle(slot, {
+					agentId: consumptionHandle.agentId,
+					sendState: consumptionHandle.sendState,
+					storeIdentity: consumptionHandle.storeIdentity,
+					credentialScopeId: consumptionHandle.credentialScopeId,
+					cwd: consumptionHandle.cwd,
+					toolContractFingerprint: consumptionHandle.toolContractFingerprint,
+				});
 				slot.bindingState = "dirty";
 				slot.createCwd = undefined;
 				slot.credentialScopeId = undefined;
