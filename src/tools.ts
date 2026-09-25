@@ -139,11 +139,14 @@ export function createToolCallDedupe(bridgeRunId: string): ToolCallDedupe {
 				}
 				return pending.promise;
 			}
-			const next = run(snapshot).then((result) => {
-				completed.set(key, { name, argsJson, result });
-				inflight.delete(key);
-				return result;
-			});
+			// Register before run so sync throws and async rejects still join; never delete on failure.
+			const next = Promise.resolve()
+				.then(() => run(snapshot))
+				.then((result) => {
+					completed.set(key, { name, argsJson, result });
+					inflight.delete(key);
+					return result;
+				});
 			inflight.set(key, { name, argsJson, promise: next });
 			return next;
 		},
@@ -159,7 +162,6 @@ export type ToolExecutor = (
 export function buildCustomTools(
 	contract: ToolContract,
 	execute: ToolExecutor,
-	dedupe: ToolCallDedupe,
 ): Record<string, SDKCustomTool> {
 	const tools: Record<string, SDKCustomTool> = {};
 	for (const tool of contract.definitions) {
@@ -167,10 +169,11 @@ export function buildCustomTools(
 			description: tool.description,
 			inputSchema: tool.inputSchema,
 			async execute(args, context) {
+				if (!context.toolCallId) {
+					throw new ToolBridgeError("custom tool callback is missing toolCallId");
+				}
 				const prepared = asRecord(args);
-				const result = await dedupe.execute(context.toolCallId, tool.ompName, prepared, (snapshot) =>
-					execute(tool.ompName, snapshot, context.toolCallId ?? ""),
-				);
+				const result = await execute(tool.ompName, prepared, context.toolCallId);
 				return hostResultToSdk(result);
 			},
 		};
@@ -185,6 +188,6 @@ function asRecord(value: unknown): Record<string, unknown> {
 	if (value !== null && typeof value === "object" && !Array.isArray(value)) {
 		return value as Record<string, unknown>;
 	}
-	return {};
+	throw new ToolBridgeError("tool arguments are not a JSON object");
 }
 

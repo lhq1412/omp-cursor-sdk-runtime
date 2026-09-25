@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { describe, expect, test } from "bun:test";
 import { buildCustomTools, buildToolContract, createToolCallDedupe, mapOmpToolName, ToolBridgeError } from "../../src/tools.ts";
+import { createSharedToolExec } from "../../src/host-exec.ts";
 import { createFakeHost } from "../helpers/fake-host.ts";
 
 function hashedSdkName(name: string): string {
@@ -109,7 +110,6 @@ describe("custom tools", () => {
 		const tools = buildCustomTools(
 			buildToolContract(host.snapshot().grantedTools),
 			(name, args, toolCallId) => host.executeTool(name, args, toolCallId),
-			createToolCallDedupe("run-1"),
 		);
 		expect(Object.keys(tools)).toEqual(["read"]);
 		await expect(host.executeTool("write", { path: "x" }, "call-x")).rejects.toThrow(/not granted/);
@@ -120,14 +120,10 @@ describe("custom tools", () => {
 		const contract = buildToolContract([
 			{ name: "grep", description: "grep", inputSchema: { type: "object", additionalProperties: true } },
 		]);
-		const tools = buildCustomTools(
-			contract,
-			async (name, args) => {
-				calls.push({ name, args });
-				return { content: [{ type: "text", text: "ok" }], isError: false };
-			},
-			createToolCallDedupe("run-1"),
-		);
+		const tools = buildCustomTools(contract, async (name, args) => {
+			calls.push({ name, args });
+			return { content: [{ type: "text", text: "ok" }], isError: false };
+		});
 		const empty = await tools.grep.execute({ path: "src" }, { toolCallId: "call-empty" });
 		expect(empty).toEqual({ content: [{ type: "text", text: "ok" }], isError: false });
 		const blankPattern = await tools.grep.execute({ pattern: "  ", glob: "*.ts" }, { toolCallId: "call-blank" });
@@ -141,24 +137,26 @@ describe("custom tools", () => {
 		]);
 	});
 
-	test("detaches callback arguments from the SDK object", async () => {
+	test("detaches callback arguments from the SDK object through SharedToolExec", async () => {
 		const source = { path: "a.ts" };
 		let seen: Record<string, unknown> | undefined;
-		const tools = buildCustomTools(
-			buildToolContract([{ name: "read", description: "read", inputSchema: { type: "object" } }]),
+		const granted = [{ name: "read", description: "read", inputSchema: { type: "object" } }];
+		const exec = createSharedToolExec(
+			granted,
 			async (_name, args) => {
 				seen = args;
 				source.path = "mutated";
 				return { content: [{ type: "text", text: "ok" }], isError: false };
 			},
-			createToolCallDedupe("run-1"),
+			"run-1",
 		);
+		const tools = buildCustomTools(buildToolContract(granted), exec.execute);
 		await tools.read.execute(source, { toolCallId: "call-1" });
 		expect(seen).toEqual({ path: "a.ts" });
 		expect(seen).not.toBe(source);
 	});
 
-	test("does not run a callback when arguments are not a JSON object", async () => {
+	test("rejects non-object SDK arguments before host execution", async () => {
 		let ran = false;
 		const tools = buildCustomTools(
 			buildToolContract([{ name: "read", description: "read", inputSchema: { type: "object" } }]),
@@ -166,8 +164,26 @@ describe("custom tools", () => {
 				ran = true;
 				return { content: [{ type: "text", text: "ok" }], isError: false };
 			},
-			createToolCallDedupe("run-1"),
 		);
+		await expect(tools.read.execute(null, { toolCallId: "call-null" })).rejects.toBeInstanceOf(ToolBridgeError);
+		await expect(tools.read.execute([], { toolCallId: "call-array" })).rejects.toBeInstanceOf(ToolBridgeError);
+		await expect(tools.read.execute("x", { toolCallId: "call-string" })).rejects.toBeInstanceOf(ToolBridgeError);
+		await expect(tools.read.execute(1, { toolCallId: "call-number" })).rejects.toBeInstanceOf(ToolBridgeError);
+		expect(ran).toBe(false);
+	});
+
+	test("does not run a callback when arguments are not a JSON object", async () => {
+		let ran = false;
+		const granted = [{ name: "read", description: "read", inputSchema: { type: "object" } }];
+		const exec = createSharedToolExec(
+			granted,
+			async () => {
+				ran = true;
+				return { content: [{ type: "text", text: "ok" }], isError: false };
+			},
+			"run-1",
+		);
+		const tools = buildCustomTools(buildToolContract(granted), exec.execute);
 		const cyclic: Record<string, unknown> = {};
 		cyclic.self = cyclic;
 		await expect(tools.read.execute(cyclic, { toolCallId: "call-cyclic" })).rejects.toThrow();
@@ -176,12 +192,24 @@ describe("custom tools", () => {
 		expect(ran).toBe(false);
 	});
 
+	test("rejects missing toolCallId on the SDK custom-tool callback", async () => {
+		let ran = false;
+		const tools = buildCustomTools(
+			buildToolContract([{ name: "read", description: "read", inputSchema: { type: "object" } }]),
+			async () => {
+				ran = true;
+				return { content: [{ type: "text", text: "ok" }], isError: false };
+			},
+		);
+		await expect(tools.read.execute({}, { toolCallId: undefined })).rejects.toBeInstanceOf(ToolBridgeError);
+		expect(ran).toBe(false);
+	});
+
 	test("returns exact text and image content from the tool callback", async () => {
 		const image = { type: "image" as const, data: "iVBORw0KGgo=", mimeType: "image/png" };
 		const tools = buildCustomTools(
 			buildToolContract([{ name: "read", description: "read", inputSchema: { type: "object" } }]),
 			async () => ({ content: [{ type: "text", text: "caption" }, image], isError: false }),
-			createToolCallDedupe("run-1"),
 		);
 		await expect(tools.read.execute({}, { toolCallId: "call-img" })).resolves.toEqual({
 			content: [{ type: "text", text: "caption" }, image],
@@ -200,7 +228,6 @@ describe("custom tools", () => {
 				},
 			}]),
 			async () => ({ content: [], isError: false }),
-			createToolCallDedupe("run-1"),
 		);
 		expect(JSON.stringify(tools.eval.inputSchema)).not.toContain("anyOf");
 	});
