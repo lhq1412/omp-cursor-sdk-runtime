@@ -95,6 +95,23 @@ describe("host tool catalog", () => {
 		expect(mergeGrantedTools([])).toEqual([]);
 	});
 
+	test("empty grant and catalogExtras false skip live catalog refresh", () => {
+		catalogTestUtils.clear();
+		let catalogReads = 0;
+		catalogTestUtils.setLiveCatalog(() => {
+			catalogReads += 1;
+			return ["mcp__should_not_load"];
+		});
+		catalogTestUtils.setLiveEnabled(() => {
+			throw new Error("enabled set should not be read on early return");
+		});
+		expect(mergeGrantedTools([])).toEqual([]);
+		expect(mergeGrantedTools([{ name: "read", description: "read", inputSchema: { type: "object" } }], {
+			catalogExtras: false,
+		})).toEqual([{ name: "read", description: "read", inputSchema: { type: "object" } }]);
+		expect(catalogReads).toBe(0);
+	});
+
 	test("does not expand a read-only grant with catalog bash, edit, or disabled MCP", () => {
 		catalogTestUtils.clear();
 		snapshotHostToolCatalog(["read", "bash", "edit", "mcp__github_list_issues", "mcp__disabled_delete"]);

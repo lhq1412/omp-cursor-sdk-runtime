@@ -367,7 +367,7 @@ export async function prepareTurn(input: OpenRuntimeTurnInput): Promise<Prepared
 		const requestMessage = input.context.messages.at(-trailing.length - 1);
 		live.requestLocator = requestMessage ? locatorFor(requestMessage) : undefined;
 		const toolExec = attachParkExecutor(live, input.grantedTools, input.host);
-		const customTools = buildCustomTools(toolContract, toolExec.execute, toolExec.dedupe);
+		const customTools = buildCustomTools(toolContract, toolExec.execute);
 		live.projection.sdkToOmp = new Map(toolContract.sdkToOmp);
 		live.projection.allowToolPreview = !input.host;
 

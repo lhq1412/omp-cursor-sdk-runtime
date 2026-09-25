@@ -118,10 +118,11 @@ function enabledToolNames(): Set<string> | undefined {
  * catalog for schema. Disabled or unknown-authorization MCP is not added.
  */
 export function mergeGrantedTools(fromContext: readonly GrantedTool[], options?: MergeGrantedToolsOptions): GrantedTool[] {
-	const { extras } = catalogState();
-	refreshCatalog();
 	if (fromContext.length === 0) return [];
 	if (options?.catalogExtras === false) return [...fromContext];
+
+	const { extras } = catalogState();
+	refreshCatalog();
 	const enabled = enabledToolNames();
 	if (!enabled) return [...fromContext];
 	const byName = new Map<string, GrantedTool>();
