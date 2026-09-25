@@ -40,6 +40,15 @@ export interface RuntimeSlot {
 	storeIdentity: ResumeStoreIdentity;
 	store?: LocalAgentStore;
 	preparation?: AbortController;
+	/**
+	 * In-process consumption proof for a tool-fingerprint-only rebuild that failed before send.
+	 * Validated against cwd + credential on the next prepare; never authorizes agent reuse.
+	 */
+	preSendConsumption?: {
+		sendState: SendState;
+		cwd: string;
+		credentialScopeId: string;
+	};
 }
 
 
@@ -268,6 +277,36 @@ function disposeAgentKeepJournalConsumption(slot: RuntimeSlot): Promise<void> {
 	return agent ? disposeAgent(agent) : Promise.resolve();
 }
 
+function stashPreSendConsumption(
+	slot: RuntimeSlot,
+	sendState: SendState,
+	cwd: string,
+	credentialScopeId: string,
+): void {
+	slot.preSendConsumption = {
+		sendState: { ...sendState },
+		cwd: normalizeRuntimeCwd(cwd),
+		credentialScopeId,
+	};
+	slot.sendState = { ...sendState };
+}
+
+function matchingPreSendConsumption(
+	slot: RuntimeSlot,
+	cwd: string,
+	credentialScopeId: string,
+): SendState | undefined {
+	const proof = slot.preSendConsumption;
+	if (!proof) return undefined;
+	if (proof.credentialScopeId !== credentialScopeId) return undefined;
+	if (normalizeRuntimeCwd(proof.cwd) !== normalizeRuntimeCwd(cwd)) return undefined;
+	return { ...proof.sendState };
+}
+
+function clearPreSendConsumption(slot: RuntimeSlot): void {
+	slot.preSendConsumption = undefined;
+}
+
 export async function prepareTurn(input: OpenRuntimeTurnInput): Promise<PreparedTurn> {
 	input.signal?.throwIfAborted();
 	const scopeKey = getCursorSessionScopeKey();
@@ -328,11 +367,16 @@ export async function prepareTurn(input: OpenRuntimeTurnInput): Promise<Prepared
 		&& slot.bindingState === "committed"
 		&& !identityMismatch
 	) ? { ...slot.sendState } : undefined;
+	const memoryConsumption = matchingPreSendConsumption(slot, cwd, nextCredential);
+	if (identityMismatch) clearPreSendConsumption(slot);
 	const sendState = (() => {
 		if (Boolean(slot.agent) && slot.bindingState !== "committed") return emptySendState();
 		if (identityMismatch) return emptySendState();
 		if (slot.agent) return { ...slot.sendState };
-		return resumeHandle?.sendState ?? consumptionHandle?.sendState ?? emptySendState();
+		return resumeHandle?.sendState
+			?? consumptionHandle?.sendState
+			?? memoryConsumption
+			?? emptySendState();
 	})();
 	let plan = trailing.length > 0
 		? { mode: "bootstrap" as const, resetAgent: true, reason: "context_divergence" as const }
@@ -368,14 +412,20 @@ export async function prepareTurn(input: OpenRuntimeTurnInput): Promise<Prepared
 	};
 	try {
 		if (unsafeBinding) {
-			if (toolFingerprintRebuild) void disposeAgentKeepJournalConsumption(slot);
-			else void persistDirtyAndDisposeAgent(slot);
+			if (toolFingerprintRebuild) {
+				stashPreSendConsumption(slot, preservedSendState ?? slot.sendState, cwd, nextCredential);
+				void disposeAgentKeepJournalConsumption(slot);
+			} else {
+				clearPreSendConsumption(slot);
+				void persistDirtyAndDisposeAgent(slot);
+			}
 		}
 		if (existingLive) {
 			await disposeLiveRun(slot.key, "OMP started a new user turn", false);
 			assertCurrent();
 		}
 		if (resumeHandle && !slot.agent) {
+			clearPreSendConsumption(slot);
 			slot.sendState = { ...resumeHandle.sendState };
 			slot.bindingState = "committed";
 			slot.createCwd = resumeHandle.cwd;
@@ -383,17 +433,26 @@ export async function prepareTurn(input: OpenRuntimeTurnInput): Promise<Prepared
 			slot.storeIdentity = resumeHandle.storeIdentity ?? slot.storeIdentity;
 			slot.toolContractFingerprint = resumeHandle.toolContractFingerprint;
 		} else if (!slot.agent) {
-			if (!resumeHandle && !identityMismatch && (preservedSendState || consumptionHandle)) {
-				slot.sendState = preservedSendState ?? { ...consumptionHandle!.sendState };
+			const consumption = preservedSendState
+				?? (consumptionHandle ? { ...consumptionHandle.sendState } : undefined)
+				?? matchingPreSendConsumption(slot, cwd, nextCredential);
+			if (!resumeHandle && !identityMismatch && consumption) {
+				slot.sendState = consumption;
 			} else {
 				slot.sendState = emptySendState();
 			}
 		}
 		if (plan.resetAgent) {
 			if (slot.agent) {
-				if (toolFingerprintRebuild) void disposeAgentKeepJournalConsumption(slot);
-				else void persistDirtyAndDisposeAgent(slot);
+				if (toolFingerprintRebuild) {
+					stashPreSendConsumption(slot, preservedSendState ?? slot.sendState, cwd, nextCredential);
+					void disposeAgentKeepJournalConsumption(slot);
+				} else {
+					clearPreSendConsumption(slot);
+					void persistDirtyAndDisposeAgent(slot);
+				}
 			} else if (resumeHandle) {
+				clearPreSendConsumption(slot);
 				persistDirtyHandle(slot, resumeHandle);
 				slot.bindingState = "dirty";
 				slot.createCwd = undefined;
@@ -455,6 +514,7 @@ export async function prepareTurn(input: OpenRuntimeTurnInput): Promise<Prepared
 		slot.cwd = cwd;
 		slot.credentialScopeId = nextCredential;
 		slot.toolContractFingerprint = toolContract.fingerprint;
+		clearPreSendConsumption(slot);
 
 		return {
 			slot,
@@ -466,12 +526,17 @@ export async function prepareTurn(input: OpenRuntimeTurnInput): Promise<Prepared
 		};
 	} catch (error) {
 		if (slots.get(slot.key) === slot) {
-			// Pre-send tool rebuild: dispose the new agent without journaling dirty over committed consumption.
-			if (toolFingerprintRebuild || (!resumeHandle && consumptionHandle && !identityMismatch)) {
+			// Pre-send tool rebuild: dispose without journaling dirty over committed consumption,
+			// and keep an identity-checked in-memory proof for same-process retry without a journal.
+			if (toolFingerprintRebuild || (!resumeHandle && !identityMismatch && (consumptionHandle || preservedSendState || slot.preSendConsumption))) {
+				const consumption = preservedSendState
+					?? (consumptionHandle ? { ...consumptionHandle.sendState } : undefined)
+					?? matchingPreSendConsumption(slot, cwd, nextCredential)
+					?? (slot.sendState.bootstrapped ? { ...slot.sendState } : undefined);
 				await disposeAgentKeepJournalConsumption(slot);
-				const consumption = preservedSendState ?? (consumptionHandle ? { ...consumptionHandle.sendState } : undefined);
-				if (consumption) slot.sendState = consumption;
+				if (consumption) stashPreSendConsumption(slot, consumption, cwd, nextCredential);
 			} else {
+				clearPreSendConsumption(slot);
 				await persistDirtyAndDisposeAgent(slot);
 			}
 		}
@@ -487,6 +552,7 @@ export function commitTurn(slot: RuntimeSlot, context: Context, incremental: boo
 		incrementalSendCount: incremental ? slot.sendState.incrementalSendCount + 1 : 0,
 	};
 	slot.bindingState = "committed";
+	clearPreSendConsumption(slot);
 	const pending = resumePending(slot, "committed");
 	if (pending) withCursorSessionOwner(slot.owner, () => persistResumeHandle(pending));
 }
