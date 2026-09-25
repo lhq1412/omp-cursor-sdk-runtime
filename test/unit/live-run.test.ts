@@ -4,6 +4,7 @@ import type { Run, RunResult } from "@cursor/sdk";
 import { createSharedToolExec } from "../../src/host-exec.ts";
 import {
 	__testUtils as liveRunTestUtils,
+	activeWaiterCount,
 	collectParkedBatch,
 	createLiveRun,
 	disposeLiveRun,
@@ -40,7 +41,8 @@ describe("live-run park-and-yield", () => {
 		const live = createLiveRun(dummyExec());
 		const parked = waitForParked(live);
 		const execution = parkToolCall(live, "read", { path: "a.ts" }, "call-1", "call-1");
-		await parked;
+		await parked.promise;
+		parked.dispose();
 		const batch = await collectParkedBatch(live);
 		expect(batch.map((call) => ({ sdk: call.sdkToolCallId, omp: call.ompToolCallId }))).toEqual([
 			{ sdk: "call-1", omp: "call-1" },
@@ -58,7 +60,7 @@ describe("live-run park-and-yield", () => {
 		liveRunTestUtils.clear();
 		const live = createLiveRun(dummyExec());
 		const first = parkToolCall(live, "read", { path: "a.ts" }, "call-first", "call-first");
-		await waitForParked(live);
+		await waitForParked(live).promise;
 		await collectParkedBatch(live);
 		const late = parkToolCall(live, "grep", { pattern: "x" }, "call-late", "call-late");
 
@@ -91,9 +93,9 @@ describe("live-run park-and-yield", () => {
 				wait: async (): Promise<RunResult> => ({ status: "finished" }) as RunResult,
 			} as unknown as Run;
 		});
-		await waitForParked(live);
+		await waitForParked(live).promise;
 		resumeParked(live, { messages: [toolResult("call-3", "ok")] } as Context);
-		await expect(waitForResult(live)).resolves.toMatchObject({ status: "finished" });
+		await expect(waitForResult(live).promise).resolves.toMatchObject({ status: "finished" });
 		await expect(send).resolves.toMatchObject({ status: "finished" });
 	});
 
@@ -113,7 +115,7 @@ describe("live-run park-and-yield", () => {
 				wait: async (): Promise<RunResult> => ({ status: "cancelled" }) as RunResult,
 			} as unknown as Run;
 		});
-		await expect(waitForCancelled(live)).resolves.toBeUndefined();
+		await expect(waitForCancelled(live).promise).resolves.toBeUndefined();
 		await expect(send).resolves.toMatchObject({ status: "cancelled" });
 		expect(cancelled).toBe(1);
 	});
@@ -137,18 +139,114 @@ describe("live-run park-and-yield", () => {
 		const ompId = projectSdkToolCallId(sdkId);
 		const parked = waitForParked(live);
 		const execution = parkToolCall(live, "read", { path: "a.ts" }, sdkId, ompId);
-		await parked;
+		await parked.promise;
+		parked.dispose();
 		await collectParkedBatch(live);
 		resumeParked(live, { messages: [toolResult(sdkId, "should not match")] } as Context);
 		await expect(execution).rejects.toThrow(/did not return a tool result/);
 
 		const parkedAgain = waitForParked(live);
 		const executionAgain = parkToolCall(live, "read", { path: "a.ts" }, sdkId, ompId);
-		await parkedAgain;
+		await parkedAgain.promise;
+		parkedAgain.dispose();
 		resumeParked(live, { messages: [toolResult(ompId, "file contents")] } as Context);
 		await expect(executionAgain).resolves.toEqual({
 			isError: false,
 			content: [{ type: "text", text: "file contents" }],
 		});
+	});
+
+	test("dispose clears cancel and result waiters without growing across races", async () => {
+		liveRunTestUtils.clear();
+		const live = createLiveRun(dummyExec());
+		const handles = Array.from({ length: 20 }, () => ({
+			cancelled: waitForCancelled(live),
+			result: waitForResult(live),
+			parked: waitForParked(live),
+		}));
+		expect(activeWaiterCount(live)).toBe(60);
+		for (const handle of handles) {
+			handle.cancelled.dispose();
+			handle.result.dispose();
+			handle.parked.dispose();
+		}
+		expect(activeWaiterCount(live)).toBe(0);
+	});
+
+	test("1000 local wait/resume cycles keep active waiters bounded to the current race", async () => {
+		liveRunTestUtils.clear();
+		const live = createLiveRun(dummyExec());
+		startSend(live, async () => ({
+			supports: () => false,
+			wait: () => new Promise<RunResult>(() => undefined),
+		} as unknown as Run));
+
+		let peak = 0;
+		for (let i = 0; i < 1000; i += 1) {
+			const parked = waitForParked(live);
+			const finished = waitForResult(live);
+			const cancelled = waitForCancelled(live);
+			peak = Math.max(peak, activeWaiterCount(live));
+			const execution = parkToolCall(live, "read", { path: `f-${i}.ts` }, `sdk-${i}`, `omp-${i}`);
+			await parked.promise;
+			parked.dispose();
+			finished.dispose();
+			cancelled.dispose();
+			expect(activeWaiterCount(live)).toBe(0);
+			const call = live.parked[0]!;
+			call.yielded = true;
+			resumeParked(live, {
+				messages: [toolResult(call.ompToolCallId, "ok")],
+			} as Context);
+			await expect(execution).resolves.toMatchObject({ content: [{ type: "text", text: "ok" }] });
+		}
+		expect(peak).toBeLessThanOrEqual(3);
+		expect(activeWaiterCount(live)).toBe(0);
+	});
+
+	test("cached result terminal serves later waiters immediately", async () => {
+		liveRunTestUtils.clear();
+		const live = createLiveRun(dummyExec());
+		const send = startSend(live, async () => ({
+			supports: () => false,
+			wait: async (): Promise<RunResult> => ({ status: "finished" }) as RunResult,
+		} as unknown as Run));
+		await send;
+		const late = waitForResult(live);
+		await expect(late.promise).resolves.toMatchObject({ status: "finished" });
+		late.dispose();
+		expect(activeWaiterCount(live)).toBe(0);
+	});
+
+	test("old cancel waiters do not fire after dispose when a new run is cancelled", async () => {
+		liveRunTestUtils.clear();
+		const oldLive = createLiveRun(dummyExec());
+		const stale = waitForCancelled(oldLive);
+		let staleFired = false;
+		void stale.promise.then(() => {
+			staleFired = true;
+		});
+		stale.dispose();
+		const fresh = createLiveRun(dummyExec());
+		const freshWait = waitForCancelled(fresh);
+		await cancelLiveRun(fresh);
+		await freshWait.promise;
+		await Promise.resolve();
+		expect(staleFired).toBe(false);
+		await cancelLiveRun(oldLive);
+		expect(staleFired).toBe(false);
+	});
+
+	test("repeated cancel and dispose do not throw or leave waiters", async () => {
+		liveRunTestUtils.clear();
+		const live = createLiveRun(dummyExec());
+		setLiveRun("dup", live);
+		const wait = waitForCancelled(live);
+		await cancelLiveRun(live);
+		await cancelLiveRun(live);
+		await disposeLiveRun("dup", "gone", false);
+		await disposeLiveRun("dup", "gone", false);
+		await expect(wait.promise).resolves.toBeUndefined();
+		expect(activeWaiterCount(live)).toBe(0);
 	});
 });

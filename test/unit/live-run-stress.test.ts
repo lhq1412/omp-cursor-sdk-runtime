@@ -234,8 +234,8 @@ async function runRound(seed: number, template: Template, trace: string[] = []):
 		}
 		if (a.live.parked.length !== 0) boom("parked-residual");
 		if (b && b.live.parked.length !== 0) boom("parked-residual");
-		if (a.live.onPark || a.live.onCancel || a.live.abortSignal || a.live.abortHandler) boom("listener-residual");
-		if (b && (b.live.onPark || b.live.onCancel || b.live.abortSignal || b.live.abortHandler)) boom("listener-residual");
+		if (a.live.parkWaiters.size || a.live.cancelWaiters.size || a.live.resultWaiters.size || a.live.abortSignal || a.live.abortHandler) boom("listener-residual");
+		if (b && (b.live.parkWaiters.size || b.live.cancelWaiters.size || b.live.resultWaiters.size || b.live.abortSignal || b.live.abortHandler)) boom("listener-residual");
 		if (getLiveRun(KEY)) boom("map-residual");
 		return trace;
 	} finally {
