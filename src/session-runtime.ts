@@ -41,14 +41,18 @@ export interface RuntimeSlot {
 	store?: LocalAgentStore;
 	preparation?: AbortController;
 	/**
-	 * In-process consumption proof for a tool-fingerprint-only rebuild that failed before send.
+	 * In-process consumption proof kept from prepare through the first `agent.send()` entry.
+	 * Covers tool-fingerprint rebuilds (memory or journal) that fail or cancel before send.
 	 * Validated against cwd + credential on the next prepare; never authorizes agent reuse.
+	 * Cleared only when send actually starts, or when identity/session invalidation drops it.
 	 */
 	preSendConsumption?: {
 		sendState: SendState;
 		cwd: string;
 		credentialScopeId: string;
 	};
+	/** Set synchronously at the `agent.send()` entry; gates dirty vs keep-consumption on failure. */
+	sendStarted?: boolean;
 }
 
 
@@ -307,6 +311,20 @@ function clearPreSendConsumption(slot: RuntimeSlot): void {
 	slot.preSendConsumption = undefined;
 }
 
+/**
+ * Mark the turn as having crossed the real SDK send boundary.
+ * Clears pre-send consumption so post-send failure uses dirty recovery only.
+ * When a rebuild left a journal-committed consumption proof, persist in-flight for the new agent first.
+ */
+export function beginAgentSend(slot: RuntimeSlot): void {
+	if (slots.get(slot.key) !== slot) return;
+	if (slot.preSendConsumption && slot.agent) {
+		invalidateBindingBeforeSend(slot, slot.agent.agentId);
+	}
+	slot.sendStarted = true;
+	clearPreSendConsumption(slot);
+}
+
 export async function prepareTurn(input: OpenRuntimeTurnInput): Promise<PreparedTurn> {
 	input.signal?.throwIfAborted();
 	const scopeKey = getCursorSessionScopeKey();
@@ -351,6 +369,7 @@ export async function prepareTurn(input: OpenRuntimeTurnInput): Promise<Prepared
 		throw new Error("Cannot open a Cursor SDK agent without a model selection");
 	}
 
+	slot.sendStarted = false;
 	const identityMismatch = agentConfigMismatch(slot, cwd, nextCredential);
 	const toolMismatch = Boolean(slot.agent) && slot.toolContractFingerprint !== toolContract.fingerprint;
 	const unsafeBinding = Boolean(slot.agent) && (slot.bindingState !== "committed" || identityMismatch || toolMismatch);
@@ -438,6 +457,10 @@ export async function prepareTurn(input: OpenRuntimeTurnInput): Promise<Prepared
 				?? matchingPreSendConsumption(slot, cwd, nextCredential);
 			if (!resumeHandle && !identityMismatch && consumption) {
 				slot.sendState = consumption;
+				// Keep journal/memory consumption until agent.send starts (cancel during baseline must not wipe it).
+				if (consumption.bootstrapped) {
+					stashPreSendConsumption(slot, consumption, cwd, nextCredential);
+				}
 			} else {
 				slot.sendState = emptySendState();
 			}
@@ -514,7 +537,7 @@ export async function prepareTurn(input: OpenRuntimeTurnInput): Promise<Prepared
 		slot.cwd = cwd;
 		slot.credentialScopeId = nextCredential;
 		slot.toolContractFingerprint = toolContract.fingerprint;
-		clearPreSendConsumption(slot);
+		// Do not clear preSendConsumption here: baseline/checkpoint reads still run before agent.send.
 
 		return {
 			slot,
@@ -573,6 +596,8 @@ export function markTurnDirty(slot: RuntimeSlot): void {
 	slot.sendState = emptySendState();
 	slot.toolContractFingerprint = undefined;
 	slot.store = undefined;
+	clearPreSendConsumption(slot);
+	slot.sendStarted = false;
 }
 
 export async function finishLiveKeepAgent(slot: RuntimeSlot, reason: string): Promise<void> {
@@ -582,6 +607,22 @@ export async function finishLiveKeepAgent(slot: RuntimeSlot, reason: string): Pr
 
 export async function finishTurnFailed(slot: RuntimeSlot, reason: string): Promise<void> {
 	if (slots.get(slot.key) !== slot) return;
+	// Prepare succeeded but agent.send never started: release the new agent, keep identity-checked consumption.
+	if (!slot.sendStarted && slot.preSendConsumption) {
+		slot.preparation?.abort();
+		const proof = slot.preSendConsumption;
+		const agent = slot.agent;
+		slot.agent = undefined;
+		slot.bindingState = "dirty";
+		slot.createCwd = undefined;
+		slot.credentialScopeId = undefined;
+		slot.toolContractFingerprint = undefined;
+		slot.store = undefined;
+		slot.sendState = { ...proof.sendState };
+		await disposeLiveRun(slot.key, reason, false);
+		if (agent) await disposeAgent(agent);
+		return;
+	}
 	markTurnDirty(slot);
 	await disposeLiveRun(slot.key, reason, true);
 }
