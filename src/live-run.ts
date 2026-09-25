@@ -17,6 +17,21 @@ export interface ParkedToolCall {
 	reject: (error: Error) => void;
 }
 
+/** Disposable local wait; dispose() unregisters without resolving. */
+export interface LiveWaitHandle<T> {
+	promise: Promise<T>;
+	dispose(): void;
+}
+
+type ResultTerminal =
+	| { ok: true; value: RunResult }
+	| { ok: false; reason: unknown };
+
+interface ResultWaiter {
+	resolve: (value: RunResult) => void;
+	reject: (reason: unknown) => void;
+}
+
 export interface LiveRun {
 	agent?: SDKAgent;
 	run?: Run;
@@ -26,8 +41,11 @@ export interface LiveRun {
 	starting?: Promise<RunResult>;
 	requestLocator?: MessageLocator;
 	parked: ParkedToolCall[];
-	onPark?: () => void;
-	onCancel?: () => void;
+	parkWaiters: Set<() => void>;
+	cancelWaiters: Set<() => void>;
+	resultWaiters: Set<ResultWaiter>;
+	resultTerminal?: ResultTerminal;
+	resultObserved: boolean;
 	toolExec: SharedToolExec;
 	sink?: { stream: AssistantMessageEventStream; partial: AssistantMessage };
 	cancelled: boolean;
@@ -54,15 +72,53 @@ export function createLiveRun(toolExec: SharedToolExec): LiveRun {
 	return {
 		wait: new Promise<RunResult>(() => undefined),
 		parked: [],
+		parkWaiters: new Set(),
+		cancelWaiters: new Set(),
+		resultWaiters: new Set(),
+		resultObserved: false,
 		toolExec,
 		cancelled: false,
 		projection: { answerText: "" },
 	};
 }
 
+export function activeWaiterCount(live: LiveRun): number {
+	return live.cancelWaiters.size + live.resultWaiters.size + live.parkWaiters.size;
+}
+
+function wakeAll(waiters: Set<() => void>): void {
+	const pending = [...waiters];
+	waiters.clear();
+	for (const wake of pending) wake();
+}
+
+function settleResult(live: LiveRun, terminal: ResultTerminal): void {
+	if (live.resultTerminal) return;
+	live.resultTerminal = terminal;
+	const waiters = [...live.resultWaiters];
+	live.resultWaiters.clear();
+	for (const waiter of waiters) {
+		if (terminal.ok) waiter.resolve(terminal.value);
+		else waiter.reject(terminal.reason);
+	}
+}
+
+function ensureResultObservation(live: LiveRun): void {
+	if (live.resultObserved || live.resultTerminal) return;
+	live.resultObserved = true;
+	const source = live.starting ?? live.wait;
+	void Promise.resolve(source).then(
+		(value) => settleResult(live, { ok: true, value }),
+		(reason) => settleResult(live, { ok: false, reason }),
+	);
+}
+
 export function attachRun(live: LiveRun, run: Run): void {
 	live.run = run;
 	live.wait = run.wait();
+	if (!live.resultObserved && !live.starting) {
+		ensureResultObservation(live);
+	}
 }
 
 async function cancelAttachedRun(live: LiveRun): Promise<void> {
@@ -79,22 +135,73 @@ export function startSend(live: LiveRun, start: () => Promise<Run>): Promise<Run
 		if (live.cancelled) await cancelAttachedRun(live);
 		return live.wait;
 	});
+	ensureResultObservation(live);
 	return live.starting;
 }
 
-export function waitForResult(live: LiveRun): Promise<RunResult> {
-	return live.starting ?? live.wait;
+export function waitForResult(live: LiveRun): LiveWaitHandle<RunResult> {
+	if (live.resultTerminal) {
+		const terminal = live.resultTerminal;
+		return {
+			promise: terminal.ok ? Promise.resolve(terminal.value) : Promise.reject(terminal.reason),
+			dispose() {},
+		};
+	}
+	ensureResultObservation(live);
+	let settled = false;
+	let resolve!: (value: RunResult) => void;
+	let reject!: (reason: unknown) => void;
+	const promise = new Promise<RunResult>((res, rej) => {
+		resolve = res;
+		reject = rej;
+	});
+	const waiter: ResultWaiter = {
+		resolve(value) {
+			if (settled) return;
+			settled = true;
+			resolve(value);
+		},
+		reject(reason) {
+			if (settled) return;
+			settled = true;
+			reject(reason);
+		},
+	};
+	live.resultWaiters.add(waiter);
+	return {
+		promise,
+		dispose() {
+			if (settled) return;
+			settled = true;
+			live.resultWaiters.delete(waiter);
+		},
+	};
 }
 
-export function waitForCancelled(live: LiveRun): Promise<void> {
-	if (live.cancelled) return Promise.resolve();
-	return new Promise((resolve) => {
-		const previous = live.onCancel;
-		live.onCancel = () => {
-			previous?.();
-			resolve();
-		};
+export function waitForCancelled(live: LiveRun): LiveWaitHandle<void> {
+	if (live.cancelled) {
+		return { promise: Promise.resolve(), dispose() {} };
+	}
+	let settled = false;
+	let resolve!: () => void;
+	const promise = new Promise<void>((res) => {
+		resolve = res;
 	});
+	const wake = () => {
+		if (settled) return;
+		settled = true;
+		live.cancelWaiters.delete(wake);
+		resolve();
+	};
+	live.cancelWaiters.add(wake);
+	return {
+		promise,
+		dispose() {
+			if (settled) return;
+			settled = true;
+			live.cancelWaiters.delete(wake);
+		},
+	};
 }
 
 export function parkToolCall(
@@ -113,22 +220,38 @@ export function parkToolCall(
 			return;
 		}
 		run.parked.push({ name, args, sdkToolCallId, ompToolCallId, yielded: false, resolve, reject });
-		run.onPark?.();
+		wakeAll(run.parkWaiters);
 	});
 }
 
-export function waitForParked(run: LiveRun): Promise<void> {
-	if (run.cancelled || run.parked.length > 0) return Promise.resolve();
-	return new Promise((resolve) => {
-		run.onPark = () => {
-			run.onPark = undefined;
-			resolve();
-		};
+export function waitForParked(run: LiveRun): LiveWaitHandle<void> {
+	if (run.cancelled || run.parked.length > 0) {
+		return { promise: Promise.resolve(), dispose() {} };
+	}
+	let settled = false;
+	let resolve!: () => void;
+	const promise = new Promise<void>((res) => {
+		resolve = res;
 	});
+	const wake = () => {
+		if (settled) return;
+		settled = true;
+		run.parkWaiters.delete(wake);
+		resolve();
+	};
+	run.parkWaiters.add(wake);
+	return {
+		promise,
+		dispose() {
+			if (settled) return;
+			settled = true;
+			run.parkWaiters.delete(wake);
+		},
+	};
 }
 
 export function stopWaitingForPark(run: LiveRun): void {
-	run.onPark = undefined;
+	run.parkWaiters.clear();
 }
 
 export function unbindLiveAbort(live: LiveRun): void {
@@ -162,8 +285,7 @@ export async function cancelLiveRun(live: LiveRun): Promise<void> {
 	for (const call of live.parked.splice(0, live.parked.length)) {
 		call.reject(new Error("Cursor SDK live run was cancelled"));
 	}
-	live.onCancel?.();
-	live.onCancel = undefined;
+	wakeAll(live.cancelWaiters);
 	await cancelAttachedRun(live);
 }
 
@@ -225,8 +347,7 @@ export async function disposeLiveRun(key: string, reason: string, disposeAgentIn
 	for (const call of run.parked.splice(0, run.parked.length)) {
 		call.reject(new Error(reason));
 	}
-	run.onCancel?.();
-	run.onCancel = undefined;
+	wakeAll(run.cancelWaiters);
 	try {
 		if (run.run?.supports("cancel")) await run.run.cancel();
 	} catch {
@@ -246,4 +367,5 @@ export const __testUtils = {
 	clear() {
 		liveRuns.clear();
 	},
+	activeWaiterCount,
 };

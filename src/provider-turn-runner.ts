@@ -261,27 +261,37 @@ export class ProviderTurnRunner {
 		const { live } = prepared;
 		const { stream, partial } = this;
 		const parked = waitForParked(live);
-		const finished = waitForResult(live).then((result) => ({ kind: "finished" as const, result }));
-		const cancelled = waitForCancelled(live).then(() => ({ kind: "cancelled" as const }));
-		const first = await Promise.race([parked.then(() => ({ kind: "parked" as const })), finished, cancelled]);
-		if (first.kind === "cancelled" || live.cancelled) {
-			return { kind: "cancelled", beforeSend: false };
-		}
-		if (first.kind === "parked") {
-			const batch = await collectParkedBatch(live);
-			this.assertCurrent();
-			projectRunUsage(partial, live.projection, live.run?.usage);
-			for (const call of batch) {
-				applyToolCall(stream, partial, { id: call.sdkToolCallId, name: call.name, arguments: call.args }, live.projection);
+		const finished = waitForResult(live);
+		const cancelled = waitForCancelled(live);
+		try {
+			const first = await Promise.race([
+				parked.promise.then(() => ({ kind: "parked" as const })),
+				finished.promise.then((result) => ({ kind: "finished" as const, result })),
+				cancelled.promise.then(() => ({ kind: "cancelled" as const })),
+			]);
+			if (first.kind === "cancelled" || live.cancelled) {
+				return { kind: "cancelled", beforeSend: false };
 			}
-			live.projection.answerText = "";
-			partial.stopReason = "toolUse";
-			const delivered = deliverWithoutUnendedPreviews(partial, live.projection, new Set(batch.map((call) => call.ompToolCallId)));
-			stream.push({ type: "done", reason: "toolUse", message: delivered });
-			stream.end(delivered);
-			return { kind: "yielded" };
+			if (first.kind === "parked") {
+				const batch = await collectParkedBatch(live);
+				this.assertCurrent();
+				projectRunUsage(partial, live.projection, live.run?.usage);
+				for (const call of batch) {
+					applyToolCall(stream, partial, { id: call.sdkToolCallId, name: call.name, arguments: call.args }, live.projection);
+				}
+				live.projection.answerText = "";
+				partial.stopReason = "toolUse";
+				const delivered = deliverWithoutUnendedPreviews(partial, live.projection, new Set(batch.map((call) => call.ompToolCallId)));
+				stream.push({ type: "done", reason: "toolUse", message: delivered });
+				stream.end(delivered);
+				return { kind: "yielded" };
+			}
+			return { kind: "finished", result: first.result };
+		} finally {
+			parked.dispose();
+			finished.dispose();
+			cancelled.dispose();
 		}
-		return { kind: "finished", result: first.result };
 	}
 
 	private async finalizeTurn(prepared: PreparedProviderTurn, outcome: DriveOutcome): Promise<void> {
@@ -328,19 +338,24 @@ export class ProviderTurnRunner {
 		if (settledAgent && live.checkpointBaseline &&
 			(!live.run || live.run.agentId === settledAgent.agentId)) {
 			const occupancyStore = live.checkpointStore ?? openJsonlStore(preparedSlot.storeIdentity.stateRoot);
-			for (let attempt = 0; attempt < 10 && !live.cancelled; attempt++) {
-				occupancy = await Promise.race([
-					readSettledCheckpointOccupancy(
-						attempt === 0 ? occupancyStore : openJsonlStore(preparedSlot.storeIdentity.stateRoot),
-						settledAgent.agentId,
-						live.checkpointBaseline.rootBlobId,
-					),
-					waitForCancelled(live).then(() => undefined),
-				]);
-				if (occupancy || live.cancelled) break;
-				const delay = Promise.withResolvers<void>();
-				setTimeout(delay.resolve, 25);
-				await Promise.race([delay.promise, waitForCancelled(live)]);
+			const cancelled = waitForCancelled(live);
+			try {
+				for (let attempt = 0; attempt < 10 && !live.cancelled; attempt++) {
+					occupancy = await Promise.race([
+						readSettledCheckpointOccupancy(
+							attempt === 0 ? occupancyStore : openJsonlStore(preparedSlot.storeIdentity.stateRoot),
+							settledAgent.agentId,
+							live.checkpointBaseline.rootBlobId,
+						),
+						cancelled.promise.then(() => undefined),
+					]);
+					if (occupancy || live.cancelled) break;
+					const delay = Promise.withResolvers<void>();
+					setTimeout(delay.resolve, 25);
+					await Promise.race([delay.promise, cancelled.promise]);
+				}
+			} finally {
+				cancelled.dispose();
 			}
 			this.assertCurrent();
 		}
