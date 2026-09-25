@@ -329,6 +329,32 @@ describe("send policy", () => {
 		expect(incremental.prompt.text).not.toContain(SDK_TOOL_CONTEXT);
 	});
 
+	test("counts formal tool-definition reserve separately from guidance text", () => {
+		const guidance = "short guidance";
+		const first = context(firstUser, ["sys"]);
+		const hugeReserve = modelLimits.contextWindow;
+		expect(() => prepareSendInput(
+			planSend(emptySendState(), first),
+			first,
+			modelLimits,
+			undefined,
+			guidance,
+			hugeReserve,
+		)).toThrow(/exceed the model input budget/);
+		const ok = prepareSendInput(planSend(emptySendState(), first), first, modelLimits, undefined, guidance, 1);
+		expect(ok.prompt.text).toContain(guidance);
+	});
+
+	test("incremental sends also apply the formal tool-definition reserve", () => {
+		const tight: ModelInputLimits = { contextWindow: 8_192, maxTokens: 1_024 };
+		// inputTextBudget = 8192 - min(1024, 8192) - 0 - 1024 = 6144
+		const text = "x".repeat(6000 * 4 - 3); // estimatedTextTokens ≈ 6000
+		const continued = context([{ role: "user", content: text, timestamp: 1 } as Context["messages"][number]]);
+		const plan = { mode: "incremental" as const, resetAgent: false, reason: "incremental" as const };
+		expect(prepareSendInput(plan, continued, tight, undefined, "", 0).prompt.text).toBe(text);
+		expect(() => prepareSendInput(plan, continued, tight, undefined, "", 512)).toThrow(/exceed the model input budget/);
+	});
+
 	test("preserves the joined OMP prompt and only trims outer whitespace", () => {
 		const structured = [
 			"<system-conventions>",

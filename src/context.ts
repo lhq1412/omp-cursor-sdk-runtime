@@ -489,10 +489,12 @@ export function prepareSendInput(
 	limits: ModelInputLimits,
 	targetModelId?: string,
 	toolGuidance = "",
+	formalToolDefinitionReserveTokens = 0,
 ): PreparedSendInput {
 	const current = activeUserInput(context, plan.continueOnly);
+	const definitionReserve = Math.max(0, formalToolDefinitionReserveTokens);
 	if (plan.mode === "incremental") {
-		if (estimatedTextTokens(current.text) > inputTextBudget(current, limits)) throwContextOverflow();
+		if (estimatedTextTokens(current.text) + definitionReserve > inputTextBudget(current, limits)) throwContextOverflow();
 		return { prompt: current };
 	}
 	const recoveryStart = validateToolResultRecovery(context);
@@ -517,12 +519,12 @@ export function prepareSendInput(
 	const toolContext = prior.length > 0 ? `${SDK_TOOL_CONTEXT}\n\n` : "";
 	const budget = inputTextBudget(current, limits);
 	const requiredText = system + tools + toolContext + current.text;
-	if (estimatedTextTokens(requiredText) > budget) {
+	if (estimatedTextTokens(requiredText) + definitionReserve > budget) {
 		if (recoveryStart !== undefined) throw new CursorRecoveryBudgetError();
 		throwContextOverflow();
 	}
 	const text = requiredText;
-	if (estimatedTextTokens(text) + estimatedHistoryTokens(prior, targetModelId) > budget) {
+	if (estimatedTextTokens(text) + estimatedHistoryTokens(prior, targetModelId) + definitionReserve > budget) {
 		if (recoveryStart !== undefined) throw new CursorRecoveryBudgetError();
 		throw new CursorBootstrapBudgetError();
 	}

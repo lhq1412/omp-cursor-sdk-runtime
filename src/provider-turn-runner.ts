@@ -19,7 +19,7 @@ import {
 	bindLiveAbort,
 	getLiveRun,
 } from "./live-run.js";
-import { commitTurn, disposeRuntimeForScope, finishLiveKeepAgent, finishTurnFailed, getRuntimeSlot, prepareTurn, runtimeKey, warmLocalExecutor, type PreparedTurn, type RuntimeSlot } from "./session-runtime.js";
+import { beginAgentSend, commitTurn, disposeRuntimeForScope, finishLiveKeepAgent, finishTurnFailed, getRuntimeSlot, prepareTurn, runtimeKey, warmLocalExecutor, type PreparedTurn, type RuntimeSlot } from "./session-runtime.js";
 import { captureCursorRequestOwner, getCursorSessionCwd, ownerForRequest, withCursorSessionOwner, type CursorSessionOwner } from "./session-scope.js";
 import { withSdkExitSuppressed } from "./sdk-exit-guard.js";
 import { ensureCursorModels, getModelMetadata, buildModelSelection } from "./catalog.js";
@@ -241,6 +241,8 @@ export class ProviderTurnRunner {
 			}
 			this.assertCurrent();
 		}
+		// Consumption evidence ends at the real send entry — not at prepareTurn success.
+		beginAgentSend(prepared.slot);
 		const starting = startSend(live, () =>
 			withSdkExitSuppressed(() =>
 				agent.send(userPrompt, {
