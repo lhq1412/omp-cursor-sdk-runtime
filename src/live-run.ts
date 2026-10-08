@@ -42,6 +42,8 @@ export interface LiveRun {
 	requestLocator?: MessageLocator;
 	/** Model-visible digest of the assistant that parked these calls. */
 	deliveredAssistantDigest?: string;
+	/** Timestamp of that delivery. Content rewrites keep it; older batches do not. */
+	deliveredAssistantTimestamp?: number;
 	parked: ParkedToolCall[];
 	parkWaiters: Set<() => void>;
 	cancelWaiters: Set<() => void>;

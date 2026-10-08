@@ -330,6 +330,13 @@ export function rewrittenToolResultsPair(context: Context): boolean {
 	return seen.size === calls.size;
 }
 
+/** The trailing assistant is the parked delivery, not an older batch that shares the user request. */
+export function sameDeliveredAssistantBatch(timestamp: number | undefined, context: Context): boolean {
+	if (typeof timestamp !== "number") return false;
+	const message = assistantBeforeToolBatch(context);
+	return Boolean(message && message.role === "assistant" && message.timestamp === timestamp);
+}
+
 function suffixRequiresBootstrap(messages: Context["messages"], fromIndex: number): boolean {
 	let extraTurns = 0;
 	for (let index = fromIndex; index < messages.length; index += 1) {

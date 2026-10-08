@@ -1562,6 +1562,7 @@ describe("streamCursorRuntime model selection", () => {
 		{ label: "renamed", callId: "call-1", callName: "inspect", resultId: "call-1", resultName: "inspect", outcome: "rebuild" },
 		{ label: "reidentified", callId: "call-rewritten", callName: "read", resultId: "call-rewritten", resultName: "read", outcome: "rebuild" },
 		{ label: "unpaired", callId: "call-rewritten", callName: "inspect", resultId: "stale-call", resultName: "inspect", outcome: "reject" },
+		{ label: "old-matched", callId: "call-1", callName: "inspect", resultId: "call-1", resultName: "read", outcome: "reject" },
 	] as const)("a $label parked tool call follows the delivered assistant", async ({ callId, callName, resultId, resultName, outcome }) => {
 		const tools = [readTool(), { name: "inspect", description: "inspect", parameters: { type: "object", properties: { path: { type: "string" } } } } as Tool];
 		const opened: Array<string | undefined> = [];
@@ -1632,6 +1633,64 @@ describe("streamCursorRuntime model selection", () => {
 				error: { errorMessage: expect.stringMatching(/do not match the current parked/) },
 			});
 		}
+	});
+
+	test("replaying an already consumed tool batch does not rebuild over the current parked call", async () => {
+		const opened: Array<string | undefined> = [];
+		runtimeTestUtils.setOpenAgent(async (input) => {
+			opened.push(input.savedAgentId);
+			return {
+				agentId: "agent-1",
+				close() {},
+				async [Symbol.asyncDispose]() {},
+				async send(_message, options) {
+					const tool = options?.local?.customTools?.read;
+					if (!tool) throw new Error("read tool not exposed");
+					const pendingA = tool.execute({ path: "a.ts" }, { toolCallId: "call-A" });
+					return {
+						supports: () => false,
+						wait: async () => {
+							await pendingA;
+							const pendingB = tool.execute({ path: "b.ts" }, { toolCallId: "call-B" });
+							await pendingB;
+							return { status: "finished", result: "done" } as RunResult;
+						},
+					} as unknown as Run;
+				},
+			} as SDKAgent;
+		});
+		const first = await drain(cursorModel("composer-2.5", 200_000), userContext("hi", [readTool()]), {
+			apiKey: "test-key", cwd: "/tmp/project",
+		});
+		const assistantA = first.at(-1);
+		expect(assistantA).toMatchObject({ type: "done", reason: "toolUse" });
+		if (assistantA?.type !== "done") throw new Error("expected assistant A");
+		const consumed = {
+			messages: [
+				{ role: "user", content: "hi", timestamp: 1 },
+				assistantA.message,
+				{
+					role: "toolResult",
+					toolCallId: "call-A",
+					toolName: "read",
+					content: [{ type: "text", text: "a" }],
+					isError: false,
+					timestamp: 2,
+				},
+			],
+			tools: [readTool()],
+		} as Context;
+		const second = await drain(cursorModel("composer-2.5", 200_000), consumed, { apiKey: "test-key", cwd: "/tmp/project" });
+		const assistantB = second.at(-1);
+		expect(assistantB).toMatchObject({ type: "done", reason: "toolUse" });
+		if (assistantB?.type !== "done") throw new Error("expected assistant B");
+		expect(assistantB.message.timestamp).not.toBe(assistantA.message.timestamp);
+		const replay = await drain(cursorModel("composer-2.5", 200_000), consumed, { apiKey: "test-key", cwd: "/tmp/project" });
+		expect(opened).toEqual([undefined]);
+		expect(replay.at(-1)).toMatchObject({
+			type: "error",
+			error: { errorMessage: expect.stringMatching(/do not match the current parked/) },
+		});
 	});
 
 	test.each([

@@ -4,7 +4,7 @@ import type { Context } from "@oh-my-pi/pi-ai";
 import { credentialScopeId } from "./auth.js";
 import { DEFAULT_AGENT_INSTANCE_ID } from "./constants.js";
 import type { BindingState, GrantedTool, OmpHostBridgeV1 } from "./contracts.js";
-import { computeContextFingerprint, deliveredAssistantDigest, emptySendState, locatorFor, locatorsMatch, parkedAssistantRewritten, planSend, prepareSendInput, rewrittenToolResultsPair, type MessageLocator, type ModelInputLimits, type SendState } from "./context.js";
+import { computeContextFingerprint, deliveredAssistantDigest, emptySendState, locatorFor, locatorsMatch, parkedAssistantRewritten, planSend, prepareSendInput, rewrittenToolResultsPair, sameDeliveredAssistantBatch, type MessageLocator, type ModelInputLimits, type SendState } from "./context.js";
 import { createSharedToolExec, type SharedToolExec } from "./host-exec.js";
 import {
 	createLiveRun,
@@ -372,9 +372,13 @@ export async function prepareTurn(input: OpenRuntimeTurnInput): Promise<Prepared
 		existingLive?.requestLocator
 		&& findUniqueMessageIndex(input.context.messages, existingLive.requestLocator) !== undefined,
 	);
-	// Name or id rewrites miss the parked call, but a paired transcript of this request is reimported.
-	const rewrittenRebuild = assistantRewritten && ownsContinuation && rewrittenToolResultsPair(input.context);
-	if (existingLive && trailing.length > 0 && !parkedMatch && !rewrittenRebuild) {
+	// A rewrite of this delivery may change the call id or name. Pairing and the delivered
+	// timestamp still have to match; an older batch that only shares the user request does not.
+	const rewrittenRebuild = assistantRewritten
+		&& ownsContinuation
+		&& rewrittenToolResultsPair(input.context)
+		&& sameDeliveredAssistantBatch(existingLive?.deliveredAssistantTimestamp, input.context);
+	if (existingLive && trailing.length > 0 && !rewrittenRebuild && (!parkedMatch || assistantRewritten)) {
 		if (existingLive.parked.length > 0 && ownsContinuation) {
 			await finishTurnFailed(slot, "mismatched parked tool results");
 		}
@@ -630,7 +634,13 @@ export function recordDeliveredAssistant(slot: RuntimeSlot, message: unknown): v
 	const digest = deliveredAssistantDigest(message);
 	if (!digest) return;
 	const live = getLiveRun(slot.key);
-	if (live && !live.cancelled) live.deliveredAssistantDigest = digest;
+	if (live && !live.cancelled) {
+		live.deliveredAssistantDigest = digest;
+		const timestamp = message !== null && typeof message === "object" && "timestamp" in message
+			? message.timestamp
+			: undefined;
+		live.deliveredAssistantTimestamp = typeof timestamp === "number" ? timestamp : undefined;
+	}
 	if (slot.bindingState !== "committed") return;
 	slot.sendState = { ...slot.sendState, deliveredAssistantDigest: digest };
 	const pending = resumePending(slot, "committed");
