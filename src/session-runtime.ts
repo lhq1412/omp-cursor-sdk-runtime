@@ -4,7 +4,7 @@ import type { Context } from "@oh-my-pi/pi-ai";
 import { credentialScopeId } from "./auth.js";
 import { DEFAULT_AGENT_INSTANCE_ID } from "./constants.js";
 import type { BindingState, GrantedTool, OmpHostBridgeV1 } from "./contracts.js";
-import { computeContextFingerprint, deliveredAssistantDigest, emptySendState, locatorFor, locatorsMatch, parkedAssistantRewritten, planSend, prepareSendInput, type MessageLocator, type ModelInputLimits, type SendState } from "./context.js";
+import { computeContextFingerprint, deliveredAssistantDigest, emptySendState, locatorFor, locatorsMatch, parkedAssistantRewritten, planSend, prepareSendInput, rewrittenToolResultsPair, type MessageLocator, type ModelInputLimits, type SendState } from "./context.js";
 import { createSharedToolExec, type SharedToolExec } from "./host-exec.js";
 import {
 	createLiveRun,
@@ -368,10 +368,13 @@ export async function prepareTurn(input: OpenRuntimeTurnInput): Promise<Prepared
 	);
 	const continuing = parkedMatch && passive.length === 0;
 	const assistantRewritten = parkedAssistantRewritten(existingLive?.deliveredAssistantDigest, input.context);
-	if (existingLive && trailing.length > 0 && !parkedMatch) {
-		const ownsContinuation = existingLive.requestLocator
-			? findUniqueMessageIndex(input.context.messages, existingLive.requestLocator) !== undefined
-			: false;
+	const ownsContinuation = Boolean(
+		existingLive?.requestLocator
+		&& findUniqueMessageIndex(input.context.messages, existingLive.requestLocator) !== undefined,
+	);
+	// Name or id rewrites miss the parked call, but a paired transcript of this request is reimported.
+	const rewrittenRebuild = assistantRewritten && ownsContinuation && rewrittenToolResultsPair(input.context);
+	if (existingLive && trailing.length > 0 && !parkedMatch && !rewrittenRebuild) {
 		if (existingLive.parked.length > 0 && ownsContinuation) {
 			await finishTurnFailed(slot, "mismatched parked tool results");
 		}

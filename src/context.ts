@@ -289,15 +289,45 @@ function suffixAssistantRewritten(digest: string | undefined, messages: Context[
 	return false;
 }
 
+function assistantBeforeToolBatch(context: Context): Context["messages"][number] | undefined {
+	const exchange = trailingToolExchange(context);
+	if (exchange.results.length === 0) return undefined;
+	return context.messages[context.messages.length - exchange.results.length - exchange.passive.length - 1];
+}
+
 /** Parked continuation rebuilds only when the assistant that issued the calls was rewritten. */
 export function parkedAssistantRewritten(digest: string | undefined, context: Context): boolean {
 	if (!digest) return false;
-	const exchange = trailingToolExchange(context);
-	if (exchange.results.length === 0) return false;
-	const message = context.messages[context.messages.length - exchange.results.length - exchange.passive.length - 1];
+	const message = assistantBeforeToolBatch(context);
 	if (!message || message.role !== "assistant") return false;
 	if (message.provider !== CURSOR_SDK_PROVIDER_ID || message.api !== CURSOR_SDK_API) return false;
 	return deliveredAssistantDigest(message) !== digest;
+}
+
+/**
+ * The tool-result batch is a complete pairing of the assistant call ids and names.
+ * A digest mismatch does not authorize results that do not belong to that assistant.
+ */
+export function rewrittenToolResultsPair(context: Context): boolean {
+	const exchange = trailingToolExchange(context);
+	const message = assistantBeforeToolBatch(context);
+	if (!message || message.role !== "assistant" || !Array.isArray(message.content)) return false;
+	if (message.provider !== CURSOR_SDK_PROVIDER_ID || message.api !== CURSOR_SDK_API) return false;
+	const calls = new Map<string, string>();
+	for (const block of message.content) {
+		if (!isRecord(block) || block.type !== "toolCall") continue;
+		if (typeof block.id !== "string" || block.id.length === 0) return false;
+		if (typeof block.name !== "string" || block.name.length === 0) return false;
+		if (calls.has(block.id)) return false;
+		calls.set(block.id, block.name);
+	}
+	if (calls.size === 0 || calls.size !== exchange.results.length) return false;
+	const seen = new Set<string>();
+	for (const result of exchange.results) {
+		if (seen.has(result.toolCallId) || calls.get(result.toolCallId) !== result.toolName) return false;
+		seen.add(result.toolCallId);
+	}
+	return seen.size === calls.size;
 }
 
 function suffixRequiresBootstrap(messages: Context["messages"], fromIndex: number): boolean {
