@@ -40,6 +40,8 @@ export interface LiveRun {
 	wait: Promise<RunResult>;
 	starting?: Promise<RunResult>;
 	requestLocator?: MessageLocator;
+	/** Model-visible digest of the assistant that parked these calls. */
+	deliveredAssistantDigest?: string;
 	parked: ParkedToolCall[];
 	parkWaiters: Set<() => void>;
 	cancelWaiters: Set<() => void>;

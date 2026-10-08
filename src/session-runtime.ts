@@ -4,7 +4,7 @@ import type { Context } from "@oh-my-pi/pi-ai";
 import { credentialScopeId } from "./auth.js";
 import { DEFAULT_AGENT_INSTANCE_ID } from "./constants.js";
 import type { BindingState, GrantedTool, OmpHostBridgeV1 } from "./contracts.js";
-import { computeContextFingerprint, emptySendState, locatorFor, locatorsMatch, planSend, prepareSendInput, type MessageLocator, type ModelInputLimits, type SendState } from "./context.js";
+import { computeContextFingerprint, deliveredAssistantDigest, emptySendState, locatorFor, locatorsMatch, parkedAssistantRewritten, planSend, prepareSendInput, type MessageLocator, type ModelInputLimits, type SendState } from "./context.js";
 import { createSharedToolExec, type SharedToolExec } from "./host-exec.js";
 import {
 	createLiveRun,
@@ -367,6 +367,7 @@ export async function prepareTurn(input: OpenRuntimeTurnInput): Promise<Prepared
 		&& trailing.every((result) => parkedByOmpId?.get(result.toolCallId)?.name === result.toolName),
 	);
 	const continuing = parkedMatch && passive.length === 0;
+	const assistantRewritten = parkedAssistantRewritten(existingLive?.deliveredAssistantDigest, input.context);
 	if (existingLive && trailing.length > 0 && !parkedMatch) {
 		const ownsContinuation = existingLive.requestLocator
 			? findUniqueMessageIndex(input.context.messages, existingLive.requestLocator) !== undefined
@@ -377,7 +378,7 @@ export async function prepareTurn(input: OpenRuntimeTurnInput): Promise<Prepared
 		throw new Error("OMP tool results do not match the current parked Cursor SDK calls");
 	}
 
-	if (existingLive && continuing) {
+	if (existingLive && continuing && !assistantRewritten) {
 		if (slotIdentityMismatch(slot, cwd, nextCredential) || slot.toolContractFingerprint !== toolContract.fingerprint) {
 			await finishTurnFailed(slot, "tool contract or identity changed during parked tool calls");
 			throw new Error(
@@ -432,6 +433,9 @@ export async function prepareTurn(input: OpenRuntimeTurnInput): Promise<Prepared
 			reason: "context_divergence",
 			...(plan.continueOnly ? { continueOnly: true as const } : {}),
 		};
+	}
+	if (assistantRewritten && passive.length === 0) {
+		plan = { mode: "bootstrap", resetAgent: true, reason: "context_divergence" };
 	}
 	const { prompt, history } = prepareSendInput(
 		plan,
@@ -613,6 +617,19 @@ export function commitTurn(slot: RuntimeSlot, context: Context, incremental: boo
 	};
 	slot.bindingState = "committed";
 	clearPreSendConsumption(slot);
+	const pending = resumePending(slot, "committed");
+	if (pending) withCursorSessionOwner(slot.owner, () => persistResumeHandle(pending));
+}
+
+/** Record the assistant actually delivered, after commitTurn has snapshotted the inbound context. */
+export function recordDeliveredAssistant(slot: RuntimeSlot, message: unknown): void {
+	if (slots.get(slot.key) !== slot || slot.preparation?.signal.aborted) return;
+	const digest = deliveredAssistantDigest(message);
+	if (!digest) return;
+	const live = getLiveRun(slot.key);
+	if (live && !live.cancelled) live.deliveredAssistantDigest = digest;
+	if (slot.bindingState !== "committed") return;
+	slot.sendState = { ...slot.sendState, deliveredAssistantDigest: digest };
 	const pending = resumePending(slot, "committed");
 	if (pending) withCursorSessionOwner(slot.owner, () => persistResumeHandle(pending));
 }

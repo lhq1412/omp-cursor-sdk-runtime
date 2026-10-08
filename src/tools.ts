@@ -79,14 +79,9 @@ export function buildToolContract(grantedTools: readonly GrantedTool[]): ToolCon
 	}
 	const serializedDefinitions = stableJson(definitions);
 	const guidance = [
-		"OMP custom tool contract: call only tools granted below through the custom-user-tools namespace.",
+		"OMP custom tool contract: call only the custom tools exposed on the current Run through the custom-user-tools namespace.",
 		"Policy: OMP validates, approves, executes, and records every call. Native Cursor tools are unavailable. Pass arguments exactly as defined by the OMP schema; do not translate them to Cursor-native tool arguments.",
-		"Granted SDK tool names:",
-		...definitions.map((tool) => (
-			tool.sdkName === tool.ompName
-				? `- ${tool.sdkName}`
-				: `- ${tool.sdkName} (OMP name: ${tool.ompName})`
-		)),
+		"The custom tools exposed on the current Run are the grant. A tool list from an earlier turn is not current authorization.",
 	].join("\n");
 	return {
 		definitions,

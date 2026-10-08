@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { SDK_TOOL_CONTEXT } from "../../src/constants.ts";
-import { activeUserInput, activeUserText, computeContextFingerprint, emptySendState, planSend, prepareSendInput, registerLegacyCursorToolCallIdMigration, type ModelInputLimits } from "../../src/context.ts";
+import { activeUserInput, activeUserText, computeContextFingerprint, deliveredAssistantDigest, emptySendState, planSend, prepareSendInput, registerLegacyCursorToolCallIdMigration, type ModelInputLimits } from "../../src/context.ts";
 import { CursorBootstrapBudgetError, CursorRecoveryBudgetError } from "../../src/errors.ts";
 import type { ModelSelection } from "@cursor/sdk";
 import type { Context } from "@oh-my-pi/pi-ai";
@@ -503,6 +503,29 @@ describe("send policy", () => {
 		expect(ordinary.prompt.images).toBeUndefined();
 	});
 
+	test("tool results followed by developer context keep the continuation and attach result images", () => {
+		const shot = { type: "image" as const, data: "screen-payload", mimeType: "image/png" };
+		const ctx = context([
+			{ role: "user", content: "Capture the screen", timestamp: 1 },
+			{ role: "assistant", content: [{ type: "toolCall", id: "shot-1", name: "screenshot", arguments: {} }], timestamp: 2 },
+			{ role: "toolResult", toolCallId: "shot-1", toolName: "screenshot", content: [{ type: "text", text: "Captured screen" }, shot], isError: false, timestamp: 3 },
+			{ role: "developer", content: [{ type: "text", text: "additional context from the tool" }], timestamp: 4 },
+		] as Context["messages"]);
+		const plan = { mode: "bootstrap" as const, resetAgent: true, continueOnly: true as const, reason: "context_divergence" as const };
+		const prepared = prepareSendInput(plan, ctx, { contextWindow: 50_000, maxTokens: 500 });
+		expect(prepared.history).toEqual(ctx.messages);
+		expect(prepared.prompt.images).toEqual([{ data: "screen-payload", mimeType: "image/png" }]);
+		expect(prepared.prompt.text).toContain("Continue the conversation from where it left off.");
+		expect(prepared.prompt.text).not.toContain("Continue the initiating request");
+		expect(prepared.prompt.text).not.toContain("additional context from the tool");
+		expect(prepared.prompt.text).not.toContain("Captured screen");
+		const unmatched = structuredClone(ctx);
+		const result = unmatched.messages[2];
+		if (result?.role !== "toolResult") throw new Error("expected tool result");
+		result.toolCallId = "other";
+		expect(() => prepareSendInput(plan, unmatched, modelLimits)).toThrow(/unmatched|duplicate/i);
+	});
+
 	test.each([
 		[{ type: "audio", data: "unsupported" }],
 		[{ type: "image", mimeType: "image/png" }],
@@ -654,6 +677,48 @@ describe("send policy", () => {
 		const limits = { contextWindow: 6000, maxTokens: 500 };
 		expect(bootstrap(history(png), limits).history).toHaveLength(1);
 		expect(() => bootstrap(history("x".repeat(png.length)), limits)).toThrow(CursorBootstrapBudgetError);
+	});
+
+	test("a delivered assistant rewrite bootstraps on the next user turn", () => {
+		const user = { role: "user", content: "hi", timestamp: 1 } as Context["messages"][number];
+		const assistant = {
+			role: "assistant" as const,
+			content: [
+				{ type: "thinking" as const, thinking: "look" },
+				{ type: "text" as const, text: "Answer A" },
+				{ type: "toolCall" as const, id: "call-1", name: "read", arguments: { path: "a.ts" } },
+			],
+			api: "cursor-sdk-agent",
+			provider: "cursor-sdk",
+			model: "composer-2.5",
+			usage: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0, totalTokens: 3, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+			stopReason: "stop" as const,
+			timestamp: 9,
+		};
+		const digest = deliveredAssistantDigest(assistant);
+		const sendState = {
+			bootstrapped: true,
+			contextFingerprint: computeContextFingerprint(context([user])),
+			incrementalSendCount: 0,
+			deliveredAssistantDigest: digest,
+		};
+		const rewritten = structuredClone(assistant);
+		rewritten.content = [
+			rewritten.content[0]!,
+			{ type: "text", text: "Answer B" },
+			rewritten.content[2]!,
+		];
+		const nextRewrite = context([user, rewritten, { role: "user", content: "next", timestamp: 4 }]);
+		expect(planSend(sendState, nextRewrite)).toMatchObject({ mode: "bootstrap", resetAgent: true, reason: "context_divergence" });
+		const same = structuredClone(assistant);
+		same.timestamp = 99;
+		same.usage = { ...same.usage, output: 99 };
+		same.stopReason = "toolUse";
+		expect(planSend(sendState, context([user, same, { role: "user", content: "next", timestamp: 4 }]))).toMatchObject({
+			mode: "incremental", resetAgent: false,
+		});
+		const { deliveredAssistantDigest: _ignored, ...withoutDigest } = sendState;
+		expect(planSend(withoutDigest, nextRewrite)).toMatchObject({ mode: "incremental", resetAgent: false });
 	});
 
 	test("an assistant text rewrite bootstraps so native history cannot diverge", () => {

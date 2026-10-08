@@ -105,6 +105,27 @@ describe("session resume fold", () => {
 		expect(sessionFileContainsResume(sessionFile, data)).toBe(false);
 	});
 
+	test("keeps an optional delivered assistant digest and still parses journals without one", () => {
+		const data = validData({
+			version: 5,
+			persistenceId: "write-1",
+			toolContractFingerprint: "tools-fp",
+			sendState: {
+				bootstrapped: true,
+				contextFingerprint: "fp",
+				incrementalSendCount: 2,
+				deliveredAssistantDigest: "digest-a",
+			},
+		});
+		expect(parseResumeEntryData(data)?.sendState.deliveredAssistantDigest).toBe("digest-a");
+		const legacy = validData({ version: 5, persistenceId: "write-1", toolContractFingerprint: "tools-fp" });
+		expect(parseResumeEntryData(legacy)?.sendState.deliveredAssistantDigest).toBeUndefined();
+		expect(parseResumeEntryData({
+			...data,
+			sendState: { ...data.sendState, deliveredAssistantDigest: "" },
+		})?.sendState.deliveredAssistantDigest).toBeUndefined();
+	});
+
 	test("parses v5 toolContractFingerprint and rejects incomplete v5", () => {
 		const data = validData({ version: 5, persistenceId: "write-1", toolContractFingerprint: "tools-fp" });
 		expect(parseResumeEntryData(data)?.toolContractFingerprint).toBe("tools-fp");

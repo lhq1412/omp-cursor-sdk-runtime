@@ -19,7 +19,7 @@ import {
 	bindLiveAbort,
 	getLiveRun,
 } from "./live-run.js";
-import { beginAgentSend, commitTurn, disposeRuntimeForScope, finishLiveKeepAgent, finishTurnFailed, getRuntimeSlot, prepareTurn, runtimeKey, warmLocalExecutor, type PreparedTurn, type RuntimeSlot } from "./session-runtime.js";
+import { beginAgentSend, commitTurn, disposeRuntimeForScope, finishLiveKeepAgent, finishTurnFailed, getRuntimeSlot, prepareTurn, recordDeliveredAssistant, runtimeKey, warmLocalExecutor, type PreparedTurn, type RuntimeSlot } from "./session-runtime.js";
 import { captureCursorRequestOwner, getCursorSessionCwd, ownerForRequest, withCursorSessionOwner, type CursorSessionOwner } from "./session-scope.js";
 import { isSideChannelRequest } from "./side-request.js";
 import { withSdkExitSuppressed } from "./sdk-exit-guard.js";
@@ -180,7 +180,11 @@ export class ProviderTurnRunner {
 		stream.push({ type: "start", partial });
 
 		let modelSelection: ModelSelection | undefined;
-		if (trailingToolResults(this.context).length === 0 || !getLiveRun(runtimeKey(undefined, agentInstanceId))) {
+		// A live tool-result turn may resume the parked run without discovery. A rewritten
+		// assistant falls through and still needs a selection, so resolve one from the warm catalog.
+		const mayContinueParked = trailingToolResults(this.context).length > 0
+			&& Boolean(getLiveRun(runtimeKey(undefined, agentInstanceId)));
+		if (!mayContinueParked) {
 			const discovery = ensureCursorModels(this.apiKey);
 			if (this.abortSignal) {
 				const signal = this.abortSignal;
@@ -199,8 +203,8 @@ export class ProviderTurnRunner {
 				await discovery;
 			}
 			this.assertCurrent();
-			modelSelection = selectionForTurn(model, this.apiKey, options);
 		}
+		modelSelection = selectionForTurn(model, this.apiKey, options);
 		this.assertCurrent();
 		const turnHost = this.auxiliary ? undefined : host;
 		const prepared = await prepareTurn({
@@ -294,6 +298,7 @@ export class ProviderTurnRunner {
 				live.projection.answerText = "";
 				partial.stopReason = "toolUse";
 				const delivered = deliverWithoutUnendedPreviews(partial, live.projection, new Set(batch.map((call) => call.ompToolCallId)));
+				recordDeliveredAssistant(prepared.slot, delivered);
 				stream.push({ type: "done", reason: "toolUse", message: delivered });
 				stream.end(delivered);
 				return { kind: "yielded" };
@@ -397,6 +402,7 @@ export class ProviderTurnRunner {
 			projectRunSummary(partial, live.projection);
 		}
 		const delivered = deliverWithoutUnendedPreviews(partial, live.projection, new Set());
+		recordDeliveredAssistant(preparedSlot, delivered);
 		stream.push({ type: "done", reason: "stop", message: delivered });
 		stream.end(delivered);
 		await finishLiveKeepAgent(preparedSlot, "run finished");
