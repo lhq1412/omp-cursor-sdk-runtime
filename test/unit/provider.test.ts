@@ -1310,6 +1310,389 @@ describe("streamCursorRuntime model selection", () => {
 		});
 	});
 
+	test("a screenshot followed by developer context is not resumed and the image is resent", async () => {
+		const opened: Array<string | undefined> = [];
+		const histories: Array<Context["messages"] | undefined> = [];
+		const sent: Array<{ text?: string; images?: Array<{ data: string; mimeType: string }> }> = [];
+		let toolExecutions = 0;
+		let oldCallbackResolved = false;
+		runtimeTestUtils.setOpenAgent(async (input) => {
+			opened.push(input.savedAgentId);
+			histories.push(input.bootstrapHistory);
+			const agentId = `agent-${opened.length}`;
+			return {
+				agentId,
+				close() {},
+				async [Symbol.asyncDispose]() {},
+				async send(message, options) {
+					sent.push(message as { text?: string; images?: Array<{ data: string; mimeType: string }> });
+					if (agentId !== "agent-1") {
+						return { supports: () => false, wait: async () => ({ status: "finished", result: "continued" }) } as unknown as Run;
+					}
+					const tool = options?.local?.customTools?.screenshot;
+					if (!tool) throw new Error("screenshot tool not exposed");
+					toolExecutions += 1;
+					const pending = tool.execute({}, { toolCallId: "shot-1" });
+					return {
+						supports: () => false,
+						wait: async () => {
+							await pending;
+							oldCallbackResolved = true;
+							return { status: "finished" } as RunResult;
+						},
+					} as unknown as Run;
+				},
+			} as SDKAgent;
+		});
+		const screenshot = {
+			name: "screenshot",
+			description: "capture the screen",
+			parameters: { type: "object", properties: {} },
+		} as Tool;
+		const first = await drain(cursorModel("composer-2.5", 200_000), userContext("Capture the screen", [screenshot]), {
+			apiKey: "test-key", cwd: "/tmp/project",
+		});
+		const done = first.at(-1);
+		expect(done).toMatchObject({ type: "done", reason: "toolUse" });
+		if (done?.type !== "done") throw new Error("expected parked screenshot");
+		const call = done.message.content.find((block) => block.type === "toolCall");
+		if (call?.type !== "toolCall") throw new Error("expected screenshot call");
+		const passive = {
+			messages: [
+				{ role: "user", content: "Capture the screen", timestamp: 1 },
+				done.message,
+				{
+					role: "toolResult",
+					toolCallId: call.id,
+					toolName: "screenshot",
+					content: [{ type: "text", text: "Captured screen" }, { type: "image", data: "screen-payload", mimeType: "image/png" }],
+					isError: false,
+					timestamp: 2,
+				},
+				{ role: "developer", content: [{ type: "text", text: "additional context from the tool" }], timestamp: 3 },
+			],
+			tools: [screenshot],
+		} as Context;
+		const second = await drain(cursorModel("composer-2.5", 200_000), passive, { apiKey: "test-key", cwd: "/tmp/project" });
+		expect(toolExecutions).toBe(1);
+		expect(oldCallbackResolved).toBe(false);
+		expect(opened).toEqual([undefined, undefined]);
+		expect(JSON.stringify(histories[1])).toContain("additional context from the tool");
+		expect(sent[1]?.images).toEqual([{ data: "screen-payload", mimeType: "image/png" }]);
+		expect(sent[1]?.text).toContain("Continue the conversation from where it left off.");
+		expect(sent[1]?.text).not.toContain("additional context from the tool");
+		expect(second.some((event) => event.type === "toolcall_start")).toBe(false);
+		expect(second.at(-1)).toMatchObject({ type: "done", reason: "stop" });
+	});
+
+	test("a rewritten delivered assistant rebuilds from the OMP transcript on the next user turn", async () => {
+		const opened: Array<string | undefined> = [];
+		const histories: Array<Context["messages"] | undefined> = [];
+		const sent: string[] = [];
+		runtimeTestUtils.setOpenAgent(async (input) => {
+			opened.push(input.savedAgentId);
+			histories.push(input.bootstrapHistory);
+			const agentId = `agent-${opened.length}`;
+			return {
+				agentId,
+				close() {},
+				async [Symbol.asyncDispose]() {},
+				async send(message) {
+					const text = (message as { text?: string }).text ?? "";
+					sent.push(text);
+					return {
+						supports: () => false,
+						wait: async () => ({ status: "finished", result: agentId === "agent-1" ? "Answer A" : "Answer C" }),
+					} as unknown as Run;
+				},
+			} as SDKAgent;
+		});
+		const first = await drain(cursorModel("composer-2.5", 200_000), userContext("hi"), { apiKey: "test-key", cwd: "/tmp/project" });
+		const done = first.at(-1);
+		expect(done).toMatchObject({ type: "done", reason: "stop", message: { content: [{ type: "text", text: "Answer A" }] } });
+		if (done?.type !== "done") throw new Error("expected answer A");
+		const rewritten = structuredClone(done.message);
+		const block = rewritten.content[0];
+		if (block?.type !== "text") throw new Error("expected text");
+		block.text = "Answer B";
+		const second = await drain(cursorModel("composer-2.5", 200_000), {
+			messages: [
+				{ role: "user", content: "hi", timestamp: 1 },
+				rewritten,
+				{ role: "user", content: "next question", timestamp: 3 },
+			],
+		} as Context, { apiKey: "test-key", cwd: "/tmp/project" });
+		expect(opened).toEqual([undefined, undefined]);
+		expect(JSON.stringify(histories[1])).toContain("Answer B");
+		expect(JSON.stringify(histories[1])).not.toContain("Answer A");
+		expect(sent[1]).toContain("next question");
+		expect(sent[1]).toContain("Cursor SDK tool access");
+		expect(second.at(-1)).toMatchObject({ type: "done", reason: "stop", message: { content: [{ type: "text", text: "Answer C" }] } });
+	});
+
+	test("an unchanged delivered assistant stays on the same agent for the next user turn", async () => {
+		const sessionFile = join(mkdtempSync(join(tmpdir(), "omp-csr-")), "session.jsonl");
+		writeFileSync(sessionFile, "");
+		scopeTestUtils.set("/tmp/project", sessionFile, "sess-1");
+		const handlers = new Map<string, Array<(event: unknown, ctx: unknown) => unknown>>();
+		const ctx = {
+			cwd: "/tmp/project",
+			sessionManager: {
+				getSessionFile: () => sessionFile,
+				getSessionId: () => "sess-1",
+				getBranch: () => [],
+				getEntries: () => [],
+			},
+		} as ExtensionContext;
+		registerCursorSessionResume({
+			appendEntry(customType: string, data?: unknown) {
+				appendFileSync(sessionFile, `${JSON.stringify({ type: "custom", customType, data })}\n`);
+			},
+			on(event: string, handler: (event: unknown, ctx: unknown) => unknown) {
+				const list = handlers.get(event) ?? [];
+				list.push(handler);
+				handlers.set(event, list);
+			},
+		} as Pick<ExtensionAPI, "on" | "appendEntry">);
+		await handlers.get("session_start")?.[0]?.({ type: "session_start" }, ctx);
+		const opened: Array<string | undefined> = [];
+		const sent: string[] = [];
+		runtimeTestUtils.setOpenAgent(async (input) => {
+			opened.push(input.savedAgentId);
+			return {
+				agentId: "agent-1",
+				close() {},
+				async [Symbol.asyncDispose]() {},
+				async send(message) {
+					sent.push((message as { text?: string }).text ?? "");
+					return { supports: () => false, wait: async () => ({ status: "finished", result: "Answer A" }) } as unknown as Run;
+				},
+			} as SDKAgent;
+		});
+		const first = await drain(cursorModel("composer-2.5", 200_000), userContext("hi"), { apiKey: "test-key", cwd: "/tmp/project" });
+		const done = first.at(-1);
+		if (done?.type !== "done") throw new Error("expected answer A");
+		const second = await drain(cursorModel("composer-2.5", 200_000), {
+			messages: [
+				{ role: "user", content: "hi", timestamp: 1 },
+				done.message,
+				{ role: "user", content: "next question", timestamp: 3 },
+			],
+		} as Context, { apiKey: "test-key", cwd: "/tmp/project" });
+		expect(opened).toEqual([undefined]);
+		expect(sent[1]).toBe("next question");
+		expect(second.at(-1)).toMatchObject({ type: "done", reason: "stop" });
+	});
+
+	test.each(["unchanged", "rewritten"] as const)("a %s parked assistant follows the delivered content", async (kind) => {
+		const opened: Array<string | undefined> = [];
+		const histories: Array<Context["messages"] | undefined> = [];
+		let toolExecutions = 0;
+		let oldCallbackResolved = false;
+		runtimeTestUtils.setOpenAgent(async (input) => {
+			opened.push(input.savedAgentId);
+			histories.push(input.bootstrapHistory);
+			const agentId = `agent-${opened.length}`;
+			return {
+				agentId,
+				close() {},
+				async [Symbol.asyncDispose]() {},
+				async send(_message, options) {
+					if (agentId !== "agent-1") {
+						return { supports: () => false, wait: async () => ({ status: "finished", result: "rebuilt" }) } as unknown as Run;
+					}
+					const tool = options?.local?.customTools?.read;
+					if (!tool) throw new Error("read tool not exposed");
+					toolExecutions += 1;
+					const pending = tool.execute({ path: "a.ts" }, { toolCallId: "call-1" });
+					return {
+						supports: () => false,
+						wait: async () => {
+							await pending;
+							oldCallbackResolved = true;
+							return { status: "finished", result: "All done." } as RunResult;
+						},
+					} as unknown as Run;
+				},
+			} as SDKAgent;
+		});
+		const first = await drain(cursorModel("composer-2.5", 200_000), userContext("hi", [readTool()]), {
+			apiKey: "test-key", cwd: "/tmp/project",
+		});
+		const done = first.at(-1);
+		expect(done).toMatchObject({ type: "done", reason: "toolUse" });
+		if (done?.type !== "done") throw new Error("expected parked assistant");
+		const assistant = structuredClone(done.message);
+		if (kind === "rewritten") {
+			const call = assistant.content.find((block) => block.type === "toolCall");
+			if (call?.type !== "toolCall") throw new Error("expected tool call");
+			call.arguments = { path: "rewritten.ts" };
+		}
+		const call = assistant.content.find((block) => block.type === "toolCall");
+		if (call?.type !== "toolCall") throw new Error("expected tool call");
+		const second = await drain(cursorModel("composer-2.5", 200_000), {
+			messages: [
+				{ role: "user", content: "hi", timestamp: 1 },
+				assistant,
+				{
+					role: "toolResult",
+					toolCallId: call.id,
+					toolName: "read",
+					content: [{ type: "text", text: "ok" }],
+					isError: false,
+					timestamp: 2,
+				},
+			],
+			tools: [readTool()],
+		} as Context, { apiKey: "test-key", cwd: "/tmp/project" });
+		expect(toolExecutions).toBe(1);
+		if (kind === "unchanged") {
+			expect(opened).toEqual([undefined]);
+			expect(oldCallbackResolved).toBe(true);
+			expect(second.at(-1)).toMatchObject({ type: "done", message: { content: [{ type: "text", text: "All done." }] } });
+		} else {
+			expect(opened).toEqual([undefined, undefined]);
+			expect(oldCallbackResolved).toBe(false);
+			expect(JSON.stringify(histories[1])).toContain("rewritten.ts");
+			expect(second.at(-1)).toMatchObject({ type: "done", message: { content: [{ type: "text", text: "rebuilt" }] } });
+		}
+	});
+
+	test.each([
+		{ label: "renamed", callId: "call-1", callName: "inspect", resultId: "call-1", resultName: "inspect", outcome: "rebuild" },
+		{ label: "reidentified", callId: "call-rewritten", callName: "read", resultId: "call-rewritten", resultName: "read", outcome: "rebuild" },
+		{ label: "unpaired", callId: "call-rewritten", callName: "inspect", resultId: "stale-call", resultName: "inspect", outcome: "reject" },
+		{ label: "old-matched", callId: "call-1", callName: "inspect", resultId: "call-1", resultName: "read", outcome: "reject" },
+	] as const)("a $label parked tool call follows the delivered assistant", async ({ callId, callName, resultId, resultName, outcome }) => {
+		const tools = [readTool(), { name: "inspect", description: "inspect", parameters: { type: "object", properties: { path: { type: "string" } } } } as Tool];
+		const opened: Array<string | undefined> = [];
+		const histories: Array<Context["messages"] | undefined> = [];
+		let oldCallbackResolved = false;
+		runtimeTestUtils.setOpenAgent(async (input) => {
+			opened.push(input.savedAgentId);
+			histories.push(input.bootstrapHistory);
+			const agentId = `agent-${opened.length}`;
+			return {
+				agentId,
+				close() {},
+				async [Symbol.asyncDispose]() {},
+				async send(_message, options) {
+					if (agentId !== "agent-1") {
+						return { supports: () => false, wait: async () => ({ status: "finished", result: "rebuilt" }) } as unknown as Run;
+					}
+					const tool = options?.local?.customTools?.read;
+					if (!tool) throw new Error("read tool not exposed");
+					const pending = tool.execute({ path: "a.ts" }, { toolCallId: "call-1" });
+					return {
+						supports: () => false,
+						wait: async () => {
+							await pending;
+							oldCallbackResolved = true;
+							return { status: "finished", result: "All done." } as RunResult;
+						},
+					} as unknown as Run;
+				},
+			} as SDKAgent;
+		});
+		const first = await drain(cursorModel("composer-2.5", 200_000), userContext("hi", tools), {
+			apiKey: "test-key", cwd: "/tmp/project",
+		});
+		const done = first.at(-1);
+		expect(done).toMatchObject({ type: "done", reason: "toolUse" });
+		if (done?.type !== "done") throw new Error("expected parked assistant");
+		const assistant = structuredClone(done.message);
+		const call = assistant.content.find((block) => block.type === "toolCall");
+		if (call?.type !== "toolCall") throw new Error("expected tool call");
+		call.id = callId;
+		call.name = callName;
+		const second = await drain(cursorModel("composer-2.5", 200_000), {
+			messages: [
+				{ role: "user", content: "hi", timestamp: 1 },
+				assistant,
+				{
+					role: "toolResult",
+					toolCallId: resultId,
+					toolName: resultName,
+					content: [{ type: "text", text: "ok" }],
+					isError: false,
+					timestamp: 2,
+				},
+			],
+			tools,
+		} as Context, { apiKey: "test-key", cwd: "/tmp/project" });
+		expect(oldCallbackResolved).toBe(false);
+		if (outcome === "rebuild") {
+			expect(opened).toEqual([undefined, undefined]);
+			expect(JSON.stringify(histories[1])).toContain(callId);
+			expect(JSON.stringify(histories[1])).toContain(callName);
+			expect(second.at(-1)).toMatchObject({ type: "done", message: { content: [{ type: "text", text: "rebuilt" }] } });
+		} else {
+			expect(opened).toEqual([undefined]);
+			expect(second.at(-1)).toMatchObject({
+				type: "error",
+				error: { errorMessage: expect.stringMatching(/do not match the current parked/) },
+			});
+		}
+	});
+
+	test("replaying an already consumed tool batch does not rebuild over the current parked call", async () => {
+		const opened: Array<string | undefined> = [];
+		runtimeTestUtils.setOpenAgent(async (input) => {
+			opened.push(input.savedAgentId);
+			return {
+				agentId: "agent-1",
+				close() {},
+				async [Symbol.asyncDispose]() {},
+				async send(_message, options) {
+					const tool = options?.local?.customTools?.read;
+					if (!tool) throw new Error("read tool not exposed");
+					const pendingA = tool.execute({ path: "a.ts" }, { toolCallId: "call-A" });
+					return {
+						supports: () => false,
+						wait: async () => {
+							await pendingA;
+							const pendingB = tool.execute({ path: "b.ts" }, { toolCallId: "call-B" });
+							await pendingB;
+							return { status: "finished", result: "done" } as RunResult;
+						},
+					} as unknown as Run;
+				},
+			} as SDKAgent;
+		});
+		const first = await drain(cursorModel("composer-2.5", 200_000), userContext("hi", [readTool()]), {
+			apiKey: "test-key", cwd: "/tmp/project",
+		});
+		const assistantA = first.at(-1);
+		expect(assistantA).toMatchObject({ type: "done", reason: "toolUse" });
+		if (assistantA?.type !== "done") throw new Error("expected assistant A");
+		const consumed = {
+			messages: [
+				{ role: "user", content: "hi", timestamp: 1 },
+				assistantA.message,
+				{
+					role: "toolResult",
+					toolCallId: "call-A",
+					toolName: "read",
+					content: [{ type: "text", text: "a" }],
+					isError: false,
+					timestamp: 2,
+				},
+			],
+			tools: [readTool()],
+		} as Context;
+		const second = await drain(cursorModel("composer-2.5", 200_000), consumed, { apiKey: "test-key", cwd: "/tmp/project" });
+		const assistantB = second.at(-1);
+		expect(assistantB).toMatchObject({ type: "done", reason: "toolUse" });
+		if (assistantB?.type !== "done") throw new Error("expected assistant B");
+		expect(assistantB.message.timestamp).not.toBe(assistantA.message.timestamp);
+		const replay = await drain(cursorModel("composer-2.5", 200_000), consumed, { apiKey: "test-key", cwd: "/tmp/project" });
+		expect(opened).toEqual([undefined]);
+		expect(replay.at(-1)).toMatchObject({
+			type: "error",
+			error: { errorMessage: expect.stringMatching(/do not match the current parked/) },
+		});
+	});
+
 	test.each([
 		["missing", ["call-1"]],
 		["duplicate", ["call-1", "call-2", "call-1"]],

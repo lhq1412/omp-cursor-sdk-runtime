@@ -11,6 +11,7 @@ import {
 	SDK_TOOL_CONTEXT,
 } from "./constants.js";
 import { CursorBootstrapBudgetError, CursorRecoveryBudgetError } from "./errors.js";
+import { trailingToolExchange } from "./omp-tools.js";
 import { nativeToolCallId, projectSdkToolCallId } from "./tool-call-id.js";
 
 export type SendMode = "bootstrap" | "incremental";
@@ -19,6 +20,8 @@ export interface SendState {
 	bootstrapped: boolean;
 	contextFingerprint: string;
 	incrementalSendCount: number;
+	/** Model-visible content of the assistant this turn delivered. Absent on older journals. */
+	deliveredAssistantDigest?: string;
 }
 
 export interface SendPlan {
@@ -199,6 +202,9 @@ export function planSend(sendState: SendState, context: Context): SendPlan {
 		if (suffixRequiresBootstrap(context.messages, previous.messageCount)) {
 			return { mode: "bootstrap", resetAgent: true, reason: "context_divergence" };
 		}
+		if (suffixAssistantRewritten(sendState.deliveredAssistantDigest, context.messages, previous.messageCount)) {
+			return { mode: "bootstrap", resetAgent: true, reason: "context_divergence" };
+		}
 	}
 	return { mode: "incremental", resetAgent: false, reason: "incremental", ...continuation };
 }
@@ -247,6 +253,88 @@ function parseFingerprint(value: string): ParsedFingerprint | undefined {
 	} catch {
 		return undefined;
 	}
+}
+
+/** Hash of text, thinking, and tool calls. Usage, timestamps, and stop reason stay out. */
+export function deliveredAssistantDigest(message: unknown): string | undefined {
+	if (!isRecord(message) || message.role !== "assistant" || !Array.isArray(message.content)) return undefined;
+	const visible: Array<Record<string, unknown>> = [];
+	for (const block of message.content) {
+		if (!isRecord(block) || typeof block.type !== "string") continue;
+		if (block.type === "text" && typeof block.text === "string") {
+			visible.push({ type: "text", text: block.text });
+		} else if (block.type === "thinking" && typeof block.thinking === "string") {
+			visible.push({ type: "thinking", thinking: block.thinking });
+		} else if (block.type === "toolCall") {
+			visible.push({
+				type: "toolCall",
+				id: typeof block.id === "string" ? block.id : "",
+				name: typeof block.name === "string" ? block.name : "",
+				arguments: block.arguments ?? {},
+			});
+		}
+	}
+	return hashValue(`delivered-assistant:${JSON.stringify(visible)}`);
+}
+
+function suffixAssistantRewritten(digest: string | undefined, messages: Context["messages"], fromIndex: number): boolean {
+	if (!digest) return false;
+	for (let index = fromIndex; index < messages.length; index += 1) {
+		const message = messages[index];
+		if (!message || message.role === "user" || message.role === "developer") return false;
+		if (message.role !== "assistant") continue;
+		if (message.provider !== CURSOR_SDK_PROVIDER_ID || message.api !== CURSOR_SDK_API) return false;
+		return deliveredAssistantDigest(message) !== digest;
+	}
+	return false;
+}
+
+function assistantBeforeToolBatch(context: Context): Context["messages"][number] | undefined {
+	const exchange = trailingToolExchange(context);
+	if (exchange.results.length === 0) return undefined;
+	return context.messages[context.messages.length - exchange.results.length - exchange.passive.length - 1];
+}
+
+/** Parked continuation rebuilds only when the assistant that issued the calls was rewritten. */
+export function parkedAssistantRewritten(digest: string | undefined, context: Context): boolean {
+	if (!digest) return false;
+	const message = assistantBeforeToolBatch(context);
+	if (!message || message.role !== "assistant") return false;
+	if (message.provider !== CURSOR_SDK_PROVIDER_ID || message.api !== CURSOR_SDK_API) return false;
+	return deliveredAssistantDigest(message) !== digest;
+}
+
+/**
+ * The tool-result batch is a complete pairing of the assistant call ids and names.
+ * A digest mismatch does not authorize results that do not belong to that assistant.
+ */
+export function rewrittenToolResultsPair(context: Context): boolean {
+	const exchange = trailingToolExchange(context);
+	const message = assistantBeforeToolBatch(context);
+	if (!message || message.role !== "assistant" || !Array.isArray(message.content)) return false;
+	if (message.provider !== CURSOR_SDK_PROVIDER_ID || message.api !== CURSOR_SDK_API) return false;
+	const calls = new Map<string, string>();
+	for (const block of message.content) {
+		if (!isRecord(block) || block.type !== "toolCall") continue;
+		if (typeof block.id !== "string" || block.id.length === 0) return false;
+		if (typeof block.name !== "string" || block.name.length === 0) return false;
+		if (calls.has(block.id)) return false;
+		calls.set(block.id, block.name);
+	}
+	if (calls.size === 0 || calls.size !== exchange.results.length) return false;
+	const seen = new Set<string>();
+	for (const result of exchange.results) {
+		if (seen.has(result.toolCallId) || calls.get(result.toolCallId) !== result.toolName) return false;
+		seen.add(result.toolCallId);
+	}
+	return seen.size === calls.size;
+}
+
+/** The trailing assistant is the parked delivery, not an older batch that shares the user request. */
+export function sameDeliveredAssistantBatch(timestamp: number | undefined, context: Context): boolean {
+	if (typeof timestamp !== "number") return false;
+	const message = assistantBeforeToolBatch(context);
+	return Boolean(message && message.role === "assistant" && message.timestamp === timestamp);
 }
 
 function suffixRequiresBootstrap(messages: Context["messages"], fromIndex: number): boolean {
@@ -453,16 +541,21 @@ export function activeUserInput(context: Context, continueOnly = false): SDKUser
 	return images.length > 0 ? { text, images } : { text };
 }
 
-function validateToolResultRecovery(context: Context): number | undefined {
-	if (context.messages.at(-1)?.role !== "toolResult") return undefined;
-	const units = historyUnits(context.messages);
+function validateToolResultRecovery(context: Context): { requestIndex: number; passive: boolean } | undefined {
+	const exchange = trailingToolExchange(context);
+	if (exchange.results.length === 0) return undefined;
+	const messages = exchange.passive.length > 0
+		? context.messages.slice(0, -exchange.passive.length)
+		: context.messages;
+	if (messages.at(-1)?.role !== "toolResult") return undefined;
+	const units = historyUnits(messages);
 	const requestIndex = units.slice(0, -1).reduce((count, unit) => count + unit.length, 0);
-	if (context.messages[requestIndex]?.role !== "user" && context.messages[requestIndex]?.role !== "developer") {
+	if (messages[requestIndex]?.role !== "user" && messages[requestIndex]?.role !== "developer") {
 		throw new Error("Cannot recover Cursor SDK tool results without their initiating user or developer request");
 	}
 	const pending = new Set<string>();
-	for (let index = requestIndex; index < context.messages.length; index += 1) {
-		const message = context.messages[index]!;
+	for (let index = requestIndex; index < messages.length; index += 1) {
+		const message = messages[index]!;
 		if (message.role === "assistant") {
 			if (!Array.isArray(message.content) || message.content.some((block) => !isRecord(block))) {
 				throw new Error("Cannot recover Cursor SDK history: unsupported or malformed assistant content");
@@ -492,7 +585,7 @@ function validateToolResultRecovery(context: Context): number | undefined {
 	if (pending.size > 0) {
 		throw new Error("Cannot recover Cursor SDK tool results: missing results for an assistant tool-call batch");
 	}
-	return requestIndex;
+	return { requestIndex, passive: exchange.passive.length > 0 };
 }
 
 /** Bootstrap instructions stay in the send text; conversation history is imported natively. */
@@ -510,13 +603,16 @@ export function prepareSendInput(
 		if (estimatedTextTokens(current.text) + definitionReserve > inputTextBudget(current, limits, targetModelId)) throwContextOverflow();
 		return { prompt: current };
 	}
-	const recoveryStart = validateToolResultRecovery(context);
+	const recovery = validateToolResultRecovery(context);
 	const message = currentInputMessage(context, plan.continueOnly);
 	const prior = message ? context.messages.slice(0, -1) : context.messages;
-	if (recoveryStart !== undefined) {
-		current.text = "Continue the initiating request using the recorded tool results. These tool calls have already completed; do not repeat completed actions or retry recorded tool calls. Treat their results as existing evidence and continue with the remaining work.";
-		const images: SDKImage[] = [];
-		for (let index = recoveryStart; index < context.messages.length; index += 1) {
+	if (recovery) {
+		// Trailing developer context stays in history and keeps the continuation sentence.
+		if (!recovery.passive) {
+			current.text = "Continue the initiating request using the recorded tool results. These tool calls have already completed; do not repeat completed actions or retry recorded tool calls. Treat their results as existing evidence and continue with the remaining work.";
+		}
+		const images: SDKImage[] = recovery.passive ? [...(current.images ?? [])] : [];
+		for (let index = recovery.requestIndex; index < context.messages.length; index += 1) {
 			const result = context.messages[index]!;
 			if (result.role !== "toolResult") continue;
 			for (const image of imagesFromContent(result.content)) {
@@ -533,12 +629,12 @@ export function prepareSendInput(
 	const budget = inputTextBudget(current, limits, targetModelId);
 	const requiredText = system + tools + toolContext + current.text;
 	if (estimatedTextTokens(requiredText) + definitionReserve > budget) {
-		if (recoveryStart !== undefined) throw new CursorRecoveryBudgetError();
+		if (recovery) throw new CursorRecoveryBudgetError();
 		throwContextOverflow();
 	}
 	const text = requiredText;
 	if (estimatedTextTokens(text) + estimatedHistoryTokens(prior, targetModelId) + definitionReserve > budget) {
-		if (recoveryStart !== undefined) throw new CursorRecoveryBudgetError();
+		if (recovery) throw new CursorRecoveryBudgetError();
 		throw new CursorBootstrapBudgetError();
 	}
 	return {

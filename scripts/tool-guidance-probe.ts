@@ -76,12 +76,14 @@ const report = {
 	renames: [...contract.ompToSdk.entries()].filter(([omp, sdk]) => omp !== sdk),
 	guidanceOmitsDescription: !contract.guidance.includes("Description:"),
 	guidanceOmitsSchema: !contract.guidance.includes("Input schema:"),
-	guidanceListsNames: contract.definitions.every((tool) => contract.guidance.includes(tool.sdkName)),
+	guidanceOmitsClosedNameList: !contract.guidance.includes("Granted SDK tool names:")
+		&& contract.definitions.every((tool) => !contract.guidance.includes(`- ${tool.sdkName}`)),
+	guidanceNamesCurrentRun: contract.guidance.includes("The custom tools exposed on the current Run are the grant."),
 	sendIncludesGuidance: prepared.prompt.text.includes(contract.guidance),
 	stableHash: createHash("sha256").update(contract.guidance).digest("hex").slice(0, 16),
 };
 
 console.log(JSON.stringify(report, null, 2));
-if (!report.guidanceOmitsDescription || !report.guidanceOmitsSchema || !report.guidanceListsNames) {
+if (!report.guidanceOmitsDescription || !report.guidanceOmitsSchema || !report.guidanceOmitsClosedNameList || !report.guidanceNamesCurrentRun) {
 	process.exitCode = 1;
 }

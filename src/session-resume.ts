@@ -171,6 +171,9 @@ export function parseResumeEntryData(value: unknown): ResumeEntryData | undefine
 			bootstrapped: record.sendState.bootstrapped,
 			contextFingerprint: record.sendState.contextFingerprint,
 			incrementalSendCount: record.sendState.incrementalSendCount,
+			...(typeof record.sendState.deliveredAssistantDigest === "string" && record.sendState.deliveredAssistantDigest
+				? { deliveredAssistantDigest: record.sendState.deliveredAssistantDigest }
+				: {}),
 		},
 		createdAt: record.createdAt,
 		...(storeIdentity ? { storeIdentity } : {}),
