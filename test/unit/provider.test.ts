@@ -8,7 +8,7 @@ import { buildModelSelection, ensureCursorModels, getModelMetadata, __testUtils 
 import { __testUtils as controlsTestUtils } from "../../src/model-controls.ts";
 import { disposeRuntimeForScope, __testUtils as runtimeTestUtils } from "../../src/session-runtime.ts";
 import { __testUtils as liveRunTestUtils } from "../../src/live-run.ts";
-import { __testUtils as scopeTestUtils } from "../../src/session-scope.ts";
+import { getCursorSessionScopeKey, __testUtils as scopeTestUtils } from "../../src/session-scope.ts";
 import { __testUtils as resumeTestUtils } from "../../src/session-resume.ts";
 import { HOST_BRIDGE_OPTION_KEY } from "../../src/host-option.ts";
 import { createFakeHost } from "../helpers/fake-host.ts";
@@ -211,10 +211,10 @@ describe("streamCursorRuntime model selection", () => {
 		expect(settled).toMatchObject({ type: "done", message: {
 			usage: { input: 0, output: 0, totalTokens: 135,
 				orchestration: { input: 105, output: 10, cacheRead: 20 }, cost: { total: 0 } },
-			cursorSdk: { cost: "unavailable", contextOccupancy: { status: "actual", source: "checkpoint", rootBlobId: "settled", maxTokens: 100 } },
+			cursorSdk: { cost: "unavailable", contextOccupancy: { status: "actual", source: "checkpoint", rootBlobId: "settled", usedTokens: 150, maxTokens: 100 } },
 		} });
 		if (settled?.type !== "done") throw new Error("Expected settled turn");
-		expect(settled.message.usage.contextTokens).toBeUndefined();
+		expect(settled.message.usage.contextTokens).toBe(150);
 	});
 
 
@@ -516,7 +516,11 @@ describe("streamCursorRuntime model selection", () => {
 				cursorSdk: { contextOccupancy: { status: "actual", source: "checkpoint" } },
 			},
 		});
-		expect(last && "message" in last ? last.message.usage.contextTokens : undefined).toBeUndefined();
+		const settled = last && "message" in last ? last.message : undefined;
+		expect(settled?.usage.contextTokens).toBe(
+			settled?.cursorSdk.contextOccupancy.status === "actual" ? settled.cursorSdk.contextOccupancy.usedTokens : undefined,
+		);
+		expect(settled?.usage.cost).toEqual({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 });
 		expect(host.bindings).toHaveLength(1);
 	});
 
@@ -719,6 +723,53 @@ describe("streamCursorRuntime model selection", () => {
 		}
 		expect(customTools).toEqual([]);
 		expect(events.at(-1)).toMatchObject({ type: "done", reason: "stop" });
+	});
+
+	test("an in-session side channel ignores the captured parent owner", async () => {
+		let customTools: string[] = [];
+		let openedScope: string | undefined;
+		runtimeTestUtils.setOpenAgent(async () => {
+			openedScope = getCursorSessionScopeKey();
+			return {
+				agentId: "side-1",
+				close() {},
+				async [Symbol.asyncDispose]() {},
+				async send(_message, options) {
+					customTools = Object.keys(options?.local?.customTools ?? {});
+					return finishedRun();
+				},
+			} as unknown as SDKAgent;
+		});
+		scopeTestUtils.set("/tmp/project", "/tmp/parent.jsonl", "parent");
+		const reminded = userContext("what is going on?", [readTool()]);
+		reminded.messages.unshift({
+			role: "developer",
+			content: [{ type: "text", text: "Ephemeral side-channel turn; reuses current conversation context." }],
+			timestamp: 0,
+		});
+		for (const options of [
+			{ sessionId: "parent:side:9", context: userContext("side question", [readTool()]) },
+			{ sessionId: "parent", context: reminded },
+		]) {
+			customTools = ["unread"];
+			openedScope = undefined;
+			const events = [];
+			for await (const event of streamCursorRuntime(cursorModel("composer-2.5", 200_000), options.context, {
+				apiKey: "test-key",
+				cwd: "/tmp/project",
+				sessionId: options.sessionId,
+				onPayload: () => {
+					scopeTestUtils.bindRequest();
+				},
+			} as SimpleStreamOptions)) {
+				events.push(event);
+			}
+			expect(customTools).toEqual([]);
+			expect(openedScope).not.toBe("/tmp/parent.jsonl");
+			expect(openedScope?.startsWith(scopeTestUtils.EPHEMERAL_SESSION_SCOPE_PREFIX)).toBe(true);
+			expect(events.at(-1)).toMatchObject({ type: "done", reason: "stop" });
+		}
+		scopeTestUtils.reset();
 	});
 
 	test.each(["disableReasoning", "forceReasoningOff"] as const)("%s wins over reasoning and still uses catalog context threshold", async (offOption) => {

@@ -17,7 +17,7 @@ import {
 	type ResumeEntryData,
 	type ResumeSessionEntry,
 } from "../../src/session-resume.ts";
-import { ownerForContext, withCursorSessionOwner, __testUtils as scopeTestUtils } from "../../src/session-scope.ts";
+import { getCursorSessionOwner, ownerForContext, withCursorSessionOwner, __testUtils as scopeTestUtils } from "../../src/session-scope.ts";
 
 function message(id: string, parentId: string | null, role: "user" | "assistant"): ResumeSessionEntry {
 	return { type: "message", id, parentId, message: { role } };
@@ -434,6 +434,33 @@ describe("session resume fold", () => {
 		expect(getMatchingResumeHandle("main", "cred-1")?.agentId).toBe("agent-local-1");
 		resumeTestUtils.state.activeHandle = validData({ version: 3, toolContractFingerprint: "tools-fp", state: "committed" });
 		expect(getMatchingResumeHandle("main", "cred-1", "/tmp/project", "tools-fp")).toBeUndefined();
+	});
+
+	test("same session id matches a rolled file and a different id does not", () => {
+		const entry = resume("r1", null, validData());
+		const rolled = foldResumeHandle([entry], { ...scope, sessionFile: "/tmp/rolled.jsonl" });
+		expect(rolled.activeHandle?.agentId).toBe("agent-local-1");
+		expect(foldResumeHandle([entry], { ...scope, sessionId: "sess-2" }).activeHandle).toBeUndefined();
+		const legacy = resume("r2", null, validData({ sessionId: undefined }));
+		expect(foldResumeHandle([legacy], { ...scope, sessionId: undefined }).activeHandle?.agentId).toBe("agent-local-1");
+		expect(foldResumeHandle([legacy], { ...scope, sessionFile: "/tmp/other.jsonl", sessionId: undefined }).activeHandle).toBeUndefined();
+	});
+
+	test("a non-writer does not reuse a committed resume handle", () => {
+		scopeTestUtils.reset();
+		scopeTestUtils.set("/tmp/project", "/tmp/session.jsonl", "sess-1");
+		const owner = getCursorSessionOwner();
+		expect(owner.writer).toBe(true);
+		resumeTestUtils.reset();
+		resumeTestUtils.state.scopeKey = "/tmp/session.jsonl";
+		resumeTestUtils.state.sessionFile = "/tmp/session.jsonl";
+		resumeTestUtils.state.sessionId = "sess-1";
+		resumeTestUtils.state.cwd = "/tmp/project";
+		resumeTestUtils.state.activeHandle = validData({ state: "committed" });
+		expect(getMatchingResumeHandle("main", "cred-1", "/tmp/project")?.agentId).toBe("agent-local-1");
+		owner.writer = false;
+		expect(getMatchingResumeHandle("main", "cred-1", "/tmp/project")).toBeUndefined();
+		scopeTestUtils.reset();
 	});
 
 	test("a later in-flight record supersedes an older committed handle on the same lineage", () => {

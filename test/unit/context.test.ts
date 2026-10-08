@@ -629,9 +629,77 @@ describe("send policy", () => {
 			{ role: "user", content: [image], timestamp: 1 },
 			{ role: "user", content: "Describe it", timestamp: 2 },
 		], "");
-		expect(bootstrap(ctx, { contextWindow: 6000, maxTokens: 500 }).history).toEqual(ctx.messages.slice(0, -1));
+		expect(bootstrap(ctx, { contextWindow: 12_000, maxTokens: 500 }).history).toEqual(ctx.messages.slice(0, -1));
 		expect(() => bootstrap(ctx, { contextWindow: 5000, maxTokens: 500 })).toThrow(CursorBootstrapBudgetError);
 		expect(() => bootstrap(context([{ role: "user", content: [image], timestamp: 1 }], ""), { contextWindow: 5000, maxTokens: 500 })).toThrow(/context window exceeded/i);
+	});
+
+	test("gemini images use the fixed token budget instead of the anthropic ceiling", () => {
+		const png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+		const history = context([
+			{ role: "user", content: [{ type: "image", data: "x".repeat(png.length), mimeType: "image/png" }], timestamp: 1 },
+			{ role: "user", content: "Describe it", timestamp: 2 },
+		], "");
+		const limits = { contextWindow: 4_000, maxTokens: 500 };
+		expect(bootstrap(history, limits, "gemini-2.5-pro").history).toHaveLength(1);
+		expect(() => bootstrap(history, limits, "claude-sonnet-4")).toThrow(CursorBootstrapBudgetError);
+	});
+
+	test("prices a decoded image below an unreadable blob of the same length", () => {
+		const png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+		const history = (data: string) => context([
+			{ role: "user", content: [{ type: "image", data, mimeType: "image/png" }], timestamp: 1 },
+			{ role: "user", content: "Describe it", timestamp: 2 },
+		], "");
+		const limits = { contextWindow: 6000, maxTokens: 500 };
+		expect(bootstrap(history(png), limits).history).toHaveLength(1);
+		expect(() => bootstrap(history("x".repeat(png.length)), limits)).toThrow(CursorBootstrapBudgetError);
+	});
+
+	test("an assistant text rewrite bootstraps so native history cannot diverge", () => {
+		const prior = context([
+			{ role: "user", content: "hi", timestamp: 1 },
+			{ role: "assistant", content: [{ type: "text", text: "old answer" }], timestamp: 2, completedAt: 3, contextSnapshot: "snap" },
+		] as Context["messages"]);
+		const fingerprint = computeContextFingerprint(prior);
+		const rewritten = structuredClone(prior);
+		const assistant = rewritten.messages[1];
+		if (assistant?.role !== "assistant" || !Array.isArray(assistant.content)) throw new Error("expected assistant");
+		assistant.content = [{ type: "text", text: "rewritten answer" }];
+		rewritten.messages.push({ role: "user", content: "continue", timestamp: 4 });
+		expect(planSend({ bootstrapped: true, contextFingerprint: fingerprint, incrementalSendCount: 1 }, rewritten)).toMatchObject({
+			mode: "bootstrap",
+			reason: "context_divergence",
+		});
+		const retimed = structuredClone(prior);
+		const same = retimed.messages[1];
+		if (same?.role === "assistant") {
+			same.completedAt = 99;
+			same.contextSnapshot = "other";
+		}
+		retimed.messages.push({ role: "user", content: "continue", timestamp: 4 });
+		expect(planSend({ bootstrapped: true, contextFingerprint: fingerprint, incrementalSendCount: 1 }, retimed)).toMatchObject({
+			mode: "incremental",
+		});
+	});
+
+	test("counts snapcompact archive frames with the model image budget", () => {
+		const limits = { contextWindow: 6000, maxTokens: 500 };
+		const summaryOnly = context([
+			{ role: "compactionSummary", summary: "Earlier turns summarized", timestamp: 1 },
+			{ role: "user", content: "Continue", timestamp: 2 },
+		] as Context["messages"]);
+		const framed = context([
+			{
+				role: "compactionSummary",
+				summary: "Earlier turns summarized",
+				blocks: [{ type: "image", data: "abc", mimeType: "image/png" }],
+				timestamp: 1,
+			},
+			{ role: "user", content: "Continue", timestamp: 2 },
+		] as Context["messages"]);
+		expect(bootstrap(summaryOnly, limits).history).toHaveLength(1);
+		expect(() => bootstrap(framed, limits)).toThrow(CursorBootstrapBudgetError);
 	});
 
 	test("recovers ASCII-heavy tool results under 64k maxTokens without counting host metadata", () => {

@@ -91,6 +91,41 @@ describe("shared tool exec", () => {
 		expect(hostRuns).toBe(1);
 	});
 
+	test("invalid arguments fail once and do not call the host", async () => {
+		let hostRuns = 0;
+		const granted = [{
+			name: "read",
+			description: "read",
+			inputSchema: { type: "object", properties: { count: { type: "integer" } }, required: ["count"], additionalProperties: false },
+		}];
+		const exec = createSharedToolExec(granted, async () => {
+			hostRuns += 1;
+			return { content: [{ type: "text", text: "ok" }], isError: false };
+		}, "run-1");
+		const invalid = { count: { no: true } };
+		await expect(exec.execute("read", invalid, "call-bad")).rejects.toBeInstanceOf(ToolBridgeError);
+		await expect(exec.execute("read", invalid, "call-bad")).rejects.toBeInstanceOf(ToolBridgeError);
+		expect(hostRuns).toBe(0);
+	});
+
+	test("lenient tools keep raw arguments and still reject malformed JSON", async () => {
+		const seen: Record<string, unknown>[] = [];
+		const granted = [{
+			name: "read",
+			description: "read",
+			lenientArgValidation: true,
+			inputSchema: { type: "object", properties: { count: { type: "integer" } }, required: ["count"], additionalProperties: false },
+		}];
+		const exec = createSharedToolExec(granted, async (_name, args) => {
+			seen.push(args);
+			return { content: [{ type: "text", text: "ok" }], isError: false };
+		}, "run-1");
+		await exec.execute("read", { count: { no: true } }, "call-soft");
+		expect(seen).toEqual([{ count: { no: true } }]);
+		await expect(exec.execute("read", { count: 1, __parseError: "bad json", __rawJson: "{" }, "call-parse")).rejects.toBeInstanceOf(ToolBridgeError);
+		expect(seen).toEqual([{ count: { no: true } }]);
+	});
+
 	test("different toolCallIds with identical arguments execute separately", async () => {
 		let hostRuns = 0;
 		const granted = [{ name: "read", description: "read", inputSchema: { type: "object" } }];

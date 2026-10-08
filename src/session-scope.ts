@@ -10,18 +10,76 @@ export interface CursorSessionOwner {
 	sessionFile?: string;
 	sessionId?: string;
 	scopeKey: string;
+	/** Stable resume identity: `session:<id>` or, with no id, `file:<path>`. */
+	persistenceKey?: string;
 	persistent: boolean;
+	/** Exclusive journal writer for the current file (or file-less session id). */
+	writer: boolean;
 	generation: number;
 }
 
 const context = new AsyncLocalStorage<CursorSessionOwner>();
 const owners = new Map<string, CursorSessionOwner>();
-const anonymousOwners = new WeakMap<object, CursorSessionOwner>();
+const managerOwners = new WeakMap<object, CursorSessionOwner>();
+const writers = new Map<string, CursorSessionOwner>();
+const leaseKeys = new WeakMap<CursorSessionOwner, string>();
+const attachedOwners = new WeakSet<CursorSessionOwner>();
 const requestOwner = new AsyncLocalStorage<{ owner?: CursorSessionOwner; generation?: number }>();
 let defaultOwner = createOwner();
 
 function createOwner(sessionId?: string, sessionFile?: string, cwd = process.cwd()): CursorSessionOwner {
-	return { cwd, sessionId, sessionFile, scopeKey: sessionFile ?? `${EPHEMERAL_SESSION_SCOPE_PREFIX}${randomUUID()}`, persistent: false, generation: 0 };
+	return {
+		cwd,
+		sessionId,
+		sessionFile,
+		scopeKey: sessionFile ?? `${EPHEMERAL_SESSION_SCOPE_PREFIX}${randomUUID()}`,
+		persistent: false,
+		writer: false,
+		generation: 0,
+	};
+}
+
+function persistenceKeyFor(sessionId?: string, sessionFile?: string): string | undefined {
+	if (sessionId) return `session:${sessionId}`;
+	if (sessionFile) return `file:${sessionFile}`;
+	return undefined;
+}
+
+/** Writer exclusivity follows the file. File-less sessions lease the session id. */
+function writerLease(sessionId?: string, sessionFile?: string): string | undefined {
+	if (sessionFile) return `file:${sessionFile}`;
+	if (sessionId) return `session:${sessionId}`;
+	return undefined;
+}
+
+function writerScopeKey(sessionId?: string, sessionFile?: string): string {
+	if (sessionFile) return sessionFile;
+	if (sessionId) return `${EPHEMERAL_SESSION_SCOPE_PREFIX}${sessionId}`;
+	return `${EPHEMERAL_SESSION_SCOPE_PREFIX}${randomUUID()}`;
+}
+
+function releaseWriter(owner: CursorSessionOwner): void {
+	const lease = leaseKeys.get(owner);
+	if (lease && writers.get(lease) === owner) writers.delete(lease);
+	leaseKeys.delete(owner);
+	if (owners.get(owner.scopeKey) === owner) owners.delete(owner.scopeKey);
+	owner.writer = false;
+	owner.persistent = false;
+}
+
+function holdLease(owner: CursorSessionOwner, lease: string | undefined): boolean {
+	const current = leaseKeys.get(owner);
+	if (current === lease) return true;
+	const holder = lease ? writers.get(lease) : undefined;
+	if (holder && holder !== owner) return false;
+	if (current && writers.get(current) === owner) writers.delete(current);
+	if (!lease) {
+		leaseKeys.delete(owner);
+		return true;
+	}
+	writers.set(lease, owner);
+	leaseKeys.set(owner, lease);
+	return true;
 }
 
 export function getCursorSessionOwner(): CursorSessionOwner {
@@ -47,20 +105,82 @@ export function ownerForRequest(sessionId?: string, cwd?: string): CursorSession
 export function ownerForContext(ctx: ExtensionContext): CursorSessionOwner {
 	const sessionId = ctx.sessionManager.getSessionId?.();
 	const sessionFile = ctx.sessionManager.getSessionFile?.() ?? undefined;
-	const key = sessionFile ?? (sessionId ? `${EPHEMERAL_SESSION_SCOPE_PREFIX}${sessionId}` : undefined);
-	let owner = key ? owners.get(key) : anonymousOwners.get(ctx.sessionManager);
-	if (!owner || owner.sessionId !== sessionId) {
-		owner = createOwner(sessionId, sessionFile, ctx.cwd);
-		if (key) {
-			owner.scopeKey = key;
-			owners.set(key, owner);
-		} else {
-			anonymousOwners.set(ctx.sessionManager, owner);
-		}
+	const manager = ctx.sessionManager;
+	let owner = managerOwners.get(manager);
+
+	if (owner && owner.sessionId !== sessionId) {
+		owner.generation += 1;
+		releaseWriter(owner);
+		managerOwners.delete(manager);
+		owner = undefined;
 	}
-	owner.cwd = ctx.cwd;
-	owner.persistent = true;
-	return owner;
+
+	if (owner && owner.writer && owner.sessionId === sessionId) {
+		const lease = writerLease(sessionId, sessionFile);
+		if (!holdLease(owner, lease)) releaseWriter(owner);
+		owner.sessionFile = sessionFile;
+		owner.cwd = ctx.cwd;
+		owner.persistenceKey = persistenceKeyFor(sessionId, sessionFile);
+		owner.persistent = owner.writer;
+		return owner;
+	}
+
+	if (owner && !owner.writer) {
+		const lease = writerLease(sessionId, sessionFile);
+		const holder = lease ? writers.get(lease) : undefined;
+		// An unattached lease holder is the authoritative writer. Rebind this manager to it.
+		if (holder && holder !== owner && !attachedOwners.has(holder) && holder.sessionId === sessionId) {
+			attachedOwners.add(holder);
+			holder.sessionFile = sessionFile ?? holder.sessionFile;
+			holder.cwd = ctx.cwd;
+			holder.persistenceKey = persistenceKeyFor(sessionId, sessionFile);
+			holder.persistent = holder.writer;
+			managerOwners.set(manager, holder);
+			return holder;
+		}
+		if (lease && !writers.has(lease)) {
+			owner.writer = true;
+			owner.persistent = true;
+			owner.persistenceKey = persistenceKeyFor(sessionId, sessionFile);
+			owner.scopeKey = writerScopeKey(sessionId, sessionFile);
+			owner.sessionFile = sessionFile;
+			owner.sessionId = sessionId;
+			owner.cwd = ctx.cwd;
+			owner.generation += 1;
+			holdLease(owner, lease);
+			owners.set(owner.scopeKey, owner);
+			return owner;
+		}
+		owner.sessionFile = sessionFile;
+		owner.cwd = ctx.cwd;
+		return owner;
+	}
+
+	const lease = writerLease(sessionId, sessionFile);
+	const holder = lease ? writers.get(lease) : undefined;
+	if (holder && !attachedOwners.has(holder) && holder.sessionId === sessionId) {
+		attachedOwners.add(holder);
+		holder.sessionFile = sessionFile ?? holder.sessionFile;
+		holder.cwd = ctx.cwd;
+		holder.persistenceKey = persistenceKeyFor(sessionId, sessionFile);
+		holder.persistent = holder.writer;
+		managerOwners.set(manager, holder);
+		return holder;
+	}
+
+	const writer = !holder;
+	const created = createOwner(sessionId, sessionFile, ctx.cwd);
+	created.persistenceKey = persistenceKeyFor(sessionId, sessionFile);
+	created.writer = writer;
+	created.persistent = writer;
+	created.scopeKey = writer ? writerScopeKey(sessionId, sessionFile) : `${EPHEMERAL_SESSION_SCOPE_PREFIX}${randomUUID()}`;
+	if (writer) {
+		holdLease(created, lease);
+		owners.set(created.scopeKey, created);
+	}
+	attachedOwners.add(created);
+	managerOwners.set(manager, created);
+	return created;
 }
 
 /** Bind each callback from its actual host context, not the globally registered provider closure. */
@@ -98,8 +218,8 @@ export function registerCursorSessionScope(pi: Pick<ExtensionAPI, "on">): void {
 	});
 	on("session_shutdown", (_event, ctx) => {
 		const owner = getCursorSessionOwner();
-		if (owners.get(owner.scopeKey) === owner) owners.delete(owner.scopeKey);
-		anonymousOwners.delete(ctx.sessionManager);
+		releaseWriter(owner);
+		managerOwners.delete(ctx.sessionManager);
 	});
 }
 
@@ -116,10 +236,19 @@ export const __testUtils = {
 		defaultOwner = createOwner(sessionId, sessionFile, cwd);
 		if (!sessionFile && sessionId) defaultOwner.scopeKey = `${EPHEMERAL_SESSION_SCOPE_PREFIX}${sessionId}`;
 		defaultOwner.persistent = Boolean(sessionFile);
+		defaultOwner.writer = true;
+		defaultOwner.persistenceKey = persistenceKeyFor(sessionId, sessionFile);
+		const lease = writerLease(sessionId, sessionFile);
+		if (lease) {
+			const holder = writers.get(lease);
+			if (holder && holder !== defaultOwner) releaseWriter(holder);
+			holdLease(defaultOwner, lease);
+		}
 		if (sessionFile || sessionId) owners.set(defaultOwner.scopeKey, defaultOwner);
 	},
 	reset() {
 		owners.clear();
+		writers.clear();
 		defaultOwner = createOwner();
 		defaultOwner.scopeKey = ANONYMOUS_SESSION_SCOPE_KEY;
 	},

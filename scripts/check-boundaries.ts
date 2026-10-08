@@ -28,6 +28,10 @@ const deepImportOwners: Record<string, Record<string, readonly string[]>> = {
 	"@oh-my-pi/pi-catalog/compat/taxonomy": {
 		"src/catalog.ts": ["classifyModel"],
 		"src/context.ts": ["classifyModel"],
+		"src/image-budget.ts": ["classifyModel"],
+	},
+	"@oh-my-pi/pi-utils/mime": {
+		"src/image-budget.ts": ["parseImageMetadata"],
 	},
 	"@oh-my-pi/pi-catalog/discovery/cursor-proto": {
 		"src/native-history.ts": ["ConversationStateStructureSchema"],

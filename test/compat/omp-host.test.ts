@@ -282,8 +282,8 @@ describe("OMP 18.3 host compatibility", () => {
 				async send(_message: SDKUserMessage, options?: SendOptions) {
 					const read = options?.local?.customTools?.read;
 					if (!read) throw new Error("Cursor SDK fake did not receive OMP read");
-					const first = read.execute({ path: "owned.txt" }, { toolCallId: "shared-sdk-read" });
-					const duplicate = read.execute({ path: "owned.txt" }, { toolCallId: "shared-sdk-read" });
+					const first = read.execute({ i: "read owned", path: "owned.txt" }, { toolCallId: "shared-sdk-read" });
+					const duplicate = read.execute({ i: "read owned", path: "owned.txt" }, { toolCallId: "shared-sdk-read" });
 					return run(async () => {
 						const results = await Promise.all([first, duplicate]);
 						callbackResults.set(input.cwd, results);
@@ -341,10 +341,10 @@ describe("OMP 18.3 host compatibility", () => {
 					throw new Error("Cursor SDK fake did not receive the requested OMP tools");
 				}
 				const pending = [
-					customTools.read.execute({ path: "source.txt" }, { toolCallId: "read-once" }),
-					customTools.write.execute({ path: "written.txt", content: "written once\n" }, { toolCallId: "write-once" }),
-					customTools.edit.execute({ path: "edited.txt", old_string: "before", new_string: "after" }, { toolCallId: "edit-once" }),
-					customTools.bash.execute({ command: "printf shell-once >> shell.txt" }, { toolCallId: "bash-once" }),
+					customTools.read.execute({ i: "read source", path: "source.txt" }, { toolCallId: "read-once" }),
+					customTools.write.execute({ i: "write file", path: "written.txt", content: "written once\n" }, { toolCallId: "write-once" }),
+					customTools.edit.execute({ i: "edit file", path: "edited.txt", old_string: "before", new_string: "after" }, { toolCallId: "edit-once" }),
+					customTools.bash.execute({ i: "run shell", command: "printf shell-once >> shell.txt" }, { toolCallId: "bash-once" }),
 				];
 				return run(async () => {
 					completed.push(...await Promise.all(pending));
@@ -613,9 +613,9 @@ describe("OMP 18.3 host compatibility", () => {
 				}
 				if (customTools.find) throw new Error("disabled find was granted");
 				const pending = [
-					customTools.read.execute({ path: "wide.txt" }, { toolCallId: "read-wide" }),
-					customTools.read.execute({ path: "dot.png" }, { toolCallId: "read-image" }),
-					customTools.bash.execute({ command: "printf kept" }, { toolCallId: "bash-kept" }),
+					customTools.read.execute({ i: "read wide", path: "wide.txt" }, { toolCallId: "read-wide" }),
+					customTools.read.execute({ i: "read image", path: "dot.png" }, { toolCallId: "read-image" }),
+					customTools.bash.execute({ i: "run shell", command: "printf kept" }, { toolCallId: "bash-kept" }),
 				];
 				return run(async () => {
 					captured.push(...await Promise.all(pending));

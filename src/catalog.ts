@@ -165,7 +165,7 @@ function cursorContextWindowFloor(modelId: string): number | undefined {
 	return undefined;
 }
 
-// ponytail: Local SDK 1.0.32 rejects Grok 4.7 500k; delete when live probe passes.
+// Local SDK 1.0.32 rejects the Grok 4.7 `context=500k` wire param. Keep the 500k metadata and omit the param.
 function isRejectedLocalContext(baseModelId: string, context: string): boolean {
 	return normalizeParamValue(context) === "500k" && /^grok-4\.7($|[-@])/i.test(baseModelId);
 }
@@ -667,11 +667,7 @@ export function buildModelSelection(
 		setParam(params, "fast", options.fastEnabled ? "true" : "false");
 	}
 	const context = getParamValue(params, "context");
-	if (context && isRejectedLocalContext(metadata.baseModelId, context)) {
-		throw new Error(
-			`Cursor Local SDK currently rejects ${metadata.baseModelId} ${context}; disable Extended Context.`,
-		);
-	}
+	if (context && isRejectedLocalContext(metadata.baseModelId, context)) deleteParam(params, "context");
 	return params.length > 0 ? { id: metadata.baseModelId, params } : { id: metadata.baseModelId };
 }
 

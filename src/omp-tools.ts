@@ -6,10 +6,12 @@ export function grantedToolsFromContext(context: Context): GrantedTool[] {
 	const granted: GrantedTool[] = [];
 	for (const tool of context.tools ?? []) {
 		if (tool.native) continue;
+		const lenient = (tool as Tool & { lenientArgValidation?: boolean }).lenientArgValidation === true;
 		granted.push({
 			name: tool.name,
 			description: descriptionFromTool(tool),
 			inputSchema: schemaFromTool(tool),
+			...(lenient ? { lenientArgValidation: true } : {}),
 		});
 	}
 	return granted;
@@ -52,6 +54,27 @@ export function trailingToolResults(context: Context): ToolResultMessage[] {
 		results.unshift(message);
 	}
 	return results;
+}
+
+/**
+ * `toolResult` then trailing `developer` messages are passive context.
+ * A pure tool-result suffix stays resumable; developers alone are not a tool exchange.
+ */
+export function trailingToolExchange(context: Context): { results: ToolResultMessage[]; passive: Context["messages"] } {
+	const messages = context.messages;
+	let end = messages.length;
+	const passive: Context["messages"] = [];
+	while (end > 0 && messages[end - 1]?.role === "developer") {
+		passive.unshift(messages[end - 1]!);
+		end -= 1;
+	}
+	const results: ToolResultMessage[] = [];
+	while (end > 0 && messages[end - 1]?.role === "toolResult") {
+		results.unshift(messages[end - 1] as ToolResultMessage);
+		end -= 1;
+	}
+	if (passive.length === 0 || results.length === 0) return { results: trailingToolResults(context), passive: [] };
+	return { results, passive };
 }
 
 export function toolResultToHost(result: ToolResultMessage): HostToolResult {

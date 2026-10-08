@@ -16,12 +16,12 @@ import {
 	setLiveRun,
 	type LiveRun,
 } from "./live-run.js";
-import { trailingToolResults } from "./omp-tools.js";
+import { trailingToolExchange } from "./omp-tools.js";
 import { withSdkExitSuppressed } from "./sdk-exit-guard.js";
 import { openAgent, prewarmLocalExecutor, type OpenAgentInput } from "./sdk-session.js";
 import { flushResumeHandleNow, getMatchingResumeHandle, persistResumeHandle, type ResumeStoreIdentity } from "./session-resume.js";
 import { getCursorSessionCwd, getCursorSessionOwner, getCursorSessionScopeKey, withCursorSessionOwner, type CursorSessionOwner } from "./session-scope.js";
-import { openScopedJsonlStore, storeRootForScope } from "./store.js";
+import { openScopedJsonlStore, openStoreAt, resolveStoreRoot, storeRootForScope } from "./store.js";
 import { buildCustomTools, buildToolContract, estimateFormalToolDefinitionTokens, newBridgeRunId } from "./tools.js";
 import { ompToolCallId } from "./projector.js";
 
@@ -42,7 +42,6 @@ export interface RuntimeSlot {
 	preparation?: AbortController;
 	/**
 	 * In-process consumption proof kept from prepare through the first `agent.send()` entry.
-	 * Covers tool-fingerprint rebuilds (memory or journal) that fail or cancel before send.
 	 * Validated against cwd + credential on the next prepare; never authorizes agent reuse.
 	 * Cleared only when send actually starts, or when identity/session invalidation drops it.
 	 */
@@ -333,16 +332,19 @@ export async function prepareTurn(input: OpenRuntimeTurnInput): Promise<Prepared
 	const toolContract = buildToolContract(input.grantedTools);
 	let slot = getOrCreateSlot(scopeKey, input.agentInstanceId, cwd);
 	const existingLive = getLiveRun(slot.key);
-	const trailing = trailingToolResults(input.context);
+	const exchange = trailingToolExchange(input.context);
+	const trailing = exchange.results;
+	const passive = exchange.passive;
 	const parkedByOmpId = existingLive
 		? new Map(existingLive.parked.map((call) => [call.ompToolCallId, call]))
 		: undefined;
-	const continuing = Boolean(
+	const parkedMatch = Boolean(
 		existingLive
 		&& trailing.length > 0
 		&& trailing.every((result) => parkedByOmpId?.get(result.toolCallId)?.name === result.toolName),
 	);
-	if (existingLive && trailing.length > 0 && !continuing) {
+	const continuing = parkedMatch && passive.length === 0;
+	if (existingLive && trailing.length > 0 && !parkedMatch) {
 		const ownsContinuation = existingLive.requestLocator
 			? findUniqueMessageIndex(input.context.messages, existingLive.requestLocator) !== undefined
 			: false;
@@ -371,15 +373,11 @@ export async function prepareTurn(input: OpenRuntimeTurnInput): Promise<Prepared
 
 	slot.sendStarted = false;
 	const identityMismatch = agentConfigMismatch(slot, cwd, nextCredential);
-	const toolMismatch = Boolean(slot.agent) && slot.toolContractFingerprint !== toolContract.fingerprint;
-	const unsafeBinding = Boolean(slot.agent) && (slot.bindingState !== "committed" || identityMismatch || toolMismatch);
-	// Tool-fingerprint-only rebuild: keep journal committed consumption until a new binding is sent.
-	const toolFingerprintRebuild = toolMismatch && !identityMismatch && slot.bindingState === "committed";
-	// Agent reuse requires an exact tool-contract fingerprint match.
+	// Per-send local.customTools already carry the current catalog. Parked runs still freeze the contract above.
+	const unsafeBinding = Boolean(slot.agent) && (slot.bindingState !== "committed" || identityMismatch);
 	const resumeHandle = unsafeBinding
 		? undefined
-		: getMatchingResumeHandle(input.agentInstanceId, nextCredential, cwd, toolContract.fingerprint);
-	// Consumed-input identity is separate: keep sendState across tool-fingerprint-only rebuilds.
+		: getMatchingResumeHandle(input.agentInstanceId, nextCredential, cwd);
 	const consumptionHandle = getMatchingResumeHandle(input.agentInstanceId, nextCredential, cwd);
 	const preservedSendState = (
 		Boolean(slot.agent)
@@ -397,9 +395,11 @@ export async function prepareTurn(input: OpenRuntimeTurnInput): Promise<Prepared
 			?? memoryConsumption
 			?? emptySendState();
 	})();
-	let plan = trailing.length > 0
-		? { mode: "bootstrap" as const, resetAgent: true, reason: "context_divergence" as const }
-		: planSend(sendState, input.context);
+	let plan = passive.length > 0
+		? { mode: "bootstrap" as const, resetAgent: true, continueOnly: true as const, reason: "context_divergence" as const }
+		: trailing.length > 0
+			? { mode: "bootstrap" as const, resetAgent: true, reason: "context_divergence" as const }
+			: planSend(sendState, input.context);
 	const willReuseAgent = (Boolean(slot.agent) && !unsafeBinding) || Boolean(resumeHandle);
 	if (!willReuseAgent && plan.mode === "incremental") {
 		// Re-import natively; keep continueOnly so consumed input is not resent.
@@ -431,13 +431,8 @@ export async function prepareTurn(input: OpenRuntimeTurnInput): Promise<Prepared
 	};
 	try {
 		if (unsafeBinding) {
-			if (toolFingerprintRebuild) {
-				stashPreSendConsumption(slot, preservedSendState ?? slot.sendState, cwd, nextCredential);
-				void disposeAgentKeepJournalConsumption(slot);
-			} else {
-				clearPreSendConsumption(slot);
-				void persistDirtyAndDisposeAgent(slot);
-			}
+			clearPreSendConsumption(slot);
+			void persistDirtyAndDisposeAgent(slot);
 		}
 		if (existingLive) {
 			await disposeLiveRun(slot.key, "OMP started a new user turn", false);
@@ -467,13 +462,8 @@ export async function prepareTurn(input: OpenRuntimeTurnInput): Promise<Prepared
 		}
 		if (plan.resetAgent) {
 			if (slot.agent) {
-				if (toolFingerprintRebuild) {
-					stashPreSendConsumption(slot, preservedSendState ?? slot.sendState, cwd, nextCredential);
-					void disposeAgentKeepJournalConsumption(slot);
-				} else {
-					clearPreSendConsumption(slot);
-					void persistDirtyAndDisposeAgent(slot);
-				}
+				clearPreSendConsumption(slot);
+				void persistDirtyAndDisposeAgent(slot);
 			} else if (resumeHandle) {
 				clearPreSendConsumption(slot);
 				persistDirtyHandle(slot, resumeHandle);
@@ -483,14 +473,16 @@ export async function prepareTurn(input: OpenRuntimeTurnInput): Promise<Prepared
 				slot.toolContractFingerprint = undefined;
 				slot.sendState = emptySendState();
 			}
-			// Tool-fingerprint-only rebuild from a journal committed handle: do not dirty it
-			// before send. A failed open must still be able to read consumption on retry.
 		}
 
 		const savedAgentId = slot.agent?.agentId ?? (slot.bindingState === "committed" ? resumeHandle?.agentId : undefined);
-		if (!slot.store) slot.store = openScopedJsonlStore(cwd, scopeKey);
+		if (!slot.store) {
+			const journalRoot = resumeHandle?.storeIdentity?.stateRoot ?? slot.storeIdentity.stateRoot;
+			const stateRoot = resolveStoreRoot(cwd, scopeKey, journalRoot);
+			slot.store = openStoreAt(stateRoot);
+			slot.storeIdentity = { version: 1, stateRoot };
+		}
 		const store = slot.store;
-		slot.storeIdentity = { version: 1, stateRoot: storeRootForScope(cwd, scopeKey) };
 
 		const reuseId = savedAgentId ?? slot.agent?.agentId;
 		if (reuseId) {
@@ -500,7 +492,7 @@ export async function prepareTurn(input: OpenRuntimeTurnInput): Promise<Prepared
 		const live = createLiveRun(createSharedToolExec(input.grantedTools, async () => {
 			throw new Error("tool executor is not attached");
 		}, newBridgeRunId()));
-		const requestMessage = input.context.messages.at(-trailing.length - 1);
+		const requestMessage = input.context.messages.at(-passive.length - trailing.length - 1);
 		live.requestLocator = requestMessage ? locatorFor(requestMessage) : undefined;
 		const toolExec = attachParkExecutor(live, input.grantedTools, input.host);
 		const customTools = buildCustomTools(toolContract, toolExec.execute);
@@ -551,7 +543,7 @@ export async function prepareTurn(input: OpenRuntimeTurnInput): Promise<Prepared
 		if (slots.get(slot.key) === slot) {
 			// Pre-send tool rebuild: dispose without journaling dirty over committed consumption,
 			// and keep an identity-checked in-memory proof for same-process retry without a journal.
-			if (toolFingerprintRebuild || (!resumeHandle && !identityMismatch && (consumptionHandle || preservedSendState || slot.preSendConsumption))) {
+			if (!resumeHandle && !identityMismatch && (consumptionHandle || preservedSendState || slot.preSendConsumption)) {
 				const consumption = preservedSendState
 					?? (consumptionHandle ? { ...consumptionHandle.sendState } : undefined)
 					?? matchingPreSendConsumption(slot, cwd, nextCredential)

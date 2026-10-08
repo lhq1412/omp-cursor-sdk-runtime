@@ -9,6 +9,8 @@ export interface GrantedTool {
 	name: string;
 	description: string;
 	inputSchema: Record<string, unknown>;
+	/** Schema mismatches pass raw arguments through. Malformed JSON still fails. */
+	lenientArgValidation?: boolean;
 }
 
 export interface HostSnapshotV1 {
