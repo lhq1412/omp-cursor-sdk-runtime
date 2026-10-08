@@ -68,6 +68,14 @@ export function setLiveRun(key: string, run: LiveRun): void {
 	liveRuns.set(key, run);
 }
 
+export function moveLiveRun(fromKey: string, toKey: string): void {
+	if (fromKey === toKey || liveRuns.has(toKey)) return;
+	const live = liveRuns.get(fromKey);
+	if (!live) return;
+	liveRuns.delete(fromKey);
+	liveRuns.set(toKey, live);
+}
+
 export function createLiveRun(toolExec: SharedToolExec): LiveRun {
 	return {
 		wait: new Promise<RunResult>(() => undefined),

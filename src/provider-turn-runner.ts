@@ -202,6 +202,7 @@ export class ProviderTurnRunner {
 			modelSelection = selectionForTurn(model, this.apiKey, options);
 		}
 		this.assertCurrent();
+		const turnHost = this.auxiliary ? undefined : host;
 		const prepared = await prepareTurn({
 			cwd,
 			agentInstanceId,
@@ -210,7 +211,7 @@ export class ProviderTurnRunner {
 			modelLimits: { contextWindow: model.contextWindow, maxTokens: model.maxTokens },
 			context: this.context,
 			grantedTools,
-			host,
+			host: turnHost,
 			signal: this.abortSignal,
 		});
 		this.slot = prepared.slot;
@@ -222,7 +223,7 @@ export class ProviderTurnRunner {
 				if (!preview.ended) prepared.live.projection.previews.delete(id);
 			}
 		}
-		return { ...prepared, cwd, agentInstanceId, host, snapshot, modelSelection };
+		return { ...prepared, cwd, agentInstanceId, host: turnHost, snapshot, modelSelection };
 	}
 
 	private async sendTurn(prepared: PreparedProviderTurn): Promise<void> {

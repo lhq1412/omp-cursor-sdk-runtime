@@ -2,11 +2,12 @@ import { appendFileSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { describe, expect, test } from "bun:test";
+import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import type { Context } from "@oh-my-pi/pi-ai";
 import type { SDKAgent } from "@cursor/sdk";
 import type { GrantedTool, HostToolResult } from "../../src/contracts.ts";
 import { credentialScopeId } from "../../src/auth.ts";
-import { computeContextFingerprint } from "../../src/context.ts";
+import { computeContextFingerprint, locatorFor } from "../../src/context.ts";
 import { CURSOR_SESSION_AGENT_RESUME_ENTRY_TYPE } from "../../src/constants.ts";
 import {
 	prepareTurn,
@@ -17,11 +18,14 @@ import {
 	disposeRuntimeForScope,
 	invalidateRuntime,
 	agentConfigMismatch,
+	warmLocalExecutor,
 	__testUtils as runtimeTestUtils,
 	type PreparedTurn,
 } from "../../src/session-runtime.ts";
 import { getLiveRun, __testUtils as liveRunTestUtils } from "../../src/live-run.ts";
-import { __testUtils as scopeTestUtils, getCursorSessionOwner, ownerForRequest, withCursorSessionOwner } from "../../src/session-scope.ts";
+import { registerCursorSessionLifecycle } from "../../src/session-lifecycle.ts";
+import { buildAgentOptions } from "../../src/sdk-session.ts";
+import { __testUtils as scopeTestUtils, getCursorSessionOwner, ownerForContext, ownerForRequest, registerCursorSessionScope, withCursorSessionOwner } from "../../src/session-scope.ts";
 import { parseResumeEntryData, registerCursorSessionResume, __testUtils as resumeTestUtils } from "../../src/session-resume.ts";
 import { buildToolContract } from "../../src/tools.ts";
 import { createFakeHost } from "../helpers/fake-host.ts";
@@ -1623,5 +1627,282 @@ describe("session runtime", () => {
 			grantedTools: granted("read"), });
 		expect(opened).toHaveLength(1);
 		expect(next.continuing).toBe(true);
+	});
+
+	test("resumes the same agent with mcp when an empty grant becomes non-empty", async () => {
+		runtimeTestUtils.clear();
+		liveRunTestUtils.clear();
+		scopeTestUtils.reset();
+		resumeTestUtils.reset();
+		registerResume();
+		const opens: Array<{ savedAgentId?: string; tools: string[]; mcp: boolean }> = [];
+		runtimeTestUtils.setOpenAgent(async (input) => {
+			opens.push({
+				savedAgentId: input.savedAgentId,
+				tools: Object.keys(input.customTools),
+				mcp: (buildAgentOptions(input).tools ?? []).includes("mcp"),
+			});
+			return fakeAgent(input.savedAgentId ?? "agent-empty");
+		});
+		const firstContext = userContext("first");
+		const first = await prepareTurn({
+			modelLimits, cwd: "/tmp/project", agentInstanceId: "main", apiKey: "test-key",
+			modelSelection: { id: "composer-2.5" }, context: firstContext, grantedTools: [],
+		});
+		commitTurn(first.slot, firstContext, first.incremental);
+		const secondContext = {
+			messages: [...firstContext.messages, { role: "user", content: "read it", timestamp: 2 }],
+		} as Context;
+		const second = await prepareTurn({
+			modelLimits, cwd: "/tmp/project", agentInstanceId: "main", apiKey: "test-key",
+			modelSelection: { id: "composer-2.5" }, context: secondContext, grantedTools: granted("read"),
+		});
+		expect(opens).toEqual([
+			{ savedAgentId: undefined, tools: [], mcp: false },
+			{ savedAgentId: "agent-empty", tools: ["read"], mcp: true },
+		]);
+		expect(second.incremental).toBe(true);
+		expect(second.prompt?.text).toContain("read it");
+		expect(second.slot.agent?.agentId).toBe("agent-empty");
+	});
+
+	test("a late result of the previous call does not cancel the passive rebuild", async () => {
+		runtimeTestUtils.clear();
+		liveRunTestUtils.clear();
+		scopeTestUtils.reset();
+		resumeTestUtils.reset();
+		registerResume();
+		let nextAgent = 0;
+		runtimeTestUtils.setOpenAgent(async (input) => fakeAgent(input.savedAgentId ?? `agent-${++nextAgent}`));
+		const tools = granted("read");
+		const first = await prepareTurn({
+			modelLimits, cwd: "/tmp/project", agentInstanceId: "main", apiKey: "key-a",
+			modelSelection: { id: "composer-2.5" }, context: userContext("first"), grantedTools: tools,
+		});
+		seedParkedRead(first);
+		const developer = { role: "developer", content: [{ type: "text", text: "additional context from the tool" }], timestamp: 4 };
+		const passive = {
+			messages: [
+				{ role: "user", content: "first", timestamp: 1 },
+				{ role: "assistant", content: [{ type: "toolCall", id: "call-1", name: "read", arguments: { path: "a.ts" } }], timestamp: 2 },
+				{ role: "toolResult", toolCallId: "call-1", toolName: "read", content: [{ type: "text", text: "file contents" }], isError: false, timestamp: 3 },
+				developer,
+			],
+		} as Context;
+		const rebuilt = await prepareTurn({
+			modelLimits, cwd: "/tmp/project", agentInstanceId: "main", apiKey: "key-a",
+			modelSelection: { id: "composer-2.5" }, context: passive, grantedTools: tools,
+		});
+		expect(rebuilt.live.requestLocator).toEqual(locatorFor(developer));
+		rebuilt.live.parked.push({
+			name: "read",
+			args: { path: "b.ts" },
+			sdkToolCallId: "sdk-call-b",
+			ompToolCallId: "call-b",
+			yielded: true,
+			resolve() {},
+			reject() {},
+		});
+		const late = {
+			messages: [
+				passive.messages[0],
+				passive.messages[1],
+				{ role: "toolResult", toolCallId: "call-1", toolName: "read", content: [{ type: "text", text: "late" }], isError: false, timestamp: 5 },
+			],
+		} as Context;
+		await expect(prepareTurn({
+			modelLimits, cwd: "/tmp/project", agentInstanceId: "main", apiKey: "key-a",
+			modelSelection: { id: "composer-2.5" }, context: late, grantedTools: tools,
+		})).rejects.toThrow(/do not match/);
+		expect(getLiveRun(rebuilt.slot.key)).toBe(rebuilt.live);
+		expect(rebuilt.live.cancelled).toBe(false);
+		expect(rebuilt.slot.agent?.agentId).toBe("agent-2");
+		expect(rebuilt.slot.bindingState).not.toBe("dirty");
+	});
+
+	test("a rollover in-flight record does not resume the already advanced agent", async () => {
+		runtimeTestUtils.clear();
+		liveRunTestUtils.clear();
+		scopeTestUtils.reset();
+		resumeTestUtils.reset();
+		const { handlers, ctx, branch, sessionFile } = registerResume();
+		const committed = {
+			version: 5,
+			runtime: "local",
+			agentId: "agent-advanced",
+			scopeKey: "/tmp/original.jsonl",
+			sessionFile: "/tmp/original.jsonl",
+			sessionId: "sess-1",
+			cwd: "/tmp/project",
+			poolKey: "main",
+			branchPathHash: resumeTestUtils.EMPTY_BRANCH_HASH,
+			compactionGeneration: 0,
+			sendState: { bootstrapped: true, contextFingerprint: "fp", incrementalSendCount: 1 },
+			createdAt: "2026-09-08T00:00:00.000Z",
+			storeIdentity: { version: 1, stateRoot: "/tmp/store" },
+			state: "committed",
+			agentInstanceId: "main",
+			credentialScopeId: credentialScopeId("test-key"),
+			persistenceId: "write-old",
+			toolContractFingerprint: buildToolContract([]).fingerprint,
+		};
+		const inflight = {
+			...committed,
+			scopeKey: "/tmp/rolled.jsonl",
+			sessionFile: "/tmp/rolled.jsonl",
+			state: "in-flight",
+			sendState: { bootstrapped: false, contextFingerprint: "", incrementalSendCount: 0 },
+			persistenceId: "write-new",
+		};
+		branch.push({
+			type: "custom",
+			id: "r1",
+			parentId: null,
+			customType: CURSOR_SESSION_AGENT_RESUME_ENTRY_TYPE,
+			data: committed,
+		});
+		ctx.sessionManager.getEntries = () => [
+			...branch,
+			{
+				type: "custom",
+				id: "r2",
+				parentId: "r1",
+				customType: CURSOR_SESSION_AGENT_RESUME_ENTRY_TYPE,
+				data: inflight,
+			},
+		];
+		await handlers.get("before_agent_start")?.[0]?.({ type: "before_agent_start" }, ctx);
+		const opens: Array<string | undefined> = [];
+		runtimeTestUtils.setOpenAgent(async (input) => {
+			opens.push(input.savedAgentId);
+			return fakeAgent(input.savedAgentId ?? "agent-fresh");
+		});
+		const prepared = await prepareTurn({
+			modelLimits, cwd: "/tmp/project", agentInstanceId: "main", apiKey: "test-key",
+			modelSelection: { id: "composer-2.5" }, context: userContext("back on the old branch"), grantedTools: [],
+		});
+		expect(sessionFile).not.toBe("");
+		expect(opens).toEqual([undefined]);
+		expect(prepared.incremental).toBe(false);
+		expect(prepared.slot.agent?.agentId).toBe("agent-fresh");
+	});
+});
+
+function scopeEventBus(): { fire(event: string, ctx: ExtensionContext): Promise<void> } {
+	const handlers = new Map<string, Array<(event: never, ctx: ExtensionContext) => unknown>>();
+	const pi = {
+		on(event: string, handler: (event: never, ctx: ExtensionContext) => unknown) {
+			const list = handlers.get(event) ?? [];
+			list.push(handler);
+			handlers.set(event, list);
+		},
+	} as Pick<ExtensionAPI, "on">;
+	registerCursorSessionLifecycle(pi);
+	registerCursorSessionScope(pi);
+	return {
+		async fire(event, ctx) {
+			for (const handler of handlers.get(event) ?? []) await handler(event as never, ctx);
+		},
+	};
+}
+
+describe("session scope runtime ownership", () => {
+	function disposableAgent(id: string, disposed: string[]): SDKAgent {
+		return {
+			agentId: id,
+			close() {},
+			async [Symbol.asyncDispose]() { disposed.push(id); },
+			send() { throw new Error("send() should not run in prepareTurn tests"); },
+		} as unknown as SDKAgent;
+	}
+
+	test("shutting down the old file does not dispose the rolled owner's agent", async () => {
+		runtimeTestUtils.clear();
+		liveRunTestUtils.clear();
+		scopeTestUtils.reset();
+		resumeTestUtils.reset();
+		const disposed: string[] = [];
+		let next = 0;
+		runtimeTestUtils.setOpenAgent(async () => disposableAgent(`agent-${++next}`, disposed));
+		const events = scopeEventBus();
+		let file = "/tmp/original.jsonl";
+		const managerA = {
+			cwd: "/tmp/project",
+			sessionManager: { getSessionFile: () => file, getSessionId: () => "sess-roll" },
+		} as ExtensionContext;
+		await events.fire("before_provider_request", managerA);
+		const ownerA = ownerForContext(managerA);
+		await withCursorSessionOwner(ownerA, () => prepareTurn({
+			modelLimits, cwd: "/tmp/project", agentInstanceId: "main", apiKey: "test-key",
+			modelSelection: { id: "composer-2.5" }, context: userContext("live"), grantedTools: [],
+		}));
+		file = "/tmp/rolled.jsonl";
+		await events.fire("before_provider_request", managerA);
+		expect(ownerA.scopeKey).toBe("/tmp/rolled.jsonl");
+		expect([...runtimeTestUtils.slots.values()].some((slot) => slot.owner === ownerA && slot.scopeKey === "/tmp/rolled.jsonl" && slot.agent?.agentId === "agent-1")).toBe(true);
+		const managerB = {
+			cwd: "/tmp/project",
+			sessionManager: { getSessionFile: () => "/tmp/original.jsonl", getSessionId: () => "sess-other" },
+		} as ExtensionContext;
+		await events.fire("before_provider_request", managerB);
+		expect(ownerForContext(managerB).scopeKey).toBe("/tmp/original.jsonl");
+		expect(ownerForContext(managerB)).not.toBe(ownerA);
+		await events.fire("session_shutdown", managerB);
+		expect(disposed).toEqual([]);
+		expect([...runtimeTestUtils.slots.values()].some((slot) => slot.owner === ownerA && slot.agent?.agentId === "agent-1")).toBe(true);
+		scopeTestUtils.reset();
+	});
+
+	test("promoting a nonwriter moves its agent and executor so shutdown can release them", async () => {
+		runtimeTestUtils.clear();
+		liveRunTestUtils.clear();
+		scopeTestUtils.reset();
+		resumeTestUtils.reset();
+		const disposed: string[] = [];
+		let next = 0;
+		runtimeTestUtils.setOpenAgent(async () => disposableAgent(`agent-${++next}`, disposed));
+		const events = scopeEventBus();
+		const file = "/tmp/shared.jsonl";
+		const managerA = {
+			cwd: "/tmp/project",
+			sessionManager: { getSessionFile: () => file, getSessionId: () => "sess" },
+		} as ExtensionContext;
+		const managerB = {
+			cwd: "/tmp/project",
+			sessionManager: { getSessionFile: () => file, getSessionId: () => "sess" },
+		} as ExtensionContext;
+		await events.fire("before_provider_request", managerA);
+		const ownerA = ownerForContext(managerA);
+		await withCursorSessionOwner(ownerA, () => prepareTurn({
+			modelLimits, cwd: "/tmp/project", agentInstanceId: "main", apiKey: "test-key",
+			modelSelection: { id: "composer-2.5" }, context: userContext("writer"), grantedTools: [],
+		}));
+		await events.fire("before_provider_request", managerB);
+		const ownerB = ownerForContext(managerB);
+		expect(ownerB.writer).toBe(false);
+		const ephemeral = ownerB.scopeKey;
+		expect(ephemeral).not.toBe(file);
+		await withCursorSessionOwner(ownerB, async () => {
+			warmLocalExecutor("/tmp/project", "test-key", "composer-2.5");
+			await prepareTurn({
+				modelLimits, cwd: "/tmp/project", agentInstanceId: "main", apiKey: "test-key",
+				modelSelection: { id: "composer-2.5" }, context: userContext("nonwriter"), grantedTools: [],
+			});
+		});
+		expect(runtimeTestUtils.executorLeases.has(ephemeral)).toBe(true);
+		await events.fire("session_shutdown", managerA);
+		expect(disposed).toEqual(["agent-1"]);
+		await events.fire("before_provider_request", managerB);
+		expect(ownerB.writer).toBe(true);
+		expect(ownerB.scopeKey).toBe(file);
+		expect([...runtimeTestUtils.slots.values()].some((slot) => slot.scopeKey === ephemeral)).toBe(false);
+		expect(runtimeTestUtils.executorLeases.has(ephemeral)).toBe(false);
+		expect(runtimeTestUtils.executorLeases.has(file)).toBe(true);
+		expect([...runtimeTestUtils.slots.values()].some((slot) => slot.owner === ownerB && slot.scopeKey === file && slot.agent?.agentId === "agent-2")).toBe(true);
+		await events.fire("session_shutdown", managerB);
+		expect(disposed).toEqual(["agent-1", "agent-2"]);
+		expect([...runtimeTestUtils.slots.values()].some((slot) => slot.owner === ownerB)).toBe(false);
+		expect(runtimeTestUtils.executorLeases.size).toBe(0);
+		scopeTestUtils.reset();
 	});
 });

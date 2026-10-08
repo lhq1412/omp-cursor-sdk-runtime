@@ -772,6 +772,55 @@ describe("streamCursorRuntime model selection", () => {
 		scopeTestUtils.reset();
 	});
 
+	test("a side turn does not commit its agent onto the main host binding", async () => {
+		const opened: string[] = [];
+		runtimeTestUtils.setOpenAgent(async () => {
+			const agentId = opened.length === 0 ? "agent-1" : "agent-2";
+			opened.push(agentId);
+			return {
+				agentId,
+				close() {},
+				async [Symbol.asyncDispose]() {},
+				async send() { return finishedRun(); },
+			} as unknown as SDKAgent;
+		});
+		scopeTestUtils.set("/tmp/project", "/tmp/parent.jsonl", "parent");
+		const host = createFakeHost({ cwd: "/tmp/project", sessionId: "parent", tools: ["read"] });
+		const mainEvents = [];
+		for await (const event of streamCursorRuntime(cursorModel("composer-2.5", 200_000), userContext("main turn"), {
+			apiKey: "test-key",
+			cwd: "/tmp/project",
+			sessionId: "parent",
+			onPayload: () => { scopeTestUtils.bindRequest(); },
+			[HOST_BRIDGE_OPTION_KEY]: host,
+		} as SimpleStreamOptions)) {
+			mainEvents.push(event);
+		}
+		expect(mainEvents.at(-1)).toMatchObject({ type: "done", reason: "stop" });
+		expect(host.bindings.map((binding) => binding.sdkAgentId)).toEqual(["agent-1"]);
+		const reminded = userContext("what is going on?");
+		reminded.messages.unshift({
+			role: "developer",
+			content: [{ type: "text", text: "Ephemeral side-channel turn; reuses current conversation context." }],
+			timestamp: 0,
+		});
+		const sideEvents = [];
+		for await (const event of streamCursorRuntime(cursorModel("composer-2.5", 200_000), reminded, {
+			apiKey: "test-key",
+			cwd: "/tmp/project",
+			sessionId: "parent:side:9",
+			onPayload: () => { scopeTestUtils.bindRequest(); },
+			[HOST_BRIDGE_OPTION_KEY]: host,
+		} as SimpleStreamOptions)) {
+			sideEvents.push(event);
+		}
+		expect(sideEvents.at(-1)).toMatchObject({ type: "done", reason: "stop" });
+		expect(opened).toEqual(["agent-1", "agent-2"]);
+		expect(host.bindings.map((binding) => binding.sdkAgentId)).toEqual(["agent-1"]);
+		expect([...runtimeTestUtils.slots.values()].some((slot) => slot.scopeKey === "/tmp/parent.jsonl" && slot.agent?.agentId === "agent-1")).toBe(true);
+		scopeTestUtils.reset();
+	});
+
 	test.each(["disableReasoning", "forceReasoningOff"] as const)("%s wins over reasoning and still uses catalog context threshold", async (offOption) => {
 		const created: ModelSelection[] = [];
 		const sent: ModelSelection[] = [];

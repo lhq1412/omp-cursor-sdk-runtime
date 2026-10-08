@@ -463,6 +463,28 @@ describe("session resume fold", () => {
 		scopeTestUtils.reset();
 	});
 
+	test("a rollover in-flight record supersedes the committed handle from the previous file", () => {
+		const user = message("u1", null, "user");
+		const afterUser = hashBranchStep(EMPTY_BRANCH_HASH, user);
+		const committed = validData({
+			branchPathHash: afterUser,
+			state: "committed",
+			sessionFile: "/tmp/original.jsonl",
+			scopeKey: "/tmp/original.jsonl",
+		});
+		const inflight = validData({
+			branchPathHash: afterUser,
+			state: "in-flight",
+			sessionFile: "/tmp/rolled.jsonl",
+			scopeKey: "/tmp/rolled.jsonl",
+		});
+		const r1 = resume("r1", "u1", committed);
+		const r2 = resume("r2", "u1", inflight);
+		const fold = foldResumeHandle([user, r1], scope, new Set(), [user, r1, r2]);
+		expect(fold.activeHandle).toBeUndefined();
+		expect(foldResumeHandle([user, r1], { ...scope, sessionFile: "/tmp/original.jsonl", scopeKey: "/tmp/original.jsonl" }, new Set(), [user, r1, r2]).activeHandle).toBeUndefined();
+	});
+
 	test("a later in-flight record supersedes an older committed handle on the same lineage", () => {
 		const user = message("u1", null, "user");
 		const afterUser = hashBranchStep(EMPTY_BRANCH_HASH, user);

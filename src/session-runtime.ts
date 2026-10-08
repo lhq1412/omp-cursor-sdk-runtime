@@ -12,6 +12,7 @@ import {
 	disposeLiveRun,
 	getLiveRun,
 	liveRunKey,
+	moveLiveRun,
 	parkToolCall,
 	setLiveRun,
 	type LiveRun,
@@ -20,7 +21,7 @@ import { trailingToolExchange } from "./omp-tools.js";
 import { withSdkExitSuppressed } from "./sdk-exit-guard.js";
 import { openAgent, prewarmLocalExecutor, type OpenAgentInput } from "./sdk-session.js";
 import { flushResumeHandleNow, getMatchingResumeHandle, persistResumeHandle, type ResumeStoreIdentity } from "./session-resume.js";
-import { getCursorSessionCwd, getCursorSessionOwner, getCursorSessionScopeKey, withCursorSessionOwner, type CursorSessionOwner } from "./session-scope.js";
+import { getCursorSessionCwd, getCursorSessionOwner, getCursorSessionScopeKey, setCursorScopeRekeyHandler, withCursorSessionOwner, type CursorSessionOwner } from "./session-scope.js";
 import { openScopedJsonlStore, openStoreAt, resolveStoreRoot, storeRootForScope } from "./store.js";
 import { buildCustomTools, buildToolContract, estimateFormalToolDefinitionTokens, newBridgeRunId } from "./tools.js";
 import { ompToolCallId } from "./projector.js";
@@ -34,6 +35,8 @@ export interface RuntimeSlot {
 	createCwd?: string;
 	credentialScopeId?: string;
 	toolContractFingerprint?: string;
+	/** SDK 1.0.32 freezes the tool allowlist at create/resume. Empty grants omit `mcp`. */
+	sdkMcpEnabled?: boolean;
 	agent?: SDKAgent;
 	sendState: SendState;
 	bindingState: BindingState;
@@ -80,6 +83,26 @@ export function warmLocalExecutor(cwd: string, apiKey: string, modelId: string, 
 	release.catch(() => undefined);
 	executorLeases.set(scopeKey, { fingerprint, release });
 }
+
+export function rekeyRuntimeScope(owner: CursorSessionOwner, fromScope: string, toScope: string): void {
+	if (fromScope === toScope) return;
+	for (const [key, slot] of [...slots.entries()]) {
+		if (slot.owner !== owner || slot.scopeKey !== fromScope) continue;
+		const nextKey = liveRunKey(toScope, slot.agentInstanceId);
+		if (slots.has(nextKey) && slots.get(nextKey) !== slot) continue;
+		slots.delete(key);
+		moveLiveRun(key, nextKey);
+		slot.scopeKey = toScope;
+		slot.key = nextKey;
+		slots.set(nextKey, slot);
+	}
+	if (executorLeases.has(fromScope) && !executorLeases.has(toScope)) {
+		executorLeases.set(toScope, executorLeases.get(fromScope)!);
+		executorLeases.delete(fromScope);
+	}
+}
+
+setCursorScopeRekeyHandler(rekeyRuntimeScope);
 
 function releaseExecutorLease(scopeKey: string): Promise<void> {
 	const lease = executorLeases.get(scopeKey);
@@ -475,7 +498,17 @@ export async function prepareTurn(input: OpenRuntimeTurnInput): Promise<Prepared
 			}
 		}
 
-		const savedAgentId = slot.agent?.agentId ?? (slot.bindingState === "committed" ? resumeHandle?.agentId : undefined);
+		let mcpResumeId: string | undefined;
+		if (slot.agent && slot.sdkMcpEnabled !== true && input.grantedTools.length > 0) {
+			mcpResumeId = slot.agent.agentId;
+			const retiring = slot.agent;
+			slot.agent = undefined;
+			await disposeLiveRun(slot.key, "SDK tool capability changed", false);
+			await disposeAgent(retiring);
+		}
+		const savedAgentId = mcpResumeId
+			?? slot.agent?.agentId
+			?? (slot.bindingState === "committed" ? resumeHandle?.agentId : undefined);
 		if (!slot.store) {
 			const journalRoot = resumeHandle?.storeIdentity?.stateRoot ?? slot.storeIdentity.stateRoot;
 			const stateRoot = resolveStoreRoot(cwd, scopeKey, journalRoot);
@@ -492,7 +525,11 @@ export async function prepareTurn(input: OpenRuntimeTurnInput): Promise<Prepared
 		const live = createLiveRun(createSharedToolExec(input.grantedTools, async () => {
 			throw new Error("tool executor is not attached");
 		}, newBridgeRunId()));
-		const requestMessage = input.context.messages.at(-passive.length - trailing.length - 1);
+		// Passive rebuild must be addressed by its own developer message. Pointing the
+		// locator at the previous assistant makes a late result of that call cancel this run.
+		const requestMessage = passive.length > 0
+			? input.context.messages.at(-1)
+			: input.context.messages.at(-trailing.length - 1);
 		live.requestLocator = requestMessage ? locatorFor(requestMessage) : undefined;
 		const toolExec = attachParkExecutor(live, input.grantedTools, input.host);
 		const customTools = buildCustomTools(toolContract, toolExec.execute);
@@ -518,6 +555,7 @@ export async function prepareTurn(input: OpenRuntimeTurnInput): Promise<Prepared
 				assertCurrent();
 			}
 			slot.agent = agent;
+			slot.sdkMcpEnabled = Object.keys(customTools).length > 0;
 			slot.createCwd = cwd;
 			slot.credentialScopeId = nextCredential;
 			slot.toolContractFingerprint = toolContract.fingerprint;
@@ -659,6 +697,7 @@ export const __testUtils = {
 	},
 	slots,
 	executorLeases,
+	rekeyRuntimeScope,
 	/** Fake agents never own a real SDK executor, so prewarm becomes a no-op unless overridden. */
 	setOpenAgent(fn: (input: OpenAgentInput) => Promise<SDKAgent>, prewarm: typeof prewarmLocalExecutor = async () => async () => undefined) {
 		openAgentImpl = fn;

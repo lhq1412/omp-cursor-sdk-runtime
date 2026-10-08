@@ -26,6 +26,22 @@ const leaseKeys = new WeakMap<CursorSessionOwner, string>();
 const attachedOwners = new WeakSet<CursorSessionOwner>();
 const requestOwner = new AsyncLocalStorage<{ owner?: CursorSessionOwner; generation?: number }>();
 let defaultOwner = createOwner();
+let onScopeRekey: (owner: CursorSessionOwner, fromScope: string, toScope: string) => void = () => {};
+
+/** Runtime maps follow the owner when its scope key changes. Registered by session-runtime. */
+export function setCursorScopeRekeyHandler(handler: (owner: CursorSessionOwner, fromScope: string, toScope: string) => void): void {
+	onScopeRekey = handler;
+}
+
+function assignScopeKey(owner: CursorSessionOwner, nextScope: string): void {
+	const previous = owner.scopeKey;
+	if (previous !== nextScope) {
+		if (owners.get(previous) === owner) owners.delete(previous);
+		owner.scopeKey = nextScope;
+		onScopeRekey(owner, previous, nextScope);
+	}
+	owners.set(owner.scopeKey, owner);
+}
 
 function createOwner(sessionId?: string, sessionFile?: string, cwd = process.cwd()): CursorSessionOwner {
 	return {
@@ -122,6 +138,9 @@ export function ownerForContext(ctx: ExtensionContext): CursorSessionOwner {
 		owner.cwd = ctx.cwd;
 		owner.persistenceKey = persistenceKeyFor(sessionId, sessionFile);
 		owner.persistent = owner.writer;
+		// The file lease moved. Keep this live owner's runtime scope with the new file
+		// so another manager of the old path cannot dispose it.
+		if (owner.writer) assignScopeKey(owner, writerScopeKey(sessionId, sessionFile));
 		return owner;
 	}
 
@@ -142,13 +161,12 @@ export function ownerForContext(ctx: ExtensionContext): CursorSessionOwner {
 			owner.writer = true;
 			owner.persistent = true;
 			owner.persistenceKey = persistenceKeyFor(sessionId, sessionFile);
-			owner.scopeKey = writerScopeKey(sessionId, sessionFile);
 			owner.sessionFile = sessionFile;
 			owner.sessionId = sessionId;
 			owner.cwd = ctx.cwd;
 			owner.generation += 1;
 			holdLease(owner, lease);
-			owners.set(owner.scopeKey, owner);
+			assignScopeKey(owner, writerScopeKey(sessionId, sessionFile));
 			return owner;
 		}
 		owner.sessionFile = sessionFile;

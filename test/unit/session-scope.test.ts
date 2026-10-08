@@ -122,7 +122,7 @@ test("two managers on one file do not share a writer, and shutdown hands the fil
 	scopeTestUtils.reset();
 });
 
-test("file rollover keeps the writer scope and a session id change starts a new one", async () => {
+test("file rollover moves the writer scope to the new file and a session id change starts a new one", async () => {
 	scopeTestUtils.reset();
 	const handlers = new Map<string, (event: never, ctx: ExtensionContext) => unknown>();
 	registerCursorSessionScope({
@@ -145,7 +145,7 @@ test("file rollover keeps the writer scope and a session id change starts a new 
 		await handlers.get("before_provider_request")!({} as never, manager);
 	});
 	expect(rolled.owner).toBe(owner);
-	expect(owner.scopeKey).toBe("/tmp/original.jsonl");
+	expect(owner.scopeKey).toBe("/tmp/rolled.jsonl");
 	expect(owner.sessionFile).toBe("/tmp/rolled.jsonl");
 	expect(owner.writer).toBe(true);
 	expect(owner.persistenceKey).toBe("session:sess-roll");

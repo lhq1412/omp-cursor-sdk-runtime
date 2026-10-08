@@ -201,7 +201,10 @@ interface FoldState {
 }
 
 function resumeLineageKey(data: ResumeEntryData): string {
-	return JSON.stringify([data.agentId, data.scopeKey, data.sessionFile, data.sessionId, data.cwd, data.poolKey]);
+	// A session id already matches across file rollover. Invalidation has to use that
+	// same identity, or a later in-flight record cannot supersede the pre-rollover commit.
+	if (data.sessionId) return JSON.stringify([data.agentId, data.sessionId, data.cwd, data.poolKey]);
+	return JSON.stringify([data.agentId, data.scopeKey, data.sessionFile, data.cwd, data.poolKey]);
 }
 
 function sameResumeCwd(left: string, right: string): boolean {
