@@ -106,7 +106,7 @@ describe("identity mapping", () => {
 			item({ id: "grok-4.7", variants: defaultVariant([]) }),
 			item({
 				id: "grok-4.7-max",
-				parameters: [param("context", ["256k", "500k"])],
+				parameters: [param("context", ["256k", "500k"]), param("fast", ["true", "false"])],
 				variants: defaultVariant([{ id: "context", value: "500k" }]),
 			}),
 			item({
@@ -148,9 +148,11 @@ describe("identity mapping", () => {
 		expect(buildModelSelection("grok-4.7-max", "off", { extendedContextEnabled: false }).params).toEqual(
 			expect.arrayContaining([{ id: "context", value: "256k" }]),
 		);
-		expect(() => buildModelSelection("grok-4.7-max", "off", { extendedContextEnabled: true })).toThrow(
-			/rejects grok-4\.7-max 500k; disable Extended Context/,
-		);
+		const extended = buildModelSelection("grok-4.7-max", "high", { extendedContextEnabled: true, fastEnabled: true });
+		expect(extended.id).toBe("grok-4.7-max");
+		expect(extended.params?.some((param) => param.id === "context")).toBeFalsy();
+		expect(extended.params).toEqual(expect.arrayContaining([{ id: "fast", value: "true" }]));
+		expect(getModelMetadata("grok-4.7-max")?.contextWindow).toBe(500_000);
 		expect(getModelMetadata("grok-4.5-max")?.contextWindow).toBe(1_000_000);
 		expect(getModelMetadata("grok-4.5-max")?.extendedContext?.standardContextWindow).toBe(256_000);
 		expect(getModelMetadata("default")?.contextWindow).toBe(256_000);

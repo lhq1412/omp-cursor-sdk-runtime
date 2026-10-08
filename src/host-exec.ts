@@ -1,3 +1,5 @@
+import type { Tool, ToolCall } from "@oh-my-pi/pi-ai";
+import { validateToolArguments } from "@oh-my-pi/pi-ai";
 import type { GrantedTool, HostToolResult } from "./contracts.js";
 import { createToolCallDedupe, ToolBridgeError, type ToolCallDedupe, type ToolExecutor } from "./tools.js";
 
@@ -15,24 +17,54 @@ export interface SharedToolExec {
  * Same payload returns the first result without reaching the host/park callback again.
  * A conflicting name or arguments throws ToolBridgeError, including while the first call is inflight.
  */
+function bridgeError(error: unknown): ToolBridgeError {
+	if (error instanceof ToolBridgeError) return error;
+	return new ToolBridgeError(error instanceof Error ? error.message : String(error));
+}
+
+/** Strict schema failure is a bridge error. Lenient tools keep raw args; parsed JSON failures still throw. */
+export function validateGrantedArguments(tool: GrantedTool, args: Record<string, unknown>): Record<string, unknown> {
+	const call = { type: "toolCall", id: "args", name: tool.name, arguments: args } as ToolCall;
+	try {
+		const validated = validateToolArguments({
+			name: tool.name,
+			description: tool.description,
+			parameters: tool.inputSchema,
+		} as Tool, call);
+		if (validated === null || typeof validated !== "object" || Array.isArray(validated)) {
+			throw new ToolBridgeError(`tool ${tool.name} arguments are not a JSON object`);
+		}
+		return validated as Record<string, unknown>;
+	} catch (error) {
+		if (!tool.lenientArgValidation) throw bridgeError(error);
+		if ("__parseError" in args) throw bridgeError(error);
+		const fallback = { ...args };
+		delete fallback.__parseError;
+		delete fallback.__rawJson;
+		return fallback;
+	}
+}
+
 export function createSharedToolExec(
 	grantedTools: readonly GrantedTool[],
 	run: ToolExecutor,
 	bridgeRunId: string,
 ): SharedToolExec {
-	const grantedNames = new Set(grantedTools.map((tool) => tool.name));
+	const grantedByName = new Map(grantedTools.map((tool) => [tool.name, tool]));
 	const dedupe = createToolCallDedupe(bridgeRunId);
 	const executed = new Set<string>();
 	return {
 		bridgeRunId,
 		dedupe,
-		grantedNames,
+		grantedNames: new Set(grantedByName.keys()),
 		executed,
 		execute: async (name, args, toolCallId) => {
-			if (!grantedNames.has(name)) {
+			const granted = grantedByName.get(name);
+			if (!granted) {
 				throw new ToolBridgeError(`tool ${name} is not granted`);
 			}
-			const result = await dedupe.execute(toolCallId, name, args, (snapshot) => run(name, snapshot, toolCallId));
+			const result = await dedupe.execute(toolCallId, name, args, (snapshot) =>
+				run(name, validateGrantedArguments(granted, snapshot), toolCallId));
 			executed.add(`${bridgeRunId}:${toolCallId}`);
 			return result;
 		},

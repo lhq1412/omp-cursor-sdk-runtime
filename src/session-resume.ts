@@ -201,7 +201,10 @@ interface FoldState {
 }
 
 function resumeLineageKey(data: ResumeEntryData): string {
-	return JSON.stringify([data.agentId, data.scopeKey, data.sessionFile, data.sessionId, data.cwd, data.poolKey]);
+	// A session id already matches across file rollover. Invalidation has to use that
+	// same identity, or a later in-flight record cannot supersede the pre-rollover commit.
+	if (data.sessionId) return JSON.stringify([data.agentId, data.sessionId, data.cwd, data.poolKey]);
+	return JSON.stringify([data.agentId, data.scopeKey, data.sessionFile, data.cwd, data.poolKey]);
 }
 
 function sameResumeCwd(left: string, right: string): boolean {
@@ -292,8 +295,14 @@ function indexLatestResumeEntries(entries: readonly ResumeSessionEntry[]): {
 	return { entryIds, latestEntryIdByLineage };
 }
 
+/** Same session id survives a file rollover. Without an id, the file and scope still have to match. */
+function sameSessionIdentity(data: { scopeKey: string; sessionFile?: string; sessionId?: string }, scope: { scopeKey: string; sessionFile?: string; sessionId?: string }): boolean {
+	if (data.sessionId && scope.sessionId) return data.sessionId === scope.sessionId;
+	return data.scopeKey === scope.scopeKey && data.sessionFile === scope.sessionFile;
+}
+
 function matchesScope(data: ResumeEntryData, scope: ResumeScope): boolean {
-	return data.scopeKey === scope.scopeKey && data.sessionFile === scope.sessionFile && data.sessionId === scope.sessionId;
+	return sameSessionIdentity(data, scope);
 }
 
 function advanceFold(
@@ -383,14 +392,14 @@ export function getMatchingResumeHandle(
 	cwd = getResumeState().cwd,
 	toolContractFingerprint?: string,
 ): ResumeEntryData | undefined {
+	const owner = getCursorSessionOwner();
+	if (!owner.writer) return undefined;
 	const state = getResumeState();
 	const handle = state.activeHandle;
 	if (!handle || !isLocalAgentId(handle.agentId)) return undefined;
 	if (handle.state !== "committed") return undefined;
 	if (handle.poolKey !== poolKey) return undefined;
-	if (handle.scopeKey !== state.scopeKey) return undefined;
-	if (handle.sessionFile !== state.sessionFile) return undefined;
-	if (handle.sessionId !== state.sessionId) return undefined;
+	if (!sameSessionIdentity(handle, state)) return undefined;
 	if (!sameResumeCwd(handle.cwd, cwd)) return undefined;
 	if (handle.compactionGeneration !== state.compactionGeneration) return undefined;
 	if (!handle.credentialScopeId || !credentialScopeId || handle.credentialScopeId !== credentialScopeId) return undefined;
@@ -406,7 +415,8 @@ export function getMatchingResumeHandle(
 
 export function persistResumeHandle(input: PendingResumeHandle): void {
 	const state = getResumeState();
-	if (!getCursorSessionOwner().persistent) return;
+	const owner = getCursorSessionOwner();
+	if (!owner.persistent || !owner.writer) return;
 	if (!isLocalAgentId(input.agentId)) return;
 	state.pendingHandle = {
 		agentId: input.agentId,
@@ -454,7 +464,8 @@ function resumeEntryFromPending(pending: PendingResumeHandle): ResumeEntryData {
  */
 export function flushResumeHandleNow(input: PendingResumeHandle): void {
 	const state = getResumeState();
-	if (!getCursorSessionOwner().persistent) return;
+	const owner = getCursorSessionOwner();
+	if (!owner.persistent || !owner.writer) return;
 	if (!isLocalAgentId(input.agentId)) {
 		throw new Error("Cannot persist a Cursor SDK resume handle without a local agent id");
 	}

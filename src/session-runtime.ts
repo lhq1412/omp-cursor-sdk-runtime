@@ -12,16 +12,17 @@ import {
 	disposeLiveRun,
 	getLiveRun,
 	liveRunKey,
+	moveLiveRun,
 	parkToolCall,
 	setLiveRun,
 	type LiveRun,
 } from "./live-run.js";
-import { trailingToolResults } from "./omp-tools.js";
+import { trailingToolExchange } from "./omp-tools.js";
 import { withSdkExitSuppressed } from "./sdk-exit-guard.js";
 import { openAgent, prewarmLocalExecutor, type OpenAgentInput } from "./sdk-session.js";
 import { flushResumeHandleNow, getMatchingResumeHandle, persistResumeHandle, type ResumeStoreIdentity } from "./session-resume.js";
-import { getCursorSessionCwd, getCursorSessionOwner, getCursorSessionScopeKey, withCursorSessionOwner, type CursorSessionOwner } from "./session-scope.js";
-import { openScopedJsonlStore, storeRootForScope } from "./store.js";
+import { getCursorSessionCwd, getCursorSessionOwner, getCursorSessionScopeKey, setCursorScopeRekeyHandler, withCursorSessionOwner, type CursorSessionOwner } from "./session-scope.js";
+import { openScopedJsonlStore, openStoreAt, resolveStoreRoot, storeRootForScope } from "./store.js";
 import { buildCustomTools, buildToolContract, estimateFormalToolDefinitionTokens, newBridgeRunId } from "./tools.js";
 import { ompToolCallId } from "./projector.js";
 
@@ -34,6 +35,8 @@ export interface RuntimeSlot {
 	createCwd?: string;
 	credentialScopeId?: string;
 	toolContractFingerprint?: string;
+	/** SDK 1.0.32 freezes the tool allowlist at create/resume. Empty grants omit `mcp`. */
+	sdkMcpEnabled?: boolean;
 	agent?: SDKAgent;
 	sendState: SendState;
 	bindingState: BindingState;
@@ -42,7 +45,6 @@ export interface RuntimeSlot {
 	preparation?: AbortController;
 	/**
 	 * In-process consumption proof kept from prepare through the first `agent.send()` entry.
-	 * Covers tool-fingerprint rebuilds (memory or journal) that fail or cancel before send.
 	 * Validated against cwd + credential on the next prepare; never authorizes agent reuse.
 	 * Cleared only when send actually starts, or when identity/session invalidation drops it.
 	 */
@@ -81,6 +83,26 @@ export function warmLocalExecutor(cwd: string, apiKey: string, modelId: string, 
 	release.catch(() => undefined);
 	executorLeases.set(scopeKey, { fingerprint, release });
 }
+
+export function rekeyRuntimeScope(owner: CursorSessionOwner, fromScope: string, toScope: string): void {
+	if (fromScope === toScope) return;
+	for (const [key, slot] of [...slots.entries()]) {
+		if (slot.owner !== owner || slot.scopeKey !== fromScope) continue;
+		const nextKey = liveRunKey(toScope, slot.agentInstanceId);
+		if (slots.has(nextKey) && slots.get(nextKey) !== slot) continue;
+		slots.delete(key);
+		moveLiveRun(key, nextKey);
+		slot.scopeKey = toScope;
+		slot.key = nextKey;
+		slots.set(nextKey, slot);
+	}
+	if (executorLeases.has(fromScope) && !executorLeases.has(toScope)) {
+		executorLeases.set(toScope, executorLeases.get(fromScope)!);
+		executorLeases.delete(fromScope);
+	}
+}
+
+setCursorScopeRekeyHandler(rekeyRuntimeScope);
 
 function releaseExecutorLease(scopeKey: string): Promise<void> {
 	const lease = executorLeases.get(scopeKey);
@@ -333,16 +355,19 @@ export async function prepareTurn(input: OpenRuntimeTurnInput): Promise<Prepared
 	const toolContract = buildToolContract(input.grantedTools);
 	let slot = getOrCreateSlot(scopeKey, input.agentInstanceId, cwd);
 	const existingLive = getLiveRun(slot.key);
-	const trailing = trailingToolResults(input.context);
+	const exchange = trailingToolExchange(input.context);
+	const trailing = exchange.results;
+	const passive = exchange.passive;
 	const parkedByOmpId = existingLive
 		? new Map(existingLive.parked.map((call) => [call.ompToolCallId, call]))
 		: undefined;
-	const continuing = Boolean(
+	const parkedMatch = Boolean(
 		existingLive
 		&& trailing.length > 0
 		&& trailing.every((result) => parkedByOmpId?.get(result.toolCallId)?.name === result.toolName),
 	);
-	if (existingLive && trailing.length > 0 && !continuing) {
+	const continuing = parkedMatch && passive.length === 0;
+	if (existingLive && trailing.length > 0 && !parkedMatch) {
 		const ownsContinuation = existingLive.requestLocator
 			? findUniqueMessageIndex(input.context.messages, existingLive.requestLocator) !== undefined
 			: false;
@@ -371,15 +396,11 @@ export async function prepareTurn(input: OpenRuntimeTurnInput): Promise<Prepared
 
 	slot.sendStarted = false;
 	const identityMismatch = agentConfigMismatch(slot, cwd, nextCredential);
-	const toolMismatch = Boolean(slot.agent) && slot.toolContractFingerprint !== toolContract.fingerprint;
-	const unsafeBinding = Boolean(slot.agent) && (slot.bindingState !== "committed" || identityMismatch || toolMismatch);
-	// Tool-fingerprint-only rebuild: keep journal committed consumption until a new binding is sent.
-	const toolFingerprintRebuild = toolMismatch && !identityMismatch && slot.bindingState === "committed";
-	// Agent reuse requires an exact tool-contract fingerprint match.
+	// Per-send local.customTools already carry the current catalog. Parked runs still freeze the contract above.
+	const unsafeBinding = Boolean(slot.agent) && (slot.bindingState !== "committed" || identityMismatch);
 	const resumeHandle = unsafeBinding
 		? undefined
-		: getMatchingResumeHandle(input.agentInstanceId, nextCredential, cwd, toolContract.fingerprint);
-	// Consumed-input identity is separate: keep sendState across tool-fingerprint-only rebuilds.
+		: getMatchingResumeHandle(input.agentInstanceId, nextCredential, cwd);
 	const consumptionHandle = getMatchingResumeHandle(input.agentInstanceId, nextCredential, cwd);
 	const preservedSendState = (
 		Boolean(slot.agent)
@@ -397,9 +418,11 @@ export async function prepareTurn(input: OpenRuntimeTurnInput): Promise<Prepared
 			?? memoryConsumption
 			?? emptySendState();
 	})();
-	let plan = trailing.length > 0
-		? { mode: "bootstrap" as const, resetAgent: true, reason: "context_divergence" as const }
-		: planSend(sendState, input.context);
+	let plan = passive.length > 0
+		? { mode: "bootstrap" as const, resetAgent: true, continueOnly: true as const, reason: "context_divergence" as const }
+		: trailing.length > 0
+			? { mode: "bootstrap" as const, resetAgent: true, reason: "context_divergence" as const }
+			: planSend(sendState, input.context);
 	const willReuseAgent = (Boolean(slot.agent) && !unsafeBinding) || Boolean(resumeHandle);
 	if (!willReuseAgent && plan.mode === "incremental") {
 		// Re-import natively; keep continueOnly so consumed input is not resent.
@@ -431,13 +454,8 @@ export async function prepareTurn(input: OpenRuntimeTurnInput): Promise<Prepared
 	};
 	try {
 		if (unsafeBinding) {
-			if (toolFingerprintRebuild) {
-				stashPreSendConsumption(slot, preservedSendState ?? slot.sendState, cwd, nextCredential);
-				void disposeAgentKeepJournalConsumption(slot);
-			} else {
-				clearPreSendConsumption(slot);
-				void persistDirtyAndDisposeAgent(slot);
-			}
+			clearPreSendConsumption(slot);
+			void persistDirtyAndDisposeAgent(slot);
 		}
 		if (existingLive) {
 			await disposeLiveRun(slot.key, "OMP started a new user turn", false);
@@ -467,13 +485,8 @@ export async function prepareTurn(input: OpenRuntimeTurnInput): Promise<Prepared
 		}
 		if (plan.resetAgent) {
 			if (slot.agent) {
-				if (toolFingerprintRebuild) {
-					stashPreSendConsumption(slot, preservedSendState ?? slot.sendState, cwd, nextCredential);
-					void disposeAgentKeepJournalConsumption(slot);
-				} else {
-					clearPreSendConsumption(slot);
-					void persistDirtyAndDisposeAgent(slot);
-				}
+				clearPreSendConsumption(slot);
+				void persistDirtyAndDisposeAgent(slot);
 			} else if (resumeHandle) {
 				clearPreSendConsumption(slot);
 				persistDirtyHandle(slot, resumeHandle);
@@ -483,14 +496,26 @@ export async function prepareTurn(input: OpenRuntimeTurnInput): Promise<Prepared
 				slot.toolContractFingerprint = undefined;
 				slot.sendState = emptySendState();
 			}
-			// Tool-fingerprint-only rebuild from a journal committed handle: do not dirty it
-			// before send. A failed open must still be able to read consumption on retry.
 		}
 
-		const savedAgentId = slot.agent?.agentId ?? (slot.bindingState === "committed" ? resumeHandle?.agentId : undefined);
-		if (!slot.store) slot.store = openScopedJsonlStore(cwd, scopeKey);
+		let mcpResumeId: string | undefined;
+		if (slot.agent && slot.sdkMcpEnabled !== true && input.grantedTools.length > 0) {
+			mcpResumeId = slot.agent.agentId;
+			const retiring = slot.agent;
+			slot.agent = undefined;
+			await disposeLiveRun(slot.key, "SDK tool capability changed", false);
+			await disposeAgent(retiring);
+		}
+		const savedAgentId = mcpResumeId
+			?? slot.agent?.agentId
+			?? (slot.bindingState === "committed" ? resumeHandle?.agentId : undefined);
+		if (!slot.store) {
+			const journalRoot = resumeHandle?.storeIdentity?.stateRoot ?? slot.storeIdentity.stateRoot;
+			const stateRoot = resolveStoreRoot(cwd, scopeKey, journalRoot);
+			slot.store = openStoreAt(stateRoot);
+			slot.storeIdentity = { version: 1, stateRoot };
+		}
 		const store = slot.store;
-		slot.storeIdentity = { version: 1, stateRoot: storeRootForScope(cwd, scopeKey) };
 
 		const reuseId = savedAgentId ?? slot.agent?.agentId;
 		if (reuseId) {
@@ -500,7 +525,11 @@ export async function prepareTurn(input: OpenRuntimeTurnInput): Promise<Prepared
 		const live = createLiveRun(createSharedToolExec(input.grantedTools, async () => {
 			throw new Error("tool executor is not attached");
 		}, newBridgeRunId()));
-		const requestMessage = input.context.messages.at(-trailing.length - 1);
+		// Passive rebuild must be addressed by its own developer message. Pointing the
+		// locator at the previous assistant makes a late result of that call cancel this run.
+		const requestMessage = passive.length > 0
+			? input.context.messages.at(-1)
+			: input.context.messages.at(-trailing.length - 1);
 		live.requestLocator = requestMessage ? locatorFor(requestMessage) : undefined;
 		const toolExec = attachParkExecutor(live, input.grantedTools, input.host);
 		const customTools = buildCustomTools(toolContract, toolExec.execute);
@@ -526,6 +555,7 @@ export async function prepareTurn(input: OpenRuntimeTurnInput): Promise<Prepared
 				assertCurrent();
 			}
 			slot.agent = agent;
+			slot.sdkMcpEnabled = Object.keys(customTools).length > 0;
 			slot.createCwd = cwd;
 			slot.credentialScopeId = nextCredential;
 			slot.toolContractFingerprint = toolContract.fingerprint;
@@ -549,15 +579,22 @@ export async function prepareTurn(input: OpenRuntimeTurnInput): Promise<Prepared
 		};
 	} catch (error) {
 		if (slots.get(slot.key) === slot) {
-			// Pre-send tool rebuild: dispose without journaling dirty over committed consumption,
-			// and keep an identity-checked in-memory proof for same-process retry without a journal.
-			if (toolFingerprintRebuild || (!resumeHandle && !identityMismatch && (consumptionHandle || preservedSendState || slot.preSendConsumption))) {
-				const consumption = preservedSendState
-					?? (consumptionHandle ? { ...consumptionHandle.sendState } : undefined)
-					?? matchingPreSendConsumption(slot, cwd, nextCredential)
-					?? (slot.sendState.bootstrapped ? { ...slot.sendState } : undefined);
+			// Failure here is before agent.send. A same-id resume may already have
+			// superseded the committed journal handle; keep the verified consumption
+			// so the retry imports that history and sends a continuation.
+			const verifiedConsumption = identityMismatch
+				? undefined
+				: preservedSendState?.bootstrapped
+					? preservedSendState
+					: consumptionHandle?.sendState.bootstrapped
+						? { ...consumptionHandle.sendState }
+						: resumeHandle?.sendState.bootstrapped
+							? { ...resumeHandle.sendState }
+							: matchingPreSendConsumption(slot, cwd, nextCredential)
+								?? (slot.sendState.bootstrapped ? { ...slot.sendState } : undefined);
+			if (verifiedConsumption?.bootstrapped) {
 				await disposeAgentKeepJournalConsumption(slot);
-				if (consumption) stashPreSendConsumption(slot, consumption, cwd, nextCredential);
+				stashPreSendConsumption(slot, verifiedConsumption, cwd, nextCredential);
 			} else {
 				clearPreSendConsumption(slot);
 				await persistDirtyAndDisposeAgent(slot);
@@ -667,6 +704,7 @@ export const __testUtils = {
 	},
 	slots,
 	executorLeases,
+	rekeyRuntimeScope,
 	/** Fake agents never own a real SDK executor, so prewarm becomes a no-op unless overridden. */
 	setOpenAgent(fn: (input: OpenAgentInput) => Promise<SDKAgent>, prewarm: typeof prewarmLocalExecutor = async () => async () => undefined) {
 		openAgentImpl = fn;

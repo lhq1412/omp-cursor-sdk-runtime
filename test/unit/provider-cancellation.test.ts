@@ -926,13 +926,15 @@ describe("provider grant fail-closed", () => {
 	});
 });
 
-describe("provider cancel during baseline after tool-fingerprint rebuild", () => {
+describe("provider turns send the current tool catalog without rebuilding", () => {
 	let cwd: string;
+	let failNextSend = false;
 	const READ = { name: "read", description: "read files", parameters: { type: "object", properties: { path: { type: "string" } } } } as Tool;
 	const COMMITTED = "Already executed request";
 
 	beforeEach(() => {
 		cwd = mkdtempSync(join(tmpdir(), "omp-baseline-cancel-"));
+		failNextSend = false;
 		runtime.__testUtils.clear();
 		liveRunTestUtils.clear();
 		scopeTestUtils.reset();
@@ -973,7 +975,6 @@ describe("provider cancel during baseline after tool-fingerprint rebuild", () =>
 		blockBaseline?: () => boolean;
 		onBaselineEntered?: () => void;
 		releaseBaseline?: Promise<void>;
-		failSend?: () => boolean;
 		prompts: unknown[];
 		opens: Array<{ savedAgentId?: string; history?: Context["messages"] }>;
 	}) {
@@ -993,7 +994,7 @@ describe("provider cancel during baseline after tool-fingerprint rebuild", () =>
 				async [Symbol.asyncDispose]() {},
 				async send(message: unknown) {
 					options.prompts.push(message);
-					if (options.failSend?.()) throw new Error("send boom");
+					if (failNextSend) throw new Error("send boom");
 					return {
 						supports: () => false,
 						wait: async () => ({ status: "finished", result: "ok" }),
@@ -1015,95 +1016,44 @@ describe("provider cancel during baseline after tool-fingerprint rebuild", () =>
 		return slot!;
 	}
 
-	test("abort during baseline after fingerprint rebuild does not call send and keeps consumption", async () => {
+	test("a stale tool fingerprint reuses the agent and sends a continuation", async () => {
 		const opens: Array<{ savedAgentId?: string; history?: Context["messages"] }> = [];
 		const prompts: unknown[] = [];
 		await commitFirstTurn(opens, prompts);
+		expect(opens).toHaveLength(1);
 
-		const baselineEntered = deferred<void>();
-		const releaseBaseline = deferred<void>();
-		let blockBaseline = true;
-		installAgent({
-			opens,
-			prompts,
-			blockBaseline: () => blockBaseline,
-			onBaselineEntered: () => baselineEntered.resolve(),
-			releaseBaseline: releaseBaseline.promise,
-		});
-
-		const controller = new AbortController();
-		const pending = collect(
-			{ apiKey: "test-key", cwd, signal: controller.signal, onPayload: scopeTestUtils.bindRequest },
-			sameContext(),
-		);
-		await awaitEntered(baselineEntered.promise, pending);
-		expect(prompts).toHaveLength(1);
-		controller.abort();
-		releaseBaseline.resolve();
-		expectAborted(await bounded(pending));
-		expect(prompts).toHaveLength(1);
-
-		const slot = [...runtime.__testUtils.slots.values()][0];
-		expect(slot?.preSendConsumption?.sendState.bootstrapped).toBe(true);
-		expect(slot?.sendState.bootstrapped).toBe(true);
-		expect(slot?.agent).toBeUndefined();
-
-		blockBaseline = false;
-		opens.length = 0;
-		const retry = await bounded(collect({ apiKey: "test-key", cwd, onPayload: scopeTestUtils.bindRequest }, sameContext()));
-		expect(expectOneTerminal(retry)).toMatchObject({ type: "done", reason: "stop" });
+		const continued = await bounded(collect({ apiKey: "test-key", cwd, onPayload: scopeTestUtils.bindRequest }, sameContext()));
+		expect(expectOneTerminal(continued)).toMatchObject({ type: "done", reason: "stop" });
+		expect(opens).toHaveLength(1);
 		expect(prompts).toHaveLength(2);
-		expect(opens).toEqual([{ savedAgentId: undefined, history: sameContext().messages }]);
 		expect(JSON.stringify(prompts[1])).toContain("Continue the conversation from where it left off.");
 		expect(JSON.stringify(prompts[1])).not.toContain(COMMITTED);
+		const slot = [...runtime.__testUtils.slots.values()][0];
+		expect(slot?.agent?.agentId).toBe("agent-1");
+		expect(slot?.bindingState).toBe("committed");
 	});
 
-	test("abort during baseline then append sends only the new input", async () => {
+	test("after a stale fingerprint continuation, an appended message sends only the new input", async () => {
 		const opens: Array<{ savedAgentId?: string; history?: Context["messages"] }> = [];
 		const prompts: unknown[] = [];
 		await commitFirstTurn(opens, prompts);
+		const continued = await bounded(collect({ apiKey: "test-key", cwd, onPayload: scopeTestUtils.bindRequest }, sameContext()));
+		expect(expectOneTerminal(continued)).toMatchObject({ type: "done", reason: "stop" });
 
-		const baselineEntered = deferred<void>();
-		const releaseBaseline = deferred<void>();
-		installAgent({
-			opens,
-			prompts,
-			blockBaseline: () => true,
-			onBaselineEntered: () => baselineEntered.resolve(),
-			releaseBaseline: releaseBaseline.promise,
-		});
-		const controller = new AbortController();
-		const pending = collect(
-			{ apiKey: "test-key", cwd, signal: controller.signal, onPayload: scopeTestUtils.bindRequest },
-			sameContext(),
-		);
-		await awaitEntered(baselineEntered.promise, pending);
-		controller.abort();
-		releaseBaseline.resolve();
-		expectAborted(await bounded(pending));
-		expect(prompts).toHaveLength(1);
-
-		installAgent({ opens, prompts });
-		opens.length = 0;
 		const next = await bounded(collect({ apiKey: "test-key", cwd, onPayload: scopeTestUtils.bindRequest }, appendedContext()));
 		expect(expectOneTerminal(next)).toMatchObject({ type: "done", reason: "stop" });
-		expect(prompts).toHaveLength(2);
-		expect(opens).toEqual([{ savedAgentId: undefined, history: sameContext().messages }]);
-		expect(JSON.stringify(prompts[1])).toContain("New request");
-		expect(JSON.stringify(prompts[1])).not.toContain(COMMITTED);
+		expect(opens).toHaveLength(1);
+		expect(prompts).toHaveLength(3);
+		expect(JSON.stringify(prompts[2])).toContain("New request");
+		expect(JSON.stringify(prompts[2])).not.toContain(COMMITTED);
 	});
 
-	test("failure after agent.send starts dirties and retries without pre-send consumption", async () => {
+	test("failure after agent.send starts dirties and retries without the continuation", async () => {
 		const opens: Array<{ savedAgentId?: string; history?: Context["messages"] }> = [];
 		const prompts: unknown[] = [];
 		await commitFirstTurn(opens, prompts);
 
-		let failSend = true;
-		installAgent({
-			opens,
-			prompts,
-			failSend: () => failSend,
-		});
+		failNextSend = true;
 		const failed = await bounded(collect({ apiKey: "test-key", cwd, onPayload: scopeTestUtils.bindRequest }, sameContext()));
 		expect(expectOneTerminal(failed)).toMatchObject({ type: "error" });
 		expect(prompts).toHaveLength(2);
@@ -1111,7 +1061,7 @@ describe("provider cancel during baseline after tool-fingerprint rebuild", () =>
 		expect(slot?.preSendConsumption).toBeUndefined();
 		expect(slot?.sendState.bootstrapped).toBe(false);
 
-		failSend = false;
+		failNextSend = false;
 		opens.length = 0;
 		const retry = await bounded(collect({ apiKey: "test-key", cwd, onPayload: scopeTestUtils.bindRequest }, sameContext()));
 		expect(expectOneTerminal(retry)).toMatchObject({ type: "done", reason: "stop" });

@@ -82,3 +82,82 @@ test("ownerForRequest stays isolated from sessionId-only main owners", async () 
 	expect(mainOwner.persistent).toBe(true);
 	scopeTestUtils.reset();
 });
+
+test("two managers on one file do not share a writer, and shutdown hands the file back", async () => {
+	scopeTestUtils.reset();
+	const handlers = new Map<string, (event: never, ctx: ExtensionContext) => unknown>();
+	registerCursorSessionScope({
+		on(event: string, handler: (event: never, ctx: ExtensionContext) => unknown) {
+			handlers.set(event, handler);
+		},
+	} as Pick<ExtensionAPI, "on">);
+	const file = "/tmp/shared.jsonl";
+	const firstManager = {
+		cwd: "/tmp/project",
+		sessionManager: { getSessionFile: () => file, getSessionId: () => "sess" },
+	} as ExtensionContext;
+	const secondManager = {
+		cwd: "/tmp/project",
+		sessionManager: { getSessionFile: () => file, getSessionId: () => "sess" },
+	} as ExtensionContext;
+	const first = await captureCursorRequestOwner(async () => {
+		await handlers.get("before_provider_request")!({} as never, firstManager);
+	});
+	const second = await captureCursorRequestOwner(async () => {
+		await handlers.get("before_provider_request")!({} as never, secondManager);
+	});
+	expect(first.owner?.writer).toBe(true);
+	expect(first.owner?.scopeKey).toBe(file);
+	expect(second.owner?.writer).toBe(false);
+	expect(second.owner?.persistent).toBe(false);
+	expect(second.owner?.scopeKey).not.toBe(file);
+	await handlers.get("session_shutdown")!({} as never, firstManager);
+	const taken = await captureCursorRequestOwner(async () => {
+		await handlers.get("before_provider_request")!({} as never, secondManager);
+	});
+	expect(taken.owner).toBe(second.owner);
+	expect(taken.owner?.writer).toBe(true);
+	expect(taken.owner?.scopeKey).toBe(file);
+	expect(first.owner?.writer).toBe(false);
+	scopeTestUtils.reset();
+});
+
+test("file rollover moves the writer scope to the new file and a session id change starts a new one", async () => {
+	scopeTestUtils.reset();
+	const handlers = new Map<string, (event: never, ctx: ExtensionContext) => unknown>();
+	registerCursorSessionScope({
+		on(event: string, handler: (event: never, ctx: ExtensionContext) => unknown) {
+			handlers.set(event, handler);
+		},
+	} as Pick<ExtensionAPI, "on">);
+	let file = "/tmp/original.jsonl";
+	let sessionId = "sess-roll";
+	const manager = {
+		cwd: "/tmp/project",
+		sessionManager: { getSessionFile: () => file, getSessionId: () => sessionId },
+	} as ExtensionContext;
+	const opened = await captureCursorRequestOwner(async () => {
+		await handlers.get("before_provider_request")!({} as never, manager);
+	});
+	const owner = opened.owner!;
+	file = "/tmp/rolled.jsonl";
+	const rolled = await captureCursorRequestOwner(async () => {
+		await handlers.get("before_provider_request")!({} as never, manager);
+	});
+	expect(rolled.owner).toBe(owner);
+	expect(owner.scopeKey).toBe("/tmp/rolled.jsonl");
+	expect(owner.sessionFile).toBe("/tmp/rolled.jsonl");
+	expect(owner.writer).toBe(true);
+	expect(owner.persistenceKey).toBe("session:sess-roll");
+	const generation = owner.generation;
+	sessionId = "sess-next";
+	const replaced = await captureCursorRequestOwner(async () => {
+		await handlers.get("before_provider_request")!({} as never, manager);
+	});
+	expect(replaced.owner).not.toBe(owner);
+	expect(owner.generation).toBe(generation + 1);
+	expect(replaced.owner?.writer).toBe(true);
+	expect(replaced.owner?.scopeKey).toBe("/tmp/rolled.jsonl");
+	expect(replaced.owner?.sessionId).toBe("sess-next");
+	scopeTestUtils.reset();
+});

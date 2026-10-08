@@ -3,6 +3,7 @@ import type { SDKImage, SDKUserMessage } from "@cursor/sdk";
 import type { Context } from "@oh-my-pi/pi-ai";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import { classifyModel } from "@oh-my-pi/pi-catalog/compat/taxonomy";
+import { imageTokenBudget } from "./image-budget.js";
 import {
 	BOOTSTRAP_OUTPUT_RESERVE_TOKENS,
 	CURSOR_SDK_API,
@@ -46,7 +47,6 @@ export interface MessageLocator {
 
 const NATIVE_HISTORY_FORMAT = "native-checkpoint-v1";
 const CONTEXT_FINGERPRINT_VERSION = 3;
-const IMAGE_TOKEN_RESERVE = 4096;
 
 export function registerLegacyCursorToolCallIdMigration(pi: Pick<ExtensionAPI, "on">): void {
 	pi.on("context", (event) => {
@@ -349,7 +349,7 @@ function estimatedHistoryTokens(messages: Context["messages"], targetModelId?: s
 		if (message.role === "user" || message.role === "developer") {
 			const text = textFromContent(message.content).trim();
 			const images = imagesFromContent(message.content);
-			tokens += images.length * IMAGE_TOKEN_RESERVE;
+			for (const image of images) tokens += budgetImage(image, targetModelId);
 			const content: unknown[] = [];
 			if (text) content.push({ type: "text", text });
 			for (const image of images) content.push({ type: "image", mediaType: "mimeType" in image ? image.mimeType : "image/png" });
@@ -397,13 +397,27 @@ function estimatedHistoryTokens(messages: Context["messages"], targetModelId?: s
 			}));
 			continue;
 		}
-		const extra = message as { role?: string; summary?: unknown };
+		const extra = message as { role?: string; summary?: unknown; blocks?: unknown; images?: unknown };
 		if ((extra.role === "compactionSummary" || extra.role === "branchSummary") && typeof extra.summary === "string" && extra.summary) {
 			fragments.push(extra.summary);
+			const frames = Array.isArray(extra.blocks) ? extra.blocks : Array.isArray(extra.images) ? extra.images : [];
+			for (const block of frames) {
+				if (!isRecord(block)) continue;
+				if (block.type === "image" && typeof block.data === "string" && typeof block.mimeType === "string") {
+					tokens += imageTokenBudget(block.data, block.mimeType, targetModelId);
+				} else if (block.type === "text" && typeof block.text === "string" && block.text) {
+					fragments.push(block.text);
+				}
+			}
 		}
 	}
 	for (const fragment of fragments) tokens += estimatedTextTokens(fragment);
 	return tokens;
+}
+
+function budgetImage(image: SDKImage, modelId?: string): number {
+	if (!("data" in image) || typeof image.data !== "string") return imageTokenBudget("", "image/png", modelId);
+	return imageTokenBudget(image.data, image.mimeType, modelId);
 }
 
 function estimatedTextTokens(text: string): number {
@@ -415,13 +429,12 @@ function throwContextOverflow(): never {
 	throw new Error("Context window exceeded: current input and system instructions exceed the model input budget (conservative estimate)");
 }
 
-function inputTextBudget(current: SDKUserMessage, limits: ModelInputLimits): number {
+function inputTextBudget(current: SDKUserMessage, limits: ModelInputLimits, modelId?: string): number {
 	if (typeof limits.contextWindow !== "number" || typeof limits.maxTokens !== "number" || !Number.isSafeInteger(limits.contextWindow) || !Number.isSafeInteger(limits.maxTokens) || limits.contextWindow <= 0 || limits.maxTokens < 0) {
 		throw new Error("Cursor SDK model context/output limits are unknown or invalid");
 	}
-	// ponytail: 4096/image reserve; SDK image tokens are unpublished.
 	// Encoded payload bytes are not tokens. Advertised maxTokens is not the bootstrap reserve.
-	const imageReserve = (current.images?.length ?? 0) * IMAGE_TOKEN_RESERVE;
+	const imageReserve = (current.images ?? []).reduce((sum, image) => sum + budgetImage(image, modelId), 0);
 	return limits.contextWindow - Math.min(limits.maxTokens, BOOTSTRAP_OUTPUT_RESERVE_TOKENS) - imageReserve - 1024;
 }
 
@@ -494,7 +507,7 @@ export function prepareSendInput(
 	const current = activeUserInput(context, plan.continueOnly);
 	const definitionReserve = Math.max(0, formalToolDefinitionReserveTokens);
 	if (plan.mode === "incremental") {
-		if (estimatedTextTokens(current.text) + definitionReserve > inputTextBudget(current, limits)) throwContextOverflow();
+		if (estimatedTextTokens(current.text) + definitionReserve > inputTextBudget(current, limits, targetModelId)) throwContextOverflow();
 		return { prompt: current };
 	}
 	const recoveryStart = validateToolResultRecovery(context);
@@ -517,7 +530,7 @@ export function prepareSendInput(
 	const system = systemText ? `System instructions from OMP:\n${systemText}\n\n` : "";
 	const tools = toolGuidance ? `${toolGuidance}\n\n` : "";
 	const toolContext = prior.length > 0 ? `${SDK_TOOL_CONTEXT}\n\n` : "";
-	const budget = inputTextBudget(current, limits);
+	const budget = inputTextBudget(current, limits, targetModelId);
 	const requiredText = system + tools + toolContext + current.text;
 	if (estimatedTextTokens(requiredText) + definitionReserve > budget) {
 		if (recoveryStart !== undefined) throw new CursorRecoveryBudgetError();

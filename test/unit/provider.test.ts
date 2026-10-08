@@ -1,4 +1,8 @@
+import { appendFileSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, test, beforeEach, afterEach } from "bun:test";
+import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import type { Context, Model, SimpleStreamOptions, Tool } from "@oh-my-pi/pi-ai";
 import { Effort, type Api } from "@oh-my-pi/pi-ai";
 import type { ModelListItem, ModelSelection, Run, RunResult, SDKAgent, SendOptions, TokenUsage } from "@cursor/sdk";
@@ -8,8 +12,8 @@ import { buildModelSelection, ensureCursorModels, getModelMetadata, __testUtils 
 import { __testUtils as controlsTestUtils } from "../../src/model-controls.ts";
 import { disposeRuntimeForScope, __testUtils as runtimeTestUtils } from "../../src/session-runtime.ts";
 import { __testUtils as liveRunTestUtils } from "../../src/live-run.ts";
-import { __testUtils as scopeTestUtils } from "../../src/session-scope.ts";
-import { __testUtils as resumeTestUtils } from "../../src/session-resume.ts";
+import { getCursorSessionScopeKey, __testUtils as scopeTestUtils } from "../../src/session-scope.ts";
+import { registerCursorSessionResume, __testUtils as resumeTestUtils } from "../../src/session-resume.ts";
 import { HOST_BRIDGE_OPTION_KEY } from "../../src/host-option.ts";
 import { createFakeHost } from "../helpers/fake-host.ts";
 import { projectSdkToolCallId } from "../../src/tool-call-id.ts";
@@ -211,10 +215,10 @@ describe("streamCursorRuntime model selection", () => {
 		expect(settled).toMatchObject({ type: "done", message: {
 			usage: { input: 0, output: 0, totalTokens: 135,
 				orchestration: { input: 105, output: 10, cacheRead: 20 }, cost: { total: 0 } },
-			cursorSdk: { cost: "unavailable", contextOccupancy: { status: "actual", source: "checkpoint", rootBlobId: "settled", maxTokens: 100 } },
+			cursorSdk: { cost: "unavailable", contextOccupancy: { status: "actual", source: "checkpoint", rootBlobId: "settled", usedTokens: 150, maxTokens: 100 } },
 		} });
 		if (settled?.type !== "done") throw new Error("Expected settled turn");
-		expect(settled.message.usage.contextTokens).toBeUndefined();
+		expect(settled.message.usage.contextTokens).toBe(150);
 	});
 
 
@@ -516,7 +520,11 @@ describe("streamCursorRuntime model selection", () => {
 				cursorSdk: { contextOccupancy: { status: "actual", source: "checkpoint" } },
 			},
 		});
-		expect(last && "message" in last ? last.message.usage.contextTokens : undefined).toBeUndefined();
+		const settled = last && "message" in last ? last.message : undefined;
+		expect(settled?.usage.contextTokens).toBe(
+			settled?.cursorSdk.contextOccupancy.status === "actual" ? settled.cursorSdk.contextOccupancy.usedTokens : undefined,
+		);
+		expect(settled?.usage.cost).toEqual({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 });
 		expect(host.bindings).toHaveLength(1);
 	});
 
@@ -719,6 +727,102 @@ describe("streamCursorRuntime model selection", () => {
 		}
 		expect(customTools).toEqual([]);
 		expect(events.at(-1)).toMatchObject({ type: "done", reason: "stop" });
+	});
+
+	test("an in-session side channel ignores the captured parent owner", async () => {
+		let customTools: string[] = [];
+		let openedScope: string | undefined;
+		runtimeTestUtils.setOpenAgent(async () => {
+			openedScope = getCursorSessionScopeKey();
+			return {
+				agentId: "side-1",
+				close() {},
+				async [Symbol.asyncDispose]() {},
+				async send(_message, options) {
+					customTools = Object.keys(options?.local?.customTools ?? {});
+					return finishedRun();
+				},
+			} as unknown as SDKAgent;
+		});
+		scopeTestUtils.set("/tmp/project", "/tmp/parent.jsonl", "parent");
+		const reminded = userContext("what is going on?", [readTool()]);
+		reminded.messages.unshift({
+			role: "developer",
+			content: [{ type: "text", text: "Ephemeral side-channel turn; reuses current conversation context." }],
+			timestamp: 0,
+		});
+		for (const options of [
+			{ sessionId: "parent:side:9", context: userContext("side question", [readTool()]) },
+			{ sessionId: "parent", context: reminded },
+		]) {
+			customTools = ["unread"];
+			openedScope = undefined;
+			const events = [];
+			for await (const event of streamCursorRuntime(cursorModel("composer-2.5", 200_000), options.context, {
+				apiKey: "test-key",
+				cwd: "/tmp/project",
+				sessionId: options.sessionId,
+				onPayload: () => {
+					scopeTestUtils.bindRequest();
+				},
+			} as SimpleStreamOptions)) {
+				events.push(event);
+			}
+			expect(customTools).toEqual([]);
+			expect(openedScope).not.toBe("/tmp/parent.jsonl");
+			expect(openedScope?.startsWith(scopeTestUtils.EPHEMERAL_SESSION_SCOPE_PREFIX)).toBe(true);
+			expect(events.at(-1)).toMatchObject({ type: "done", reason: "stop" });
+		}
+		scopeTestUtils.reset();
+	});
+
+	test("a side turn does not commit its agent onto the main host binding", async () => {
+		const opened: string[] = [];
+		runtimeTestUtils.setOpenAgent(async () => {
+			const agentId = opened.length === 0 ? "agent-1" : "agent-2";
+			opened.push(agentId);
+			return {
+				agentId,
+				close() {},
+				async [Symbol.asyncDispose]() {},
+				async send() { return finishedRun(); },
+			} as unknown as SDKAgent;
+		});
+		scopeTestUtils.set("/tmp/project", "/tmp/parent.jsonl", "parent");
+		const host = createFakeHost({ cwd: "/tmp/project", sessionId: "parent", tools: ["read"] });
+		const mainEvents = [];
+		for await (const event of streamCursorRuntime(cursorModel("composer-2.5", 200_000), userContext("main turn"), {
+			apiKey: "test-key",
+			cwd: "/tmp/project",
+			sessionId: "parent",
+			onPayload: () => { scopeTestUtils.bindRequest(); },
+			[HOST_BRIDGE_OPTION_KEY]: host,
+		} as SimpleStreamOptions)) {
+			mainEvents.push(event);
+		}
+		expect(mainEvents.at(-1)).toMatchObject({ type: "done", reason: "stop" });
+		expect(host.bindings.map((binding) => binding.sdkAgentId)).toEqual(["agent-1"]);
+		const reminded = userContext("what is going on?");
+		reminded.messages.unshift({
+			role: "developer",
+			content: [{ type: "text", text: "Ephemeral side-channel turn; reuses current conversation context." }],
+			timestamp: 0,
+		});
+		const sideEvents = [];
+		for await (const event of streamCursorRuntime(cursorModel("composer-2.5", 200_000), reminded, {
+			apiKey: "test-key",
+			cwd: "/tmp/project",
+			sessionId: "parent:side:9",
+			onPayload: () => { scopeTestUtils.bindRequest(); },
+			[HOST_BRIDGE_OPTION_KEY]: host,
+		} as SimpleStreamOptions)) {
+			sideEvents.push(event);
+		}
+		expect(sideEvents.at(-1)).toMatchObject({ type: "done", reason: "stop" });
+		expect(opened).toEqual(["agent-1", "agent-2"]);
+		expect(host.bindings.map((binding) => binding.sdkAgentId)).toEqual(["agent-1"]);
+		expect([...runtimeTestUtils.slots.values()].some((slot) => slot.scopeKey === "/tmp/parent.jsonl" && slot.agent?.agentId === "agent-1")).toBe(true);
+		scopeTestUtils.reset();
 	});
 
 	test.each(["disableReasoning", "forceReasoningOff"] as const)("%s wins over reasoning and still uses catalog context threshold", async (offOption) => {
@@ -1348,5 +1452,72 @@ describe("streamCursorRuntime model selection", () => {
 			type: "error",
 			error: { errorMessage: expect.stringMatching(/cwd or credentials changed/) },
 		});
+	});
+
+	test("a same-id resume that fails before send retries with consumed history and a continuation", async () => {
+		const sessionFile = join(mkdtempSync(join(tmpdir(), "omp-csr-")), "session.jsonl");
+		writeFileSync(sessionFile, "");
+		scopeTestUtils.set("/tmp/project", sessionFile, "sess-1");
+		const branch: Array<{ type: string; id: string; parentId: string | null; customType?: string; data?: unknown }> = [];
+		const handlers = new Map<string, Array<(event: unknown, ctx: unknown) => unknown>>();
+		const ctx = {
+			cwd: "/tmp/project",
+			sessionManager: {
+				getSessionFile: () => sessionFile,
+				getSessionId: () => "sess-1",
+				getBranch: () => branch,
+				getEntries: () => branch,
+			},
+		} as ExtensionContext;
+		const pi = {
+			appendEntry(customType: string, data?: unknown) {
+				appendFileSync(sessionFile, `${JSON.stringify({ type: "custom", customType, data })}\n`);
+			},
+			on(event: string, handler: (event: unknown, ctx: unknown) => unknown) {
+				const list = handlers.get(event) ?? [];
+				list.push(handler);
+				handlers.set(event, list);
+			},
+		};
+		registerCursorSessionResume(pi as Pick<ExtensionAPI, "on" | "appendEntry">);
+		await handlers.get("session_start")?.[0]?.({ type: "session_start" }, ctx);
+		const phrase = "remember the oak-table request";
+		const consumed = userContext(phrase);
+		const withTools = { ...consumed, tools: [readTool()] } as Context;
+		const opens: Array<{ savedAgentId?: string; history?: Context["messages"] }> = [];
+		const sends: string[] = [];
+		runtimeTestUtils.setOpenAgent(async (input) => {
+			opens.push({ savedAgentId: input.savedAgentId, history: input.bootstrapHistory });
+			if (input.savedAgentId) throw new Error("resume failed before send");
+			return {
+				agentId: `agent-${opens.length}`,
+				close() {},
+				async [Symbol.asyncDispose]() {},
+				async send(message: { text?: string }) {
+					sends.push(message.text ?? "");
+					return finishedRun();
+				},
+			} as unknown as SDKAgent;
+		});
+		const model = cursorModel("composer-2.5", 200_000);
+		const first = await drain(model, consumed, { apiKey: "test-key", cwd: "/tmp/project" });
+		expect(first.at(-1)).toMatchObject({ type: "done", reason: "stop" });
+		await handlers.get("turn_end")?.[0]?.({ type: "turn_end" }, ctx);
+		expect(resumeTestUtils.state.activeHandle?.state).toBe("committed");
+		expect(resumeTestUtils.state.activeHandle?.agentId).toBe("agent-1");
+		const journal = () => readFileSync(sessionFile, "utf8").trim().split("\n").map((line) => JSON.parse(line) as { data?: { state?: string; agentId?: string } });
+		expect(journal().some((entry) => entry.data?.state === "committed" && entry.data.agentId === "agent-1")).toBe(true);
+		const failed = await drain(model, withTools, { apiKey: "test-key", cwd: "/tmp/project" });
+		expect(failed.at(-1)).toMatchObject({ type: "error" });
+		expect(opens[1]?.savedAgentId).toBe("agent-1");
+		expect(sends).toHaveLength(1);
+		expect(journal().at(-1)?.data?.state).toBe("in-flight");
+		const retried = await drain(model, withTools, { apiKey: "test-key", cwd: "/tmp/project" });
+		expect(retried.at(-1)).toMatchObject({ type: "done", reason: "stop" });
+		expect(opens[2]?.savedAgentId).toBeUndefined();
+		expect(JSON.stringify(opens[2]?.history)).toContain(phrase);
+		expect(sends).toHaveLength(2);
+		expect(sends[1]).toContain("Continue the conversation from where it left off.");
+		expect(sends[1]).not.toContain(phrase);
 	});
 });

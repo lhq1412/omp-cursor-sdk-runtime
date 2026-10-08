@@ -21,6 +21,7 @@ import {
 } from "./live-run.js";
 import { beginAgentSend, commitTurn, disposeRuntimeForScope, finishLiveKeepAgent, finishTurnFailed, getRuntimeSlot, prepareTurn, runtimeKey, warmLocalExecutor, type PreparedTurn, type RuntimeSlot } from "./session-runtime.js";
 import { captureCursorRequestOwner, getCursorSessionCwd, ownerForRequest, withCursorSessionOwner, type CursorSessionOwner } from "./session-scope.js";
+import { isSideChannelRequest } from "./side-request.js";
 import { withSdkExitSuppressed } from "./sdk-exit-guard.js";
 import { ensureCursorModels, getModelMetadata, buildModelSelection } from "./catalog.js";
 import { getFastMode } from "./model-controls.js";
@@ -104,29 +105,37 @@ export class ProviderTurnRunner {
 				this.context = request.value as Context;
 			}
 			this.owner = request.owner;
-			if (!this.owner && host && snapshot) {
-				const key = JSON.stringify([snapshot.sessionId, snapshot.agentInstanceId]);
-				const previous = bridgeOwners.get(key);
-				previous?.signal.removeEventListener("abort", previous.onAbort);
-				const bridgeOwner = previous?.owner ?? ownerForRequest(snapshot.sessionId, snapshot.cwd);
-				const signal = this.abortSignal ?? host.signal;
-				const binding = {
-					owner: bridgeOwner,
-					signal,
-					onAbort: (): void => {
-						if (bridgeOwners.get(key) !== binding) return;
-						bridgeOwners.delete(key);
-						void disposeRuntimeForScope(bridgeOwner.scopeKey);
-					},
-				};
-				bridgeOwners.set(key, binding);
-				signal.addEventListener("abort", binding.onAbort, { once: true });
-				if (signal.aborted) binding.onAbort();
-				this.owner = bridgeOwner;
+			const sideChannel = isSideChannelRequest(options?.sessionId, this.context);
+			if (sideChannel) {
+				// Parent before_provider_request and host-bridge owners stay on the main session.
+				this.auxiliary = true;
+				this.owner = ownerForRequest(options?.sessionId, snapshot?.cwd ?? options?.cwd);
+				this.ownerGeneration = this.owner.generation;
+			} else {
+				if (!this.owner && host && snapshot) {
+					const key = JSON.stringify([snapshot.sessionId, snapshot.agentInstanceId]);
+					const previous = bridgeOwners.get(key);
+					previous?.signal.removeEventListener("abort", previous.onAbort);
+					const bridgeOwner = previous?.owner ?? ownerForRequest(snapshot.sessionId, snapshot.cwd);
+					const signal = this.abortSignal ?? host.signal;
+					const binding = {
+						owner: bridgeOwner,
+						signal,
+						onAbort: (): void => {
+							if (bridgeOwners.get(key) !== binding) return;
+							bridgeOwners.delete(key);
+							void disposeRuntimeForScope(bridgeOwner.scopeKey);
+						},
+					};
+					bridgeOwners.set(key, binding);
+					signal.addEventListener("abort", binding.onAbort, { once: true });
+					if (signal.aborted) binding.onAbort();
+					this.owner = bridgeOwner;
+				}
+				this.auxiliary = !this.owner;
+				this.owner ??= ownerForRequest(options?.sessionId, options?.cwd);
+				this.ownerGeneration = request.generation ?? this.owner.generation;
 			}
-			this.auxiliary = !this.owner;
-			this.owner ??= ownerForRequest(options?.sessionId, options?.cwd);
-			this.ownerGeneration = request.generation ?? this.owner.generation;
 			this.assertCurrent();
 			await withCursorSessionOwner(this.owner, async () => {
 				const prepared = await this.prepareTurnRequest(host, snapshot);
@@ -193,6 +202,7 @@ export class ProviderTurnRunner {
 			modelSelection = selectionForTurn(model, this.apiKey, options);
 		}
 		this.assertCurrent();
+		const turnHost = this.auxiliary ? undefined : host;
 		const prepared = await prepareTurn({
 			cwd,
 			agentInstanceId,
@@ -201,7 +211,7 @@ export class ProviderTurnRunner {
 			modelLimits: { contextWindow: model.contextWindow, maxTokens: model.maxTokens },
 			context: this.context,
 			grantedTools,
-			host,
+			host: turnHost,
 			signal: this.abortSignal,
 		});
 		this.slot = prepared.slot;
@@ -213,7 +223,7 @@ export class ProviderTurnRunner {
 				if (!preview.ended) prepared.live.projection.previews.delete(id);
 			}
 		}
-		return { ...prepared, cwd, agentInstanceId, host, snapshot, modelSelection };
+		return { ...prepared, cwd, agentInstanceId, host: turnHost, snapshot, modelSelection };
 	}
 
 	private async sendTurn(prepared: PreparedProviderTurn): Promise<void> {
@@ -380,7 +390,10 @@ export class ProviderTurnRunner {
 		this.assertCurrent();
 		if (!live.cancelled && settledAgent && getLiveRun(preparedSlot.key) === live &&
 			preparedSlot.agent === settledAgent && live.agent === settledAgent) {
-			if (occupancy) partial.cursorSdk.contextOccupancy = occupancy;
+			if (occupancy) {
+				partial.cursorSdk.contextOccupancy = occupancy;
+				partial.usage.contextTokens = occupancy.usedTokens;
+			}
 			projectRunSummary(partial, live.projection);
 		}
 		const delivered = deliverWithoutUnendedPreviews(partial, live.projection, new Set());
