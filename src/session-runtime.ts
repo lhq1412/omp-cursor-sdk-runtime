@@ -579,15 +579,22 @@ export async function prepareTurn(input: OpenRuntimeTurnInput): Promise<Prepared
 		};
 	} catch (error) {
 		if (slots.get(slot.key) === slot) {
-			// Pre-send tool rebuild: dispose without journaling dirty over committed consumption,
-			// and keep an identity-checked in-memory proof for same-process retry without a journal.
-			if (!resumeHandle && !identityMismatch && (consumptionHandle || preservedSendState || slot.preSendConsumption)) {
-				const consumption = preservedSendState
-					?? (consumptionHandle ? { ...consumptionHandle.sendState } : undefined)
-					?? matchingPreSendConsumption(slot, cwd, nextCredential)
-					?? (slot.sendState.bootstrapped ? { ...slot.sendState } : undefined);
+			// Failure here is before agent.send. A same-id resume may already have
+			// superseded the committed journal handle; keep the verified consumption
+			// so the retry imports that history and sends a continuation.
+			const verifiedConsumption = identityMismatch
+				? undefined
+				: preservedSendState?.bootstrapped
+					? preservedSendState
+					: consumptionHandle?.sendState.bootstrapped
+						? { ...consumptionHandle.sendState }
+						: resumeHandle?.sendState.bootstrapped
+							? { ...resumeHandle.sendState }
+							: matchingPreSendConsumption(slot, cwd, nextCredential)
+								?? (slot.sendState.bootstrapped ? { ...slot.sendState } : undefined);
+			if (verifiedConsumption?.bootstrapped) {
 				await disposeAgentKeepJournalConsumption(slot);
-				if (consumption) stashPreSendConsumption(slot, consumption, cwd, nextCredential);
+				stashPreSendConsumption(slot, verifiedConsumption, cwd, nextCredential);
 			} else {
 				clearPreSendConsumption(slot);
 				await persistDirtyAndDisposeAgent(slot);

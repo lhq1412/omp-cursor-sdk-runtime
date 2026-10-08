@@ -139,8 +139,10 @@ export function ownerForContext(ctx: ExtensionContext): CursorSessionOwner {
 		owner.persistenceKey = persistenceKeyFor(sessionId, sessionFile);
 		owner.persistent = owner.writer;
 		// The file lease moved. Keep this live owner's runtime scope with the new file
-		// so another manager of the old path cannot dispose it.
+		// so another manager of the old path cannot dispose it. Losing the target lease
+		// demotes this owner; its slot, live run, and executor must still leave the old file.
 		if (owner.writer) assignScopeKey(owner, writerScopeKey(sessionId, sessionFile));
+		else assignScopeKey(owner, `${EPHEMERAL_SESSION_SCOPE_PREFIX}${randomUUID()}`);
 		return owner;
 	}
 

@@ -22,7 +22,7 @@ import {
 	__testUtils as runtimeTestUtils,
 	type PreparedTurn,
 } from "../../src/session-runtime.ts";
-import { getLiveRun, __testUtils as liveRunTestUtils } from "../../src/live-run.ts";
+import { getLiveRun, liveRunKey, __testUtils as liveRunTestUtils } from "../../src/live-run.ts";
 import { registerCursorSessionLifecycle } from "../../src/session-lifecycle.ts";
 import { buildAgentOptions } from "../../src/sdk-session.ts";
 import { __testUtils as scopeTestUtils, getCursorSessionOwner, ownerForContext, ownerForRequest, registerCursorSessionScope, withCursorSessionOwner } from "../../src/session-scope.ts";
@@ -1903,6 +1903,68 @@ describe("session scope runtime ownership", () => {
 		expect(disposed).toEqual(["agent-1", "agent-2"]);
 		expect([...runtimeTestUtils.slots.values()].some((slot) => slot.owner === ownerB)).toBe(false);
 		expect(runtimeTestUtils.executorLeases.size).toBe(0);
+		scopeTestUtils.reset();
+	});
+
+	test("a failed target lease isolates the demoted owner's runtime from the old file", async () => {
+		runtimeTestUtils.clear();
+		liveRunTestUtils.clear();
+		scopeTestUtils.reset();
+		resumeTestUtils.reset();
+		const disposed: string[] = [];
+		let next = 0;
+		runtimeTestUtils.setOpenAgent(async () => disposableAgent(`agent-${++next}`, disposed));
+		const events = scopeEventBus();
+		const original = "/tmp/original.jsonl";
+		const taken = "/tmp/taken.jsonl";
+		let fileA = original;
+		const managerHolder = {
+			cwd: "/tmp/project",
+			sessionManager: { getSessionFile: () => taken, getSessionId: () => "sess-holder" },
+		} as ExtensionContext;
+		const managerA = {
+			cwd: "/tmp/project",
+			sessionManager: { getSessionFile: () => fileA, getSessionId: () => "sess-a" },
+		} as ExtensionContext;
+		await events.fire("before_provider_request", managerHolder);
+		expect(ownerForContext(managerHolder).writer).toBe(true);
+		await events.fire("before_provider_request", managerA);
+		const ownerA = ownerForContext(managerA);
+		expect(ownerA.writer).toBe(true);
+		expect(ownerA.scopeKey).toBe(original);
+		await withCursorSessionOwner(ownerA, async () => {
+			warmLocalExecutor("/tmp/project", "test-key", "composer-2.5");
+			await prepareTurn({
+				modelLimits, cwd: "/tmp/project", agentInstanceId: "main", apiKey: "test-key",
+				modelSelection: { id: "composer-2.5" }, context: userContext("live"), grantedTools: [],
+			});
+		});
+		fileA = taken;
+		await events.fire("before_provider_request", managerA);
+		expect(ownerA.writer).toBe(false);
+		expect(ownerA.sessionFile).toBe(taken);
+		expect(ownerA.scopeKey).not.toBe(original);
+		expect(ownerA.scopeKey).not.toBe(taken);
+		expect(ownerA.scopeKey.startsWith(scopeTestUtils.EPHEMERAL_SESSION_SCOPE_PREFIX)).toBe(true);
+		const isolated = ownerA.scopeKey;
+		expect([...runtimeTestUtils.slots.values()].some((slot) => slot.owner === ownerA && slot.scopeKey === isolated && slot.agent?.agentId === "agent-1")).toBe(true);
+		expect([...runtimeTestUtils.slots.values()].some((slot) => slot.scopeKey === original)).toBe(false);
+		expect(getLiveRun(liveRunKey(original, "main"))).toBeUndefined();
+		expect(getLiveRun(liveRunKey(isolated, "main"))?.cancelled).toBe(false);
+		expect(runtimeTestUtils.executorLeases.has(original)).toBe(false);
+		expect(runtimeTestUtils.executorLeases.has(isolated)).toBe(true);
+		const managerNext = {
+			cwd: "/tmp/project",
+			sessionManager: { getSessionFile: () => original, getSessionId: () => "sess-next" },
+		} as ExtensionContext;
+		await events.fire("before_provider_request", managerNext);
+		expect(ownerForContext(managerNext).writer).toBe(true);
+		expect(ownerForContext(managerNext).scopeKey).toBe(original);
+		await events.fire("session_shutdown", managerNext);
+		expect(disposed).toEqual([]);
+		expect([...runtimeTestUtils.slots.values()].some((slot) => slot.owner === ownerA && slot.agent?.agentId === "agent-1")).toBe(true);
+		expect(getLiveRun(liveRunKey(isolated, "main"))?.cancelled).toBe(false);
+		expect(runtimeTestUtils.executorLeases.has(isolated)).toBe(true);
 		scopeTestUtils.reset();
 	});
 });

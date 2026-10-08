@@ -1,4 +1,8 @@
+import { appendFileSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, test, beforeEach, afterEach } from "bun:test";
+import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import type { Context, Model, SimpleStreamOptions, Tool } from "@oh-my-pi/pi-ai";
 import { Effort, type Api } from "@oh-my-pi/pi-ai";
 import type { ModelListItem, ModelSelection, Run, RunResult, SDKAgent, SendOptions, TokenUsage } from "@cursor/sdk";
@@ -9,7 +13,7 @@ import { __testUtils as controlsTestUtils } from "../../src/model-controls.ts";
 import { disposeRuntimeForScope, __testUtils as runtimeTestUtils } from "../../src/session-runtime.ts";
 import { __testUtils as liveRunTestUtils } from "../../src/live-run.ts";
 import { getCursorSessionScopeKey, __testUtils as scopeTestUtils } from "../../src/session-scope.ts";
-import { __testUtils as resumeTestUtils } from "../../src/session-resume.ts";
+import { registerCursorSessionResume, __testUtils as resumeTestUtils } from "../../src/session-resume.ts";
 import { HOST_BRIDGE_OPTION_KEY } from "../../src/host-option.ts";
 import { createFakeHost } from "../helpers/fake-host.ts";
 import { projectSdkToolCallId } from "../../src/tool-call-id.ts";
@@ -1448,5 +1452,72 @@ describe("streamCursorRuntime model selection", () => {
 			type: "error",
 			error: { errorMessage: expect.stringMatching(/cwd or credentials changed/) },
 		});
+	});
+
+	test("a same-id resume that fails before send retries with consumed history and a continuation", async () => {
+		const sessionFile = join(mkdtempSync(join(tmpdir(), "omp-csr-")), "session.jsonl");
+		writeFileSync(sessionFile, "");
+		scopeTestUtils.set("/tmp/project", sessionFile, "sess-1");
+		const branch: Array<{ type: string; id: string; parentId: string | null; customType?: string; data?: unknown }> = [];
+		const handlers = new Map<string, Array<(event: unknown, ctx: unknown) => unknown>>();
+		const ctx = {
+			cwd: "/tmp/project",
+			sessionManager: {
+				getSessionFile: () => sessionFile,
+				getSessionId: () => "sess-1",
+				getBranch: () => branch,
+				getEntries: () => branch,
+			},
+		} as ExtensionContext;
+		const pi = {
+			appendEntry(customType: string, data?: unknown) {
+				appendFileSync(sessionFile, `${JSON.stringify({ type: "custom", customType, data })}\n`);
+			},
+			on(event: string, handler: (event: unknown, ctx: unknown) => unknown) {
+				const list = handlers.get(event) ?? [];
+				list.push(handler);
+				handlers.set(event, list);
+			},
+		};
+		registerCursorSessionResume(pi as Pick<ExtensionAPI, "on" | "appendEntry">);
+		await handlers.get("session_start")?.[0]?.({ type: "session_start" }, ctx);
+		const phrase = "remember the oak-table request";
+		const consumed = userContext(phrase);
+		const withTools = { ...consumed, tools: [readTool()] } as Context;
+		const opens: Array<{ savedAgentId?: string; history?: Context["messages"] }> = [];
+		const sends: string[] = [];
+		runtimeTestUtils.setOpenAgent(async (input) => {
+			opens.push({ savedAgentId: input.savedAgentId, history: input.bootstrapHistory });
+			if (input.savedAgentId) throw new Error("resume failed before send");
+			return {
+				agentId: `agent-${opens.length}`,
+				close() {},
+				async [Symbol.asyncDispose]() {},
+				async send(message: { text?: string }) {
+					sends.push(message.text ?? "");
+					return finishedRun();
+				},
+			} as unknown as SDKAgent;
+		});
+		const model = cursorModel("composer-2.5", 200_000);
+		const first = await drain(model, consumed, { apiKey: "test-key", cwd: "/tmp/project" });
+		expect(first.at(-1)).toMatchObject({ type: "done", reason: "stop" });
+		await handlers.get("turn_end")?.[0]?.({ type: "turn_end" }, ctx);
+		expect(resumeTestUtils.state.activeHandle?.state).toBe("committed");
+		expect(resumeTestUtils.state.activeHandle?.agentId).toBe("agent-1");
+		const journal = () => readFileSync(sessionFile, "utf8").trim().split("\n").map((line) => JSON.parse(line) as { data?: { state?: string; agentId?: string } });
+		expect(journal().some((entry) => entry.data?.state === "committed" && entry.data.agentId === "agent-1")).toBe(true);
+		const failed = await drain(model, withTools, { apiKey: "test-key", cwd: "/tmp/project" });
+		expect(failed.at(-1)).toMatchObject({ type: "error" });
+		expect(opens[1]?.savedAgentId).toBe("agent-1");
+		expect(sends).toHaveLength(1);
+		expect(journal().at(-1)?.data?.state).toBe("in-flight");
+		const retried = await drain(model, withTools, { apiKey: "test-key", cwd: "/tmp/project" });
+		expect(retried.at(-1)).toMatchObject({ type: "done", reason: "stop" });
+		expect(opens[2]?.savedAgentId).toBeUndefined();
+		expect(JSON.stringify(opens[2]?.history)).toContain(phrase);
+		expect(sends).toHaveLength(2);
+		expect(sends[1]).toContain("Continue the conversation from where it left off.");
+		expect(sends[1]).not.toContain(phrase);
 	});
 });
